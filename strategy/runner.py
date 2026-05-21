@@ -1,7 +1,7 @@
-"""策略运行模块。
+"""绛栫暐杩愯妯″潡銆?
 
-本模块是项目中连接“行情、策略、订单、持仓、状态恢复”的调度中心。
-它不关心具体策略逻辑本身，而是负责让多个策略实例在统一规则下运行。
+鏈ā鍧楁槸椤圭洰涓繛鎺モ€滆鎯呫€佺瓥鐣ャ€佽鍗曘€佹寔浠撱€佺姸鎬佹仮澶嶁€濈殑璋冨害涓績銆?
+瀹冧笉鍏冲績鍏蜂綋绛栫暐閫昏緫鏈韩锛岃€屾槸璐熻矗璁╁涓瓥鐣ュ疄渚嬪湪缁熶竴瑙勫垯涓嬭繍琛屻€?
 """
 import json
 import threading
@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Type
 
 from config.enums import AlertLevel, OrderDirection, OrderStatus, OrderType, StrategyStatus
+from core.l2_models import L2OrderEvent, L2OrderQueueEvent, L2QuoteEvent, L2TransactionEvent
 from core.models import TickData
 from core.trading_calendar import is_market_day, minus_one_market_day
 from position.manager import PositionManager
@@ -24,19 +25,19 @@ logger = get_logger("system")
 
 
 def _select_configs_in_subprocess(strategy_class):
-    """在子进程中执行选股逻辑并返回配置列表。
+    """鍦ㄥ瓙杩涚▼涓墽琛岄€夎偂閫昏緫骞惰繑鍥為厤缃垪琛ㄣ€?
 
-    这样做的主要目的是把潜在耗时较长、且可能依赖外部计算的选股逻辑
-    与主进程隔离开，降低阻塞主流程的风险。
+    杩欐牱鍋氱殑涓昏鐩殑鏄妸娼滃湪鑰楁椂杈冮暱銆佷笖鍙兘渚濊禆澶栭儴璁＄畻鐨勯€夎偂閫昏緫
+    涓庝富杩涚▼闅旂寮€锛岄檷浣庨樆濉炰富娴佺▼鐨勯闄┿€?
     """
     strategy = strategy_class(StrategyConfig(), None, None)
     return strategy.select_stocks()
 
 
 class StrategyRunner:
-    """策略运行管理器。
+    """绛栫暐杩愯绠＄悊鍣ㄣ€?
 
-    它负责统一调度所有策略对象，是策略层的总控中心。
+    瀹冭礋璐ｇ粺涓€璋冨害鎵€鏈夌瓥鐣ュ璞★紝鏄瓥鐣ュ眰鐨勬€绘帶涓績銆?
     """
 
     def __init__(self, data_subscription=None, trade_executor=None,
@@ -49,118 +50,122 @@ class StrategyRunner:
                  state_realtime_persist_min_interval_sec: float = 3.0,
                  latency_threshold_sec: float = 10.0,
                  process_threshold_ms: float = 200.0):
-        """初始化策略运行器。
+        """鍒濆鍖栫瓥鐣ヨ繍琛屽櫒銆?
 
         Args:
-            data_subscription: 行情订阅管理器。
-            trade_executor: 交易执行器。
-            position_manager: 持仓管理器。
-            data_manager: 数据持久化管理器。
-            connection_manager: 交易连接管理器，用于启动前账户校验。
-            strategy_classes: 需要托管的策略类列表。
-            load_previous_state_on_start: 当日状态不存在时，是否回退加载上一交易日状态。
-            state_autosave_interval_sec: 盘中自动保存状态的周期，单位秒；``0`` 表示关闭。
-            state_realtime_persist_min_interval_sec: 盘中实时状态保存的最小间隔，单位秒。
-            latency_threshold_sec: 行情延迟告警阈值，单位秒。
-            process_threshold_ms: 单次策略处理耗时告警阈值，单位毫秒。
+            data_subscription: 琛屾儏璁㈤槄绠＄悊鍣ㄣ€?
+            trade_executor: 浜ゆ槗鎵ц鍣ㄣ€?
+            position_manager: 鎸佷粨绠＄悊鍣ㄣ€?
+            data_manager: 鏁版嵁鎸佷箙鍖栫鐞嗗櫒銆?
+            connection_manager: 浜ゆ槗杩炴帴绠＄悊鍣紝鐢ㄤ簬鍚姩鍓嶈处鎴锋牎楠屻€?
+            strategy_classes: 闇€瑕佹墭绠＄殑绛栫暐绫诲垪琛ㄣ€?
+            load_previous_state_on_start: 褰撴棩鐘舵€佷笉瀛樺湪鏃讹紝鏄惁鍥為€€鍔犺浇涓婁竴浜ゆ槗鏃ョ姸鎬併€?
+            state_autosave_interval_sec: 鐩樹腑鑷姩淇濆瓨鐘舵€佺殑鍛ㄦ湡锛屽崟浣嶇锛沗`0`` 琛ㄧず鍏抽棴銆?
+            state_realtime_persist_min_interval_sec: 鐩樹腑瀹炴椂鐘舵€佷繚瀛樼殑鏈€灏忛棿闅旓紝鍗曚綅绉掋€?
+            latency_threshold_sec: 琛屾儏寤惰繜鍛婅闃堝€硷紝鍗曚綅绉掋€?
+            process_threshold_ms: 鍗曟绛栫暐澶勭悊鑰楁椂鍛婅闃堝€硷紝鍗曚綅姣銆?
         """
-        # ``_data_sub`` 负责向运行器推送最新行情数据。
+        # ``_data_sub`` 璐熻矗鍚戣繍琛屽櫒鎺ㄩ€佹渶鏂拌鎯呮暟鎹€?
         self._data_sub = data_subscription
-        # ``_trade_exec`` 负责把策略信号翻译成真实下单动作。
+        # ``_trade_exec`` 璐熻矗鎶婄瓥鐣ヤ俊鍙风炕璇戞垚鐪熷疄涓嬪崟鍔ㄤ綔銆?
         self._trade_exec = trade_executor
-        # ``_order_mgr`` 用于在重启时把活动订单从持久化层重新装载回内存。
+        # ``_order_mgr`` 鐢ㄤ簬鍦ㄩ噸鍚椂鎶婃椿鍔ㄨ鍗曚粠鎸佷箙鍖栧眰閲嶆柊瑁呰浇鍥炲唴瀛樸€?
         self._order_mgr = order_manager
-        # ``_position_mgr`` 负责查询和维护策略持仓。
+        # ``_position_mgr`` 璐熻矗鏌ヨ鍜岀淮鎶ょ瓥鐣ユ寔浠撱€?
         self._position_mgr = position_manager
-        # ``_data_mgr`` 用于保存和恢复策略状态快照。
+        # ``_data_mgr`` 鐢ㄤ簬淇濆瓨鍜屾仮澶嶇瓥鐣ョ姸鎬佸揩鐓с€?
         self._data_mgr = data_manager
-        # ``_connection_mgr`` 用于在启动前查询账户资产与持仓。
+        # ``_connection_mgr`` 鐢ㄤ簬鍦ㄥ惎鍔ㄥ墠鏌ヨ璐︽埛璧勪骇涓庢寔浠撱€?
         self._connection_mgr = connection_manager
-        # ``_strategy_classes`` 保存所有可参与自动选股/恢复的策略类。
+        # ``_strategy_classes`` 淇濆瓨鎵€鏈夊彲鍙備笌鑷姩閫夎偂/鎭㈠鐨勭瓥鐣ョ被銆?
         self._strategy_classes = strategy_classes or []
-        # ``_load_previous_state_on_start`` 控制是否回退到上一交易日状态文件。
+        # ``_load_previous_state_on_start`` 鎺у埗鏄惁鍥為€€鍒颁笂涓€浜ゆ槗鏃ョ姸鎬佹枃浠躲€?
         self._load_previous_state_on_start = load_previous_state_on_start
-        # ``_state_autosave_interval_sec`` 控制盘中状态自动保存频率。
+        # ``_state_autosave_interval_sec`` 鎺у埗鐩樹腑鐘舵€佽嚜鍔ㄤ繚瀛橀鐜囥€?
         self._state_autosave_interval_sec = max(0, int(state_autosave_interval_sec or 0))
-        # ``_state_realtime_persist_min_interval_sec`` 控制纯行情态下最小保存间隔，避免每个 tick 都写快照。
+        # ``_state_realtime_persist_min_interval_sec`` 鎺у埗绾鎯呮€佷笅鏈€灏忎繚瀛橀棿闅旓紝閬垮厤姣忎釜 tick 閮藉啓蹇収銆?
         self._state_realtime_persist_min_interval_sec = max(0.0, float(state_realtime_persist_min_interval_sec or 0.0))
-        # ``_strategies`` 保存当前正在托管的策略实例列表。
+        # ``_strategies`` 淇濆瓨褰撳墠姝ｅ湪鎵樼鐨勭瓥鐣ュ疄渚嬪垪琛ㄣ€?
         self._strategies: List[BaseStrategy] = []
-        # ``_lock`` 保护策略列表在多线程环境下的增删改查。
+        # ``_lock`` 淇濇姢绛栫暐鍒楄〃鍦ㄥ绾跨▼鐜涓嬬殑澧炲垹鏀规煡銆?
         self._lock = threading.Lock()
-        # ``_latency_threshold`` 是行情延迟告警阈值，单位秒。
+        # ``_latency_threshold`` 鏄鎯呭欢杩熷憡璀﹂槇鍊硷紝鍗曚綅绉掋€?
         self._latency_threshold = latency_threshold_sec
-        # ``_process_threshold_ms`` 是单次策略处理耗时阈值，单位毫秒。
+        # ``_process_threshold_ms`` 鏄崟娆＄瓥鐣ュ鐞嗚€楁椂闃堝€硷紝鍗曚綅姣銆?
         self._process_threshold_ms = process_threshold_ms
-        # ``_last_round_total_process_ms`` 记录最近一轮行情推送对应的策略总处理耗时。
+        # ``_last_round_total_process_ms`` 璁板綍鏈€杩戜竴杞鎯呮帹閫佸搴旂殑绛栫暐鎬诲鐞嗚€楁椂銆?
         self._last_round_total_process_ms = 0.0
-        # ``_running`` 标记运行器是否已进入工作状态。
+        # ``_running`` 鏍囪杩愯鍣ㄦ槸鍚﹀凡杩涘叆宸ヤ綔鐘舵€併€?
         self._running = False
-        # ``_scheduler`` 是 APScheduler 实例，用于定时选股与保存状态。
+        # ``_scheduler`` 鏄?APScheduler 瀹炰緥锛岀敤浜庡畾鏃堕€夎偂涓庝繚瀛樼姸鎬併€?
         self._scheduler = None
-        # ``_state_save_lock`` 用于串行化事件驱动快照保存，避免多线程并发写 pickle。
+        # ``_state_save_lock`` 鐢ㄤ簬涓茶鍖栦簨浠堕┍鍔ㄥ揩鐓т繚瀛橈紝閬垮厤澶氱嚎绋嬪苟鍙戝啓 pickle銆?
         self._state_save_lock = threading.RLock()
-        # ``_last_state_save_monotonic`` 记录最近一次成功保存的单调时钟时间。
+        # ``_last_state_save_monotonic`` 璁板綍鏈€杩戜竴娆℃垚鍔熶繚瀛樼殑鍗曡皟鏃堕挓鏃堕棿銆?
         self._last_state_save_monotonic = 0.0
-        # ``_scheduler_thread`` 是调度器所在线程。
+        # ``_scheduler_thread`` 鏄皟搴﹀櫒鎵€鍦ㄧ嚎绋嬨€?
         self._scheduler_thread = None
-        # ``_heartbeat_callback`` 用于向看门狗报告主循环活跃状态。
+        # ``_heartbeat_callback`` 鐢ㄤ簬鍚戠湅闂ㄧ嫍鎶ュ憡涓诲惊鐜椿璺冪姸鎬併€?
         self._heartbeat_callback = None
-        # ``_alert_callback`` 用于发送启动前账户校验告警。
+        # ``_alert_callback`` 鐢ㄤ簬鍙戦€佸惎鍔ㄥ墠璐︽埛鏍￠獙鍛婅銆?
         self._alert_callback = None
-        # ``_known_trade_ids`` 缓存已处理成交，避免主动同步重复回放同一笔成交。
+        # ``_known_trade_ids`` 缂撳瓨宸插鐞嗘垚浜わ紝閬垮厤涓诲姩鍚屾閲嶅鍥炴斁鍚屼竴绗旀垚浜ゃ€?
         self._known_trade_ids: Optional[set[str]] = None
 
     def set_heartbeat_callback(self, callback) -> None:
-        """注册心跳回调，供看门狗感知策略主循环是否仍在工作。"""
+        """娉ㄥ唽蹇冭烦鍥炶皟锛屼緵鐪嬮棬鐙楁劅鐭ョ瓥鐣ヤ富寰幆鏄惁浠嶅湪宸ヤ綔銆?"""
         self._heartbeat_callback = callback
 
     def set_alert_callback(self, callback) -> None:
-        """注册预检查告警回调。
+        """娉ㄥ唽棰勬鏌ュ憡璀﹀洖璋冦€?
 
-        当前主要用于把启动前的账户校验结果转发到钉钉。
+        褰撳墠涓昏鐢ㄤ簬鎶婂惎鍔ㄥ墠鐨勮处鎴锋牎楠岀粨鏋滆浆鍙戝埌閽夐拤銆?
         """
         self._alert_callback = callback
 
-    # ------------------------------------------------------------------ 启动/停止
+    # ------------------------------------------------------------------ 鍚姩/鍋滄
 
     def start(self) -> None:
-        """启动策略运行器。"""
+        """鍚姩绛栫暐杩愯鍣ㄣ€?"""
         self._running = True
         logger.info("StrategyRunner: 启动")
 
-        # 尝试恢复状态
+        # 灏濊瘯鎭㈠鐘舵€?
         self._load_state()
 
-        # 无论是否恢复出快照，都再按当日 CSV 补齐一次缺失实例。
-        # add_strategy 会按 instance_key 去重，因此不会覆盖已恢复的实例。
+        # 鏃犺鏄惁鎭㈠鍑哄揩鐓э紝閮藉啀鎸夊綋鏃?CSV 琛ラ綈涓€娆＄己澶卞疄渚嬨€?
+        # add_strategy 浼氭寜 instance_key 鍘婚噸锛屽洜姝や笉浼氳鐩栧凡鎭㈠鐨勫疄渚嬨€?
         self.run_stock_selection()
 
-        # 把快照里记录的活动订单 UUID 重新装载回内存，
-        # 避免异常重启后策略忘记自己仍有挂单未完结。
+        # 鎶婂揩鐓ч噷璁板綍鐨勬椿鍔ㄨ鍗?UUID 閲嶆柊瑁呰浇鍥炲唴瀛橈紝
+        # 閬垮厤寮傚父閲嶅惎鍚庣瓥鐣ュ繕璁拌嚜宸变粛鏈夋寕鍗曟湭瀹岀粨銆?
         self._restore_pending_orders_from_storage()
         self._cleanup_orphaned_pending_orders_from_storage()
 
-        # 在真正开始盯盘前，先核对账户资产和账户持仓，
-        # 防止策略内部状态与真实账户状态明显不一致。
+        # 鍦ㄧ湡姝ｅ紑濮嬬洴鐩樺墠锛屽厛鏍稿璐︽埛璧勪骇鍜岃处鎴锋寔浠擄紝
+        # 闃叉绛栫暐鍐呴儴鐘舵€佷笌鐪熷疄璐︽埛鐘舵€佹槑鏄句笉涓€鑷淬€?
         self._validate_account_constraints()
         self.sync_orders_and_trades_once(reason="startup")
 
-        # 注册数据回调
+        # 娉ㄥ唽鏁版嵁鍥炶皟
         if self._data_sub:
             self._data_sub.set_data_callback(self.on_market_data)
+            self._data_sub.set_l2_quote_callback(self.on_l2_quote_data)
+            self._data_sub.set_l2_transaction_callback(self.on_l2_transaction_data)
+            self._data_sub.set_l2_order_callback(self.on_l2_order_data)
+            self._data_sub.set_l2_orderqueue_callback(self.on_l2_orderqueue_data)
 
-        # 启动调度器
+        # 鍚姩璋冨害鍣?
         self._start_scheduler()
 
-        # 仅在交易日激活策略
+        # 浠呭湪浜ゆ槗鏃ユ縺娲荤瓥鐣?
         self._activate_for_trading_day(reason="startup")
 
         logger.info("StrategyRunner: 已启动 %d 个策略", len(self._strategies))
         self.request_state_persist("runner_started")
 
     def stop(self) -> None:
-        """停止运行器，并保存当前策略状态。"""
+        """鍋滄杩愯鍣紝骞朵繚瀛樺綋鍓嶇瓥鐣ョ姸鎬併€?"""
         self._running = False
         self.save_state()
         with self._lock:
@@ -174,13 +179,13 @@ class StrategyRunner:
                 pass
         logger.info("StrategyRunner: 已停止")
 
-    # ------------------------------------------------------------------ 数据分发
+    # ------------------------------------------------------------------ 鏁版嵁鍒嗗彂
 
     def on_market_data(self, tick_data: Dict[str, TickData]) -> None:
-        """处理一批最新行情数据。
+        """澶勭悊涓€鎵规渶鏂拌鎯呮暟鎹€?
 
         Args:
-            tick_data: 以证券代码为键的行情字典。
+            tick_data: 浠ヨ瘉鍒镐唬鐮佷负閿殑琛屾儏瀛楀吀銆?
         """
         if not self._running:
             return
@@ -193,7 +198,7 @@ class StrategyRunner:
                 if first_tick and getattr(first_tick, "data_time", None):
                     self._position_mgr.unlock_available_quantities(first_tick.data_time.strftime("%Y%m%d"))
 
-            # 先做统一的延迟检测，避免策略内部各自重复判断。
+            # 鍏堝仛缁熶竴鐨勫欢杩熸娴嬶紝閬垮厤绛栫暐鍐呴儴鍚勮嚜閲嶅鍒ゆ柇銆?
             for code, tick in tick_data.items():
                 if tick.latency_ms > self._latency_threshold * 1000:
                     print(f"[WARNING] 数据延迟 {tick.latency_ms/1000:.1f}s > "
@@ -208,6 +213,8 @@ class StrategyRunner:
                 tick = tick_data.get(code)
                 if not tick:
                     continue
+                if strategy.status == StrategyStatus.INITIALIZING:
+                    strategy.start()
                 t0 = time.perf_counter()
                 try:
                     strategy.before_process_tick(tick)
@@ -228,28 +235,93 @@ class StrategyRunner:
 
             self._last_round_total_process_ms = round_total_elapsed_ms
 
-            # 每轮行情结束后顺手清理已停止策略，
-            # 可以避免策略列表持续膨胀。
+            # 姣忚疆琛屾儏缁撴潫鍚庨『鎵嬫竻鐞嗗凡鍋滄绛栫暐锛?
+            # 鍙互閬垮厤绛栫暐鍒楄〃鎸佺画鑶ㄨ儉銆?
             self._cleanup_stopped()
 
         except Exception as e:
             logger.error("StrategyRunner: on_market_data 异常: %s", e, exc_info=True)
 
-    # ------------------------------------------------------------------ 策略管理
+    # ------------------------------------------------------------------ 绛栫暐绠＄悊
+
+    def on_l2_quote_data(self, events_by_code: Dict[str, L2QuoteEvent]) -> None:
+        """Dispatch Level2 quote events to matching strategies."""
+        self._dispatch_l2_single(events_by_code, "on_l2_quote")
+
+    def on_l2_transaction_data(self, events_by_code: Dict[str, List[L2TransactionEvent]]) -> None:
+        """Dispatch Level2 transaction events to matching strategies."""
+        self._dispatch_l2_batch(events_by_code, "on_l2_transaction")
+
+    def on_l2_order_data(self, events_by_code: Dict[str, List[L2OrderEvent]]) -> None:
+        """Dispatch Level2 order events to matching strategies."""
+        self._dispatch_l2_batch(events_by_code, "on_l2_order")
+
+    def on_l2_orderqueue_data(self, events_by_code: Dict[str, L2OrderQueueEvent]) -> None:
+        """Dispatch Level2 order-queue events to matching strategies."""
+        self._dispatch_l2_single(events_by_code, "on_l2_orderqueue")
+
+    def _dispatch_l2_single(self, events_by_code: Dict[str, object], handler_name: str) -> None:
+        if not self._running:
+            return
+
+        if self._heartbeat_callback:
+            self._heartbeat_callback("strategy_runner")
+
+        with self._lock:
+            strategies = list(self._strategies)
+
+        for strategy in strategies:
+            event = events_by_code.get(strategy.stock_code)
+            if event is None:
+                continue
+            try:
+                getattr(strategy, handler_name)(event)
+            except Exception as e:
+                logger.error(
+                    "StrategyRunner: Strategy[%s] %s failed: %s",
+                    strategy.strategy_id[:8],
+                    handler_name,
+                    e,
+                    exc_info=True,
+                )
+
+    def _dispatch_l2_batch(self, events_by_code: Dict[str, List[object]], handler_name: str) -> None:
+        if not self._running:
+            return
+
+        if self._heartbeat_callback:
+            self._heartbeat_callback("strategy_runner")
+
+        with self._lock:
+            strategies = list(self._strategies)
+
+        for strategy in strategies:
+            events = events_by_code.get(strategy.stock_code) or []
+            for event in events:
+                try:
+                    getattr(strategy, handler_name)(event)
+                except Exception as e:
+                    logger.error(
+                        "StrategyRunner: Strategy[%s] %s failed: %s",
+                        strategy.strategy_id[:8],
+                        handler_name,
+                        e,
+                        exc_info=True,
+                    )
 
     @staticmethod
     def _strategy_instance_key(strategy: BaseStrategy) -> tuple[str, str]:
-        """返回用于判断策略实例是否重复的唯一键。"""
+        """杩斿洖鐢ㄤ簬鍒ゆ柇绛栫暐瀹炰緥鏄惁閲嶅鐨勫敮涓€閿€?"""
         params = getattr(strategy.config, "params", {}) or {}
         instance_key = str(params.get("instance_key") or strategy.stock_code)
         return strategy.strategy_name, instance_key
 
     def get_last_round_total_process_ms(self) -> float:
-        """返回最近一轮行情推送对应的策略总处理耗时，单位毫秒。"""
+        """杩斿洖鏈€杩戜竴杞鎯呮帹閫佸搴旂殑绛栫暐鎬诲鐞嗚€楁椂锛屽崟浣嶆绉掋€?"""
         return float(self._last_round_total_process_ms or 0.0)
 
     def add_strategy(self, strategy: BaseStrategy) -> None:
-        """向运行器中添加一个策略实例。"""
+        """鍚戣繍琛屽櫒涓坊鍔犱竴涓瓥鐣ュ疄渚嬨€?"""
         strategy.bind_persistence(self._data_mgr, self.request_state_persist)
         strategy_key = self._strategy_instance_key(strategy)
         with self._lock:
@@ -263,7 +335,7 @@ class StrategyRunner:
             )
             if exists:
                 logger.info(
-                    "StrategyRunner: 跳过重复策略 %s stock=%s key=%s",
+                    "StrategyRunner: 璺宠繃閲嶅绛栫暐 %s stock=%s key=%s",
                     strategy.strategy_name,
                     strategy.stock_code,
                     strategy_key[1],
@@ -283,21 +355,24 @@ class StrategyRunner:
         with self._lock:
             should_subscribe = is_trading_day
 
-        # 订阅该标的
-        if self._data_sub and should_subscribe:
-            self._data_sub.subscribe_stocks([strategy.stock_code])
+        # 璁㈤槄璇ユ爣鐨?
+        if self._data_sub and is_trading_day:
+            self._sync_subscriptions()
         if self._running:
             self.request_state_persist(f"add_strategy:{strategy.strategy_id}")
 
     def remove_strategy(self, strategy_id: str) -> None:
-        """按策略 ID 移除策略实例。"""
+        """鎸夌瓥鐣?ID 绉婚櫎绛栫暐瀹炰緥銆?"""
         with self._lock:
             self._strategies = [s for s in self._strategies
                                  if s.strategy_id != strategy_id]
         logger.info("StrategyRunner: 移除策略 %s", strategy_id[:8])
 
+        if self._data_sub and self._running and self.is_trading_day():
+            self._sync_subscriptions()
+
     def get_strategy(self, strategy_id: str) -> Optional[BaseStrategy]:
-        """按策略 ID 获取策略对象。"""
+        """鎸夌瓥鐣?ID 鑾峰彇绛栫暐瀵硅薄銆?"""
         with self._lock:
             for s in self._strategies:
                 if s.strategy_id == strategy_id:
@@ -305,12 +380,12 @@ class StrategyRunner:
         return None
 
     def get_all_strategies(self) -> List[BaseStrategy]:
-        """返回当前全部策略对象的副本列表。"""
+        """杩斿洖褰撳墠鍏ㄩ儴绛栫暐瀵硅薄鐨勫壇鏈垪琛ㄣ€?"""
         with self._lock:
             return list(self._strategies)
 
     def get_paused_strategy_reconciliation(self) -> List[dict]:
-        """返回暂停策略的持仓对账视图。"""
+        """杩斿洖鏆傚仠绛栫暐鐨勬寔浠撳璐﹁鍥俱€?"""
         account_position_map = self._build_account_position_map()
         rows: List[dict] = []
 
@@ -338,10 +413,10 @@ class StrategyRunner:
         rows.sort(key=lambda item: (item["stock_code"], item["strategy_name"], item["strategy_id"]))
         return rows
 
-    # ------------------------------------------------------------------ 选股
+    # ------------------------------------------------------------------ 閫夎偂
 
     def run_stock_selection(self) -> None:
-        """执行选股，并为每个配置创建一个策略实例。"""
+        """鎵ц閫夎偂锛屽苟涓烘瘡涓厤缃垱寤轰竴涓瓥鐣ュ疄渚嬨€?"""
         if not self.is_trading_day():
             logger.info("StrategyRunner: 今日非交易日，跳过选股")
             return
@@ -371,10 +446,10 @@ class StrategyRunner:
 
         self._activate_for_trading_day(reason="stock_selection")
 
-    # ------------------------------------------------------------------ 持久化
+    # ------------------------------------------------------------------ 鎸佷箙鍖?
 
     def save_state(self) -> None:
-        """保存全部策略的快照状态。"""
+        """淇濆瓨鍏ㄩ儴绛栫暐鐨勫揩鐓х姸鎬併€?"""
         if not self._data_mgr:
             return
         with self._state_save_lock:
@@ -411,7 +486,7 @@ class StrategyRunner:
                 logger.error("StrategyRunner: 保存状态失败: %s", e, exc_info=True)
 
     def rebuild_runtime_state(self) -> dict:
-        """清空 SQLite 运行态并立即按当前内存策略重建。"""
+        """娓呯┖ SQLite 杩愯鎬佸苟绔嬪嵆鎸夊綋鍓嶅唴瀛樼瓥鐣ラ噸寤恒€?"""
         if not self._data_mgr:
             return {"removed": 0, "persisted": 0}
 
@@ -427,7 +502,7 @@ class StrategyRunner:
         return {"removed": removed, "persisted": persisted}
 
     def request_state_persist(self, reason: str = "", min_interval_sec: float = 0.0) -> None:
-        """在关键运行事件后立即保存策略快照。"""
+        """鍦ㄥ叧閿繍琛屼簨浠跺悗绔嬪嵆淇濆瓨绛栫暐蹇収銆?"""
         if not self._data_mgr:
             return
         interval_limit = max(0.0, float(min_interval_sec or 0.0))
@@ -440,10 +515,10 @@ class StrategyRunner:
         self.save_state()
 
     def _load_state(self) -> bool:
-        """加载历史策略状态。
+        """鍔犺浇鍘嗗彶绛栫暐鐘舵€併€?
 
         Returns:
-            是否成功恢复出至少一个策略实例。
+            鏄惁鎴愬姛鎭㈠鍑鸿嚦灏戜竴涓瓥鐣ュ疄渚嬨€?
         """
         if not self._data_mgr:
             return False
@@ -478,8 +553,10 @@ class StrategyRunner:
                 continue
             cls = self._find_strategy_class(snap.strategy_name)
             if not cls:
-                logger.warning("StrategyRunner: 未找到策略类 %s，跳过恢复",
-                               snap.strategy_name)
+                logger.warning(
+                    "StrategyRunner: 未找到策略类 %s，跳过恢复",
+                    snap.strategy_name,
+                )
                 continue
             strategy = cls(snap.config, self._trade_exec, self._position_mgr)
             strategy.bind_persistence(self._data_mgr, self.request_state_persist)
@@ -495,8 +572,8 @@ class StrategyRunner:
             current_trade_day = minus_one_market_day(current_trade_day)
         if self._position_mgr and loaded_trade_day:
             if loaded_trade_day == current_trade_day:
-                # 同一交易日内重启时，快照中的 available_quantity 已经代表当日真实状态，
-                # 不应在首个 tick 到来时再次执行“新交易日解锁”。
+                # 鍚屼竴浜ゆ槗鏃ュ唴閲嶅惎鏃讹紝蹇収涓殑 available_quantity 宸茬粡浠ｈ〃褰撴棩鐪熷疄鐘舵€侊紝
+                # 涓嶅簲鍦ㄩ涓?tick 鍒版潵鏃跺啀娆℃墽琛屸€滄柊浜ゆ槗鏃ヨВ閿佲€濄€?
                 self._position_mgr.mark_trade_day_processed(current_trade_day)
             else:
                 self._position_mgr.unlock_available_quantities(current_trade_day)
@@ -506,11 +583,11 @@ class StrategyRunner:
 
     @staticmethod
     def _has_open_position(position: Optional[PositionInfo]) -> bool:
-        """判断持仓对象是否代表非零持仓。"""
+        """鍒ゆ柇鎸佷粨瀵硅薄鏄惁浠ｈ〃闈為浂鎸佷粨銆?"""
         return bool(position and int(getattr(position, "total_quantity", 0) or 0) > 0)
 
     def _restore_position_from_storage_if_needed(self, strategy: BaseStrategy, snapshot: StrategySnapshot) -> None:
-        """当快照中的持仓为空时，使用 SQLite 持仓快照兜底恢复。"""
+        """褰撳揩鐓т腑鐨勬寔浠撲负绌烘椂锛屼娇鐢?SQLite 鎸佷粨蹇収鍏滃簳鎭㈠銆?"""
         if not self._position_mgr or not self._data_mgr:
             return
         live_position = self._position_mgr.get_position(strategy.strategy_id)
@@ -530,14 +607,14 @@ class StrategyRunner:
 
         self._position_mgr.restore_position(strategy.strategy_id, position)
         logger.info(
-            "StrategyRunner: Strategy[%s] 使用 SQLite 持仓兜底恢复 qty=%d price=%.3f",
+            "StrategyRunner: Strategy[%s] 浣跨敤 SQLite 鎸佷粨鍏滃簳鎭㈠ qty=%d price=%.3f",
             strategy.strategy_id[:8],
             position.total_quantity,
             position.current_price,
         )
 
     def _restore_position_from_trades_if_available(self, strategy: BaseStrategy) -> None:
-        """当策略存在成交历史时，按成交回放重建持仓与可卖数量。"""
+        """褰撶瓥鐣ュ瓨鍦ㄦ垚浜ゅ巻鍙叉椂锛屾寜鎴愪氦鍥炴斁閲嶅缓鎸佷粨涓庡彲鍗栨暟閲忋€?"""
         if not self._position_mgr or not self._data_mgr:
             return
 
@@ -554,14 +631,14 @@ class StrategyRunner:
         rebuilt.stock_code = strategy.stock_code
         self._position_mgr.restore_position(strategy.strategy_id, rebuilt)
         logger.info(
-            "StrategyRunner: Strategy[%s] 使用成交回放恢复持仓 qty=%d available=%d",
+            "StrategyRunner: Strategy[%s] 浣跨敤鎴愪氦鍥炴斁鎭㈠鎸佷粨 qty=%d available=%d",
             strategy.strategy_id[:8],
             rebuilt.total_quantity,
             rebuilt.available_quantity,
         )
 
     def _rebuild_position_from_trade_rows(self, rows: List[dict]) -> Optional[PositionInfo]:
-        """按单策略成交记录回放重建持仓。"""
+        """鎸夊崟绛栫暐鎴愪氦璁板綍鍥炴斁閲嶅缓鎸佷粨銆?"""
         rows = self._dedupe_trade_rows(rows)
         if not rows:
             return None
@@ -595,7 +672,7 @@ class StrategyRunner:
 
     @staticmethod
     def _dedupe_trade_rows(rows: List[dict]) -> List[dict]:
-        """按 trade_id 去重成交记录，避免重复回放同一笔成交。"""
+        """鎸?trade_id 鍘婚噸鎴愪氦璁板綍锛岄伩鍏嶉噸澶嶅洖鏀惧悓涓€绗旀垚浜ゃ€?"""
         deduped: List[dict] = []
         seen_trade_ids: set[str] = set()
         for row in rows or []:
@@ -609,7 +686,7 @@ class StrategyRunner:
 
     @staticmethod
     def _trade_day_from_row(row: dict) -> str:
-        """从成交记录中提取交易日，统一成 YYYYMMDD。"""
+        """浠庢垚浜よ褰曚腑鎻愬彇浜ゆ槗鏃ワ紝缁熶竴鎴?YYYYMMDD銆?"""
         for field in ("traded_time", "trade_time"):
             digits = "".join(ch for ch in str(row.get(field, "") or "") if ch.isdigit())
             if len(digits) < 8:
@@ -629,7 +706,7 @@ class StrategyRunner:
 
     @staticmethod
     def _trade_from_storage_row(row: dict) -> TradeRecord:
-        """把数据库成交记录反序列化为 TradeRecord。"""
+        """鎶婃暟鎹簱鎴愪氦璁板綍鍙嶅簭鍒楀寲涓?TradeRecord銆?"""
         direction = OrderDirection(str(row.get("direction", OrderDirection.BUY.value) or OrderDirection.BUY.value))
         trade_time = StrategyRunner._parse_db_datetime(row.get("trade_time"))
         return TradeRecord(
@@ -664,7 +741,7 @@ class StrategyRunner:
 
     @staticmethod
     def _position_from_storage_row(row: dict) -> PositionInfo:
-        """把 SQLite 持仓记录转换成 PositionInfo。"""
+        """鎶?SQLite 鎸佷粨璁板綍杞崲鎴?PositionInfo銆?"""
         fifo_lots = []
         raw_fifo = str(row.get("fifo_lots_json", "") or "").strip()
         if raw_fifo:
@@ -717,16 +794,16 @@ class StrategyRunner:
         )
 
     def _find_strategy_class(self, strategy_name: str) -> Optional[Type[BaseStrategy]]:
-        """根据策略名称找到对应的策略类。"""
+        """鏍规嵁绛栫暐鍚嶇О鎵惧埌瀵瑰簲鐨勭瓥鐣ョ被銆?"""
         for cls in self._strategy_classes:
             if cls.strategy_name == strategy_name:
                 return cls
         return None
 
-    # ------------------------------------------------------------------ 调度器
+    # ------------------------------------------------------------------ 璋冨害鍣?
 
     def _start_scheduler(self) -> None:
-        """启动 APScheduler 定时任务线程。"""
+        """鍚姩 APScheduler 瀹氭椂浠诲姟绾跨▼銆?"""
         try:
             from apscheduler.schedulers.blocking import BlockingScheduler
             from apscheduler.executors.pool import ProcessPoolExecutor as APSProcessPoolExecutor
@@ -736,10 +813,10 @@ class StrategyRunner:
                 "processpool": APSProcessPoolExecutor(max_workers=2),
             }
             self._scheduler = BlockingScheduler(executors=executors)
-            # 开盘前刷新当日策略并激活
+            # 寮€鐩樺墠鍒锋柊褰撴棩绛栫暐骞舵縺娲?
             self._scheduler.add_job(self.run_stock_selection, "cron",
                                     hour=9, minute=25, id="stock_selection")
-            # 收盘后保存状态
+            # 鏀剁洏鍚庝繚瀛樼姸鎬?
             self._scheduler.add_job(self.save_state, "cron",
                                     hour=15, minute=5, id="save_state")
             if self._state_autosave_interval_sec > 0:
@@ -748,7 +825,7 @@ class StrategyRunner:
                                         id="autosave_state")
             self._scheduler.add_job(self._sync_orders_and_trades_job, "interval",
                                     seconds=30, id="sync_orders_and_trades")
-            # 每30分钟清理已停止策略
+            # 姣?0鍒嗛挓娓呯悊宸插仠姝㈢瓥鐣?
             self._scheduler.add_job(self._cleanup_stopped, "interval",
                                     minutes=30, id="cleanup")
             self._scheduler_thread = threading.Thread(
@@ -764,13 +841,13 @@ class StrategyRunner:
             logger.error("StrategyRunner: 调度器启动失败: %s", e, exc_info=True)
 
     def _autosave_state(self) -> None:
-        """盘中周期保存状态，降低异常退出导致的持仓丢失风险。"""
+        """鐩樹腑鍛ㄦ湡淇濆瓨鐘舵€侊紝闄嶄綆寮傚父閫€鍑哄鑷寸殑鎸佷粨涓㈠け椋庨櫓銆?"""
         if not self._running or not self.is_trading_day():
             return
         self.save_state()
 
     def is_trading_time(self) -> bool:
-        """判断当前是否位于日内交易时段。"""
+        """鍒ゆ柇褰撳墠鏄惁浣嶄簬鏃ュ唴浜ゆ槗鏃舵銆?"""
         now = datetime.now()
         if not self.is_trading_day(now):
             return False
@@ -778,12 +855,12 @@ class StrategyRunner:
         return (("09:30" <= t <= "11:30") or ("13:00" <= t <= "15:00"))
 
     def is_trading_day(self, when=None) -> bool:
-        """判断指定日期是否为交易日。"""
+        """鍒ゆ柇鎸囧畾鏃ユ湡鏄惁涓轰氦鏄撴棩銆?"""
         target = when or datetime.now()
         return is_market_day(target)
 
     def _activate_for_trading_day(self, reason: str = "") -> bool:
-        """在交易日激活策略、恢复订阅。"""
+        """鍦ㄤ氦鏄撴棩婵€娲荤瓥鐣ャ€佹仮澶嶈闃呫€?"""
         if not self.is_trading_day():
             logger.info("StrategyRunner: 今日非交易日，跳过策略激活 [%s]", reason or "unknown")
             return False
@@ -798,12 +875,15 @@ class StrategyRunner:
                     strategy.start()
                     started += 1
 
-        logger.info("StrategyRunner: 交易日激活完成 [%s]，新增启动 %d 个策略",
-                    reason or "unknown", started)
+        logger.info(
+            "StrategyRunner: 交易日激活完成 [%s]，新增启动 %d 个策略",
+            reason or "unknown",
+            started,
+        )
         return True
 
     def _prepare_all_strategies_for_trading_day(self, reason: str = "") -> None:
-        """在统一订阅前，先完成所有策略的交易日预初始化。"""
+        """鍦ㄧ粺涓€璁㈤槄鍓嶏紝鍏堝畬鎴愭墍鏈夌瓥鐣ョ殑浜ゆ槗鏃ラ鍒濆鍖栥€?"""
         trade_day = datetime.now().strftime("%Y%m%d")
         with self._lock:
             strategies = list(self._strategies)
@@ -817,20 +897,20 @@ class StrategyRunner:
                 failed += 1
 
         logger.info(
-            "StrategyRunner: 交易日前初始化完成 [%s]，成功 %d，失败 %d",
+            "StrategyRunner: 浜ゆ槗鏃ュ墠鍒濆鍖栧畬鎴?[%s]锛屾垚鍔?%d锛屽け璐?%d",
             reason or "unknown",
             prepared,
             failed,
         )
 
     def _prepare_strategy_for_trading_day(self, strategy: BaseStrategy, trade_day: str = "") -> bool:
-        """为单个策略执行交易日前初始化。"""
+        """涓哄崟涓瓥鐣ユ墽琛屼氦鏄撴棩鍓嶅垵濮嬪寲銆?"""
         target_trade_day = trade_day or datetime.now().strftime("%Y%m%d")
         try:
             return bool(strategy.prepare_for_trading_day(target_trade_day))
         except Exception as exc:
             logger.error(
-                "StrategyRunner: Strategy[%s] 交易日前初始化失败: %s",
+                "StrategyRunner: Strategy[%s] 浜ゆ槗鏃ュ墠鍒濆鍖栧け璐? %s",
                 strategy.strategy_id[:8],
                 exc,
                 exc_info=True,
@@ -838,17 +918,66 @@ class StrategyRunner:
             return False
 
     def _subscribe_all(self) -> None:
-        """订阅当前所有策略涉及的证券代码。"""
+        self._sync_subscriptions()
+        return
+
+    def _sync_subscriptions(self) -> None:
+        """Keep ordinary-tick and Level2 subscriptions aligned with strategy needs."""
         if not self._data_sub:
             return
+
+        tick_codes, l2_plan = self._build_subscription_plan()
+        current_tick_codes = set(self._data_sub.get_subscription_list())
+        current_l2_map = {code: set(kinds) for code, kinds in self._data_sub.get_l2_subscription_map().items()}
+
+        desired_tick_codes = set(tick_codes)
+        add_tick_codes = sorted(desired_tick_codes - current_tick_codes)
+        remove_tick_codes = sorted(current_tick_codes - desired_tick_codes)
+
+        if add_tick_codes:
+            self._data_sub.subscribe_stocks(add_tick_codes)
+        if remove_tick_codes:
+            self._data_sub.unsubscribe_stocks(remove_tick_codes)
+
+        desired_l2_codes = set(l2_plan)
+        for code in sorted(desired_l2_codes | set(current_l2_map)):
+            desired_kinds = set(l2_plan.get(code, set()))
+            current_kinds = set(current_l2_map.get(code, set()))
+            add_kinds = sorted(desired_kinds - current_kinds)
+            remove_kinds = sorted(current_kinds - desired_kinds)
+            if add_kinds:
+                self._data_sub.subscribe_l2_stocks([code], kinds=add_kinds)
+            if remove_kinds:
+                self._data_sub.unsubscribe_l2_stocks([code], kinds=remove_kinds)
+
+    def _build_subscription_plan(self) -> tuple[List[str], Dict[str, set[str]]]:
+        tick_codes: set[str] = set()
+        l2_plan: Dict[str, set[str]] = {}
+
         with self._lock:
-            # 用集合去重，避免多个策略订阅同一标的时重复请求。
-            codes = list({s.stock_code for s in self._strategies})
-        if codes:
-            self._data_sub.subscribe_stocks(codes)
+            strategies = list(self._strategies)
+
+        for strategy in strategies:
+            kinds = self._normalize_strategy_data_kinds(strategy)
+            if "tick" in kinds:
+                tick_codes.add(strategy.stock_code)
+            l2_kinds = {kind for kind in kinds if kind != "tick"}
+            if l2_kinds:
+                l2_plan.setdefault(strategy.stock_code, set()).update(l2_kinds)
+
+        return sorted(tick_codes), l2_plan
+
+    @staticmethod
+    def _normalize_strategy_data_kinds(strategy: BaseStrategy) -> set[str]:
+        raw_kinds = getattr(strategy.__class__, "required_data_kinds", lambda: {"tick"})()
+        normalized = {str(kind or "").strip().lower() for kind in (raw_kinds or {"tick"})}
+        normalized.discard("")
+        allowed = getattr(strategy.__class__, "_supported_data_kinds", {"tick"})
+        valid = normalized & set(allowed)
+        return valid or {"tick"}
 
     def _restore_pending_orders_from_storage(self) -> int:
-        """从 SQLite 重建快照中记录的活动订单。"""
+        """浠?SQLite 閲嶅缓蹇収涓褰曠殑娲诲姩璁㈠崟銆?"""
         if not self._data_mgr or not self._order_mgr:
             return 0
 
@@ -866,7 +995,10 @@ class StrategyRunner:
 
         rows = self._data_mgr.query_orders(order_uuids=pending_order_ids)
         if not rows:
-            logger.warning("StrategyRunner: 快照记录了 %d 个活动订单，但数据库未找到对应记录", len(pending_order_ids))
+            logger.warning(
+                "StrategyRunner: 快照记录了 %d 个活动订单，但数据库未找到对应记录",
+                len(pending_order_ids),
+            )
             return 0
 
         restored_orders: Dict[str, Order] = {}
@@ -907,7 +1039,7 @@ class StrategyRunner:
         return restored_count
 
     def _cleanup_orphaned_pending_orders_from_storage(self) -> int:
-        """清理数据库里未被任何活策略接管的本地待报挂单。"""
+        """娓呯悊鏁版嵁搴撻噷鏈浠讳綍娲荤瓥鐣ユ帴绠＄殑鏈湴寰呮姤鎸傚崟銆?"""
         if not self._data_mgr:
             return 0
 
@@ -943,12 +1075,15 @@ class StrategyRunner:
             cleaned += 1
 
         if cleaned > 0:
-            logger.info("StrategyRunner: 已清理 %d 个未被活策略接管的本地待报挂单", cleaned)
+            logger.info(
+                "StrategyRunner: 已清理 %d 个未被活动策略接管的本地待报挂单",
+                cleaned,
+            )
         return cleaned
 
     @staticmethod
     def _deserialize_order_row(row: dict) -> Order:
-        """把数据库行反序列化成内部 Order 对象。"""
+        """鎶婃暟鎹簱琛屽弽搴忓垪鍖栨垚鍐呴儴 Order 瀵硅薄銆?"""
         return Order(
             order_uuid=str(row.get("order_uuid", "") or ""),
             order_trace_id=str(row.get("order_trace_id", "") or ""),
@@ -991,7 +1126,7 @@ class StrategyRunner:
 
     @staticmethod
     def _parse_db_datetime(value) -> datetime:
-        """把 SQLite 时间字段解析为 datetime。"""
+        """鎶?SQLite 鏃堕棿瀛楁瑙ｆ瀽涓?datetime銆?"""
         text = str(value or "").strip()
         if not text:
             return datetime.now()
@@ -1004,7 +1139,7 @@ class StrategyRunner:
 
     @staticmethod
     def _safe_json_loads(raw: str) -> dict:
-        """安全解析订单快照 JSON。"""
+        """瀹夊叏瑙ｆ瀽璁㈠崟蹇収 JSON銆?"""
         import json
 
         try:
@@ -1014,7 +1149,7 @@ class StrategyRunner:
         return data if isinstance(data, dict) else {}
 
     def _cleanup_stopped(self) -> None:
-        """移除已停止且无持仓的策略，同时归档盈亏"""
+        """绉婚櫎宸插仠姝笖鏃犳寔浠撶殑绛栫暐锛屽悓鏃跺綊妗ｇ泩浜?"""
         removed_ids = []
         with self._lock:
             remaining = []
@@ -1030,8 +1165,12 @@ class StrategyRunner:
                 try:
                     self._position_mgr.remove_position(strategy_id)
                 except Exception as e:
-                    logger.error("StrategyRunner: 清理策略持仓失败 [%s]: %s",
-                                 strategy_id[:8], e, exc_info=True)
+                    logger.error(
+                        "StrategyRunner: 清理策略持仓失败 [%s]: %s",
+                        strategy_id[:8],
+                        e,
+                        exc_info=True,
+                    )
 
         removed = len(removed_ids)
         if removed:
@@ -1039,19 +1178,19 @@ class StrategyRunner:
             self.request_state_persist("cleanup_stopped")
 
     def dispatch_order_update(self, order) -> None:
-        """将订单更新分发给对应策略"""
+        """灏嗚鍗曟洿鏂板垎鍙戠粰瀵瑰簲绛栫暐"""
         strategy = self.get_strategy(order.strategy_id)
         if strategy:
             strategy.on_order_update(order)
 
     def _sync_orders_and_trades_job(self) -> None:
-        """仅在交易时段运行主动同步，补偿漏回报场景。"""
+        """浠呭湪浜ゆ槗鏃舵杩愯涓诲姩鍚屾锛岃ˉ鍋挎紡鍥炴姤鍦烘櫙銆?"""
         if not self._running or not self.is_trading_time():
             return
         self.sync_orders_and_trades_once(reason="scheduler")
 
     def sync_orders_and_trades_once(self, reason: str = "manual") -> Dict[str, int]:
-        """主动拉取账户委托/成交并纠正本地状态。"""
+        """涓诲姩鎷夊彇璐︽埛濮旀墭/鎴愪氦骞剁籂姝ｆ湰鍦扮姸鎬併€?"""
         summary = {
             "trades_synced": 0,
             "orders_synced": 0,
@@ -1086,7 +1225,7 @@ class StrategyRunner:
         return summary
 
     def cancel_entry_orders_and_recover(self, strategy_id: str, remark: str = "") -> Dict[str, object]:
-        """人工撤销未成交建仓单，并在安全时恢复公平竞争状态。"""
+        """浜哄伐鎾ら攢鏈垚浜ゅ缓浠撳崟锛屽苟鍦ㄥ畨鍏ㄦ椂鎭㈠鍏钩绔炰簤鐘舵€併€?"""
         strategy = self.get_strategy(strategy_id)
         if not strategy:
             return {"success": False, "message": "策略不存在"}
@@ -1154,14 +1293,14 @@ class StrategyRunner:
         }
 
     def _build_account_position_map(self) -> Dict[str, Dict[str, int]]:
-        """查询并标准化账户持仓映射。"""
+        """鏌ヨ骞舵爣鍑嗗寲璐︽埛鎸佷粨鏄犲皠銆?"""
         if not self._connection_mgr or not self._connection_mgr.is_connected():
             return {}
 
         try:
             account_positions = self._connection_mgr.query_stock_positions()
         except Exception as exc:
-            logger.warning("StrategyRunner: 查询账户持仓失败，暂停对账视图返回空结果: %s", exc)
+            logger.warning("StrategyRunner: 查询账户持仓失败，暂停对账视图并返回空结果: %s", exc)
             return {}
 
         account_position_map: Dict[str, Dict[str, int]] = {}
@@ -1181,14 +1320,14 @@ class StrategyRunner:
         return account_position_map
 
     def _validate_account_constraints(self) -> None:
-        """在策略运行前核对账户资产和账户持仓。
+        """鍦ㄧ瓥鐣ヨ繍琛屽墠鏍稿璐︽埛璧勪骇鍜岃处鎴锋寔浠撱€?
 
-        校验规则：
-        1. 策略的最大可用资金不能明显大于账户可用资金。
-        2. 策略内部记录的标的持仓数量不能大于账户真实持仓数量。
-        3. 策略内部记录的可用数量不能大于账户真实可用数量。
+        鏍￠獙瑙勫垯锛?
+        1. 绛栫暐鐨勬渶澶у彲鐢ㄨ祫閲戜笉鑳芥槑鏄惧ぇ浜庤处鎴峰彲鐢ㄨ祫閲戙€?
+        2. 绛栫暐鍐呴儴璁板綍鐨勬爣鐨勬寔浠撴暟閲忎笉鑳藉ぇ浜庤处鎴风湡瀹炴寔浠撴暟閲忋€?
+        3. 绛栫暐鍐呴儴璁板綍鐨勫彲鐢ㄦ暟閲忎笉鑳藉ぇ浜庤处鎴风湡瀹炲彲鐢ㄦ暟閲忋€?
 
-        注意：这里按用户要求仅发出警告，不阻止程序继续运行。
+        娉ㄦ剰锛氳繖閲屾寜鐢ㄦ埛瑕佹眰浠呭彂鍑鸿鍛婏紝涓嶉樆姝㈢▼搴忕户缁繍琛屻€?
         """
         if not self._connection_mgr or not self._connection_mgr.is_connected():
             logger.info("StrategyRunner: 启动前账户校验已跳过，交易连接未就绪")
@@ -1257,7 +1396,7 @@ class StrategyRunner:
             if not account_position:
                 self._warn_preflight(
                     f"[启动前校验] 策略持仓显示 {stock_code} 共 {strategy_total} 股，"
-                    f"但账户中未查询到该标的持仓（策略: {strategy_names or '-' }）"
+                    f"但账户中未查询到该标的持仓（策略: {strategy_names or '-'}）"
                 )
                 self._pause_strategies_for_stock(stock_code, "账户未查询到对应持仓")
                 continue
@@ -1265,19 +1404,19 @@ class StrategyRunner:
             if strategy_total > account_volume:
                 self._warn_preflight(
                     f"[启动前校验] 策略持仓 {stock_code} 共 {strategy_total} 股，"
-                    f"超过账户实际持仓 {account_volume} 股（策略: {strategy_names or '-' }）"
+                    f"超过账户实际持仓 {account_volume} 股（策略: {strategy_names or '-'}）"
                 )
                 self._pause_strategies_for_stock(stock_code, "策略持仓超过账户实际持仓")
 
             if strategy_available > account_available:
                 self._warn_preflight(
                     f"[启动前校验] 策略可用持仓 {stock_code} 共 {strategy_available} 股，"
-                    f"超过账户实际可用持仓 {account_available} 股（策略: {strategy_names or '-' }）"
+                    f"超过账户实际可用持仓 {account_available} 股（策略: {strategy_names or '-'}）"
                 )
                 self._pause_strategies_for_stock(stock_code, "策略可用持仓超过账户实际可用持仓")
 
     def _sync_position_availability_with_account(self, account_position_map: Dict[str, Dict[str, int]]) -> None:
-        """按账户真实可用持仓压降策略侧 available_quantity。"""
+        """鎸夎处鎴风湡瀹炲彲鐢ㄦ寔浠撳帇闄嶇瓥鐣ヤ晶 available_quantity銆?"""
         if not self._position_mgr:
             return
 
@@ -1311,7 +1450,7 @@ class StrategyRunner:
         positions: List[PositionInfo],
         account_available: int,
     ) -> Dict[str, int]:
-        """按账户可用上限压降同一标的多个策略的可卖数量。"""
+        """鎸夎处鎴峰彲鐢ㄤ笂闄愬帇闄嶅悓涓€鏍囩殑澶氫釜绛栫暐鐨勫彲鍗栨暟閲忋€?"""
         valid_positions = [pos for pos in positions if int(getattr(pos, "total_quantity", 0) or 0) > 0]
         if not valid_positions:
             return {}
@@ -1359,7 +1498,7 @@ class StrategyRunner:
         return allocations
 
     def _pause_strategies_for_stock(self, stock_code: str, reason: str) -> None:
-        """当账户持仓约束不满足时，暂停相关策略以避免继续发出错误交易指令。"""
+        """褰撹处鎴锋寔浠撶害鏉熶笉婊¤冻鏃讹紝鏆傚仠鐩稿叧绛栫暐浠ラ伩鍏嶇户缁彂鍑洪敊璇氦鏄撴寚浠ゃ€?"""
         paused_ids = []
         with self._lock:
             for strategy in self._strategies:
@@ -1378,7 +1517,7 @@ class StrategyRunner:
             )
 
     def _sync_trades_from_account(self, queried_trades: List[object]) -> int:
-        """把账户成交查询结果补灌回内部订单/持仓链路。"""
+        """鎶婅处鎴锋垚浜ゆ煡璇㈢粨鏋滆ˉ鐏屽洖鍐呴儴璁㈠崟/鎸佷粨閾捐矾銆?"""
         if not queried_trades:
             return 0
 
@@ -1426,7 +1565,7 @@ class StrategyRunner:
         return synced
 
     def _get_known_trade_ids(self) -> set[str]:
-        """返回已知成交 ID 集合，并在首次使用时从数据库预热。"""
+        """杩斿洖宸茬煡鎴愪氦 ID 闆嗗悎锛屽苟鍦ㄩ娆′娇鐢ㄦ椂浠庢暟鎹簱棰勭儹銆?"""
         if self._known_trade_ids is None:
             known_trade_ids: set[str] = set()
             if self._data_mgr:
@@ -1439,7 +1578,7 @@ class StrategyRunner:
         return self._known_trade_ids
 
     def _sync_orders_from_account(self, queried_orders: List[object]) -> Dict[str, int]:
-        """把账户委托查询结果回写到本地订单状态。"""
+        """鎶婅处鎴峰鎵樻煡璇㈢粨鏋滃洖鍐欏埌鏈湴璁㈠崟鐘舵€併€?"""
         summary = {"orders_synced": 0, "state_recovered": 0}
         if not queried_orders:
             return summary
@@ -1526,7 +1665,7 @@ class StrategyRunner:
         seen_xt_order_ids: set[int],
         seen_trace_ids: set[str],
     ) -> bool:
-        """判断本地活动单是否已在柜台委托列表中出现。"""
+        """鍒ゆ柇鏈湴娲诲姩鍗曟槸鍚﹀凡鍦ㄦ煖鍙板鎵樺垪琛ㄤ腑鍑虹幇銆?"""
         xt_order_id = int(getattr(local_order, "xt_order_id", 0) or 0)
         if xt_order_id > 0 and xt_order_id in seen_xt_order_ids:
             return True
@@ -1535,7 +1674,7 @@ class StrategyRunner:
 
     @staticmethod
     def _resolve_missing_active_order_status(local_order: Order) -> OrderStatus:
-        """为“柜台侧不存在”的本地活动单选择收敛终态。"""
+        """涓衡€滄煖鍙颁晶涓嶅瓨鍦ㄢ€濈殑鏈湴娲诲姩鍗曢€夋嫨鏀舵暃缁堟€併€?"""
         if int(getattr(local_order, "filled_quantity", 0) or 0) > 0:
             return OrderStatus.PART_CANCEL
         if int(getattr(local_order, "xt_order_id", 0) or 0) > 0:
@@ -1543,7 +1682,7 @@ class StrategyRunner:
         return OrderStatus.JUNK
 
     def _recover_strategy_after_entry_release(self, strategy: BaseStrategy) -> bool:
-        """在无持仓且无活动买单时，把策略收敛回正确状态。"""
+        """鍦ㄦ棤鎸佷粨涓旀棤娲诲姩涔板崟鏃讹紝鎶婄瓥鐣ユ敹鏁涘洖姝ｇ‘鐘舵€併€?"""
         if not strategy or strategy.status == StrategyStatus.STOPPED:
             return False
 
@@ -1561,7 +1700,7 @@ class StrategyRunner:
         return True
 
     def _warn_preflight(self, message: str) -> None:
-        """统一处理启动前校验警告：同时写日志并发送告警。"""
+        """缁熶竴澶勭悊鍚姩鍓嶆牎楠岃鍛婏細鍚屾椂鍐欐棩蹇楀苟鍙戦€佸憡璀︺€?"""
         logger.warning(message)
         if self._alert_callback:
             try:
@@ -1571,7 +1710,7 @@ class StrategyRunner:
 
     @staticmethod
     def _map_xt_order_status(xt_status) -> OrderStatus:
-        """将 xtquant 原始订单状态码映射为内部状态。"""
+        """灏?xtquant 鍘熷璁㈠崟鐘舵€佺爜鏄犲皠涓哄唴閮ㄧ姸鎬併€?"""
         mapping = {
             48: OrderStatus.UNREPORTED,
             49: OrderStatus.WAIT_REPORTING,
@@ -1589,7 +1728,7 @@ class StrategyRunner:
 
     @staticmethod
     def _extract_public_attrs(payload) -> Dict[str, object]:
-        """提取对象上的公开属性，便于调试和持久化。"""
+        """鎻愬彇瀵硅薄涓婄殑鍏紑灞炴€э紝渚夸簬璋冭瘯鍜屾寔涔呭寲銆?"""
         data: Dict[str, object] = {}
         if payload is None:
             return data
@@ -1606,7 +1745,7 @@ class StrategyRunner:
         return data
 
     def _build_xt_order_payload(self, order) -> Dict[str, object]:
-        """把查询得到的 XtOrder 对象转换成统一 dict。"""
+        """鎶婃煡璇㈠緱鍒扮殑 XtOrder 瀵硅薄杞崲鎴愮粺涓€ dict銆?"""
         return {
             "account_type": int(getattr(order, "account_type", 0) or 0),
             "account_id": str(getattr(order, "account_id", "") or ""),
@@ -1634,7 +1773,7 @@ class StrategyRunner:
 
     @staticmethod
     def _xt_to_code(xt_code: str) -> str:
-        """把 xtquant 证券代码转换为 6 位内部证券代码。"""
+        """鎶?xtquant 璇佸埜浠ｇ爜杞崲涓?6 浣嶅唴閮ㄨ瘉鍒镐唬鐮併€?"""
         return xt_code.split(".")[0] if "." in xt_code else xt_code
 
 

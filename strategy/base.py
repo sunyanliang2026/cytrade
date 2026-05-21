@@ -56,6 +56,7 @@ class BaseStrategy(ABC):
     current_positions: int = 0
     current_used_amount: float = 0.0
     _class_used_amount: float = 0.0
+    _supported_data_kinds = frozenset({"tick", "l2quote", "l2transaction", "l2order", "l2orderqueue"})
     _current_positions_count: int = 0  # 当前持仓标的数
     _lock = threading.Lock()  # 类级别锁，保护共享统计
 
@@ -146,6 +147,11 @@ class BaseStrategy(ABC):
 
     # ------------------------------------------------------------------ 主处理流程
 
+    @classmethod
+    def required_data_kinds(cls) -> set[str]:
+        """Declare which market data channels this strategy needs."""
+        return {"tick"}
+
     def process_tick(self, tick: TickData) -> None:
         """处理一条最新行情。
 
@@ -195,6 +201,22 @@ class BaseStrategy(ABC):
 
         子类可覆盖，用于在真正进入 `process_tick()` 前做恢复/清理判断。
         """
+        return None
+
+    def on_l2_quote(self, event: Any) -> None:
+        """Handle a normalized Level2 quote event."""
+        return None
+
+    def on_l2_transaction(self, event: Any) -> None:
+        """Handle a normalized Level2 transaction event."""
+        return None
+
+    def on_l2_order(self, event: Any) -> None:
+        """Handle a normalized Level2 order event."""
+        return None
+
+    def on_l2_orderqueue(self, event: Any) -> None:
+        """Handle a normalized Level2 order queue event."""
         return None
 
     def _check_risk(self, tick: TickData) -> bool:

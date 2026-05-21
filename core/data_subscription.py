@@ -1,18 +1,22 @@
 """
-数据订阅模块
-- 订阅/取消订阅实时行情
-- 预处理 xtquant 推送数据 → TickData
-- 计算数据延迟并记录到日志
-- 通过回调传递给策略运行模块
+Market data subscription management.
+
+- Subscribe/unsubscribe real-time market data
+- Normalize xtquant payloads into project-level models
+- Track latest data timestamps and latency
+- Dispatch ordinary tick and Level2 data through dedicated callbacks
 """
+from __future__ import annotations
+
+import sys
 import threading
 import time
-import sys
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from config.enums import SubscriptionPeriod
+from core.l2_models import L2OrderEvent, L2OrderQueueEvent, L2QuoteEvent, L2TransactionEvent
 from core.models import TickData
 from monitor.logger import get_logger
 
@@ -20,6 +24,7 @@ logger = get_logger("system")
 
 try:
     from xtquant import xtdata
+
     _XT_AVAILABLE = True
 except ImportError:
     _XT_AVAILABLE = False
@@ -27,20 +32,28 @@ except ImportError:
 
 
 class DataSubscriptionManager:
-    """实时行情数据订阅管理。
+    """Manage ordinary tick and Level2 data subscriptions."""
 
-    它的职责是：
-    - 维护当前订阅了哪些证券
-    - 接收 xtquant 推送的原始数据
-    - 转换成统一 ``TickData``
-    - 检查延迟并转发给策略层
-    """
+    SUPPORTED_L2_KINDS = frozenset({"l2quote", "l2transaction", "l2order", "l2orderqueue"})
 
-    def __init__(self, latency_threshold_sec: float = 10.0,
-                 default_period: SubscriptionPeriod | str = SubscriptionPeriod.TICK):
-        self._subscriptions: Dict[str, str] = {}  # {stock_code: period}
-        self._subscription_ids: Dict[str, int] = {}  # {stock_code: subscribe_id}
+    def __init__(
+        self,
+        latency_threshold_sec: float = 10.0,
+        default_period: SubscriptionPeriod | str = SubscriptionPeriod.TICK,
+    ):
+        self._subscriptions: Dict[str, str] = {}
+        self._subscription_ids: Dict[str, int] = {}
+        self._l2_subscriptions: Dict[str, set[str]] = {}
+        self._l2_subscription_ids: Dict[tuple[str, str], int] = {}
+
         self._data_callback: Optional[Callable[[Dict[str, TickData]], None]] = None
+        self._l2_quote_callback: Optional[Callable[[Dict[str, L2QuoteEvent]], None]] = None
+        self._l2_transaction_callback: Optional[
+            Callable[[Dict[str, List[L2TransactionEvent]]], None]
+        ] = None
+        self._l2_order_callback: Optional[Callable[[Dict[str, List[L2OrderEvent]]], None]] = None
+        self._l2_orderqueue_callback: Optional[Callable[[Dict[str, L2OrderQueueEvent]], None]] = None
+
         self._latency_threshold = latency_threshold_sec
         self._default_period = self._normalize_period(default_period)
         self._running = False
@@ -55,84 +68,167 @@ class DataSubscriptionManager:
     # ------------------------------------------------------------------ Public
 
     def subscribe_stocks(self, stock_codes: List[str], period: SubscriptionPeriod | str = "") -> None:
-        """订阅一组股票的实时行情。"""
+        """Subscribe ordinary tick data for a list of stocks."""
         period = self._normalize_period(period or self._default_period)
         xt_codes = [self._to_xt(c) for c in stock_codes]
         with self._lock:
-            for code, xt_code in zip(stock_codes, xt_codes):
-                # 先在本地记录订阅意图，方便断线重连后恢复。
+            for code in stock_codes:
                 self._subscriptions[code] = period
 
         if not _XT_AVAILABLE:
-            logger.warning("DataSubscription: xtquant 未安装，跳过实际订阅")
+            logger.warning("DataSubscription: xtquant not installed, skip real tick subscribe")
             return
+
         try:
             self._ensure_xtdata_connected()
-            # 逐只订阅（xtdata.subscribe_quote 接收单个代码）
             for code, xt_code in zip(stock_codes, xt_codes):
-                old_sub_id = self._subscription_ids.get(code)
-                if old_sub_id is not None:
-                    try:
-                        # 同一只股票重复订阅前，先取消旧订阅，避免句柄泄漏。
-                        xtdata.unsubscribe_quote(old_sub_id)
-                    except Exception:
-                        pass
-                sub_id = xtdata.subscribe_quote(
-                    xt_code,
+                self._subscribe_xt_quote(
+                    subscribe_key=code,
+                    xt_code=xt_code,
                     period=period,
-                    count=-1,
                     callback=self._on_data,
+                    subscription_ids=self._subscription_ids,
                 )
-                self._subscription_ids[code] = int(sub_id) if sub_id is not None else -1
-            logger.info("DataSubscription: 订阅 %d 只股票 [%s]", len(xt_codes), period)
+            logger.info("DataSubscription: subscribed %d stocks [%s]", len(xt_codes), period)
         except Exception as e:
-            logger.error("DataSubscription: 订阅失败: %s", e, exc_info=True)
+            logger.error("DataSubscription: subscribe_stocks failed: %s", e, exc_info=True)
 
     def unsubscribe_stocks(self, stock_codes: List[str]) -> None:
-        """取消一组股票的实时订阅。"""
-        xt_codes = [self._to_xt(c) for c in stock_codes]
-        sub_ids = {}
+        """Unsubscribe ordinary tick data for a list of stocks."""
+        sub_ids: Dict[str, Optional[int]] = {}
         with self._lock:
             for code in stock_codes:
                 sub_ids[code] = self._subscription_ids.get(code)
                 self._subscriptions.pop(code, None)
                 self._subscription_ids.pop(code, None)
+
         if not _XT_AVAILABLE:
             return
+
         try:
             for code in stock_codes:
                 sub_id = sub_ids.get(code)
                 if sub_id is not None:
                     xtdata.unsubscribe_quote(sub_id)
-            logger.info("DataSubscription: 取消订阅 %d 只股票", len(xt_codes))
+            logger.info("DataSubscription: unsubscribed %d stocks", len(stock_codes))
         except Exception as e:
-            logger.error("DataSubscription: 取消订阅失败: %s", e, exc_info=True)
+            logger.error("DataSubscription: unsubscribe_stocks failed: %s", e, exc_info=True)
+
+    def subscribe_l2_stocks(self, stock_codes: List[str], kinds: Optional[List[str] | set[str] | tuple[str, ...]] = None) -> None:
+        """Subscribe Level2 feeds for a list of stocks."""
+        requested_kinds = self._normalize_l2_kinds(kinds or self.SUPPORTED_L2_KINDS)
+        xt_codes = [self._to_xt(c) for c in stock_codes]
+
+        with self._lock:
+            for code in stock_codes:
+                self._l2_subscriptions.setdefault(code, set()).update(requested_kinds)
+
+        if not _XT_AVAILABLE:
+            logger.warning("DataSubscription: xtquant not installed, skip real Level2 subscribe")
+            return
+
+        try:
+            self._ensure_xtdata_connected()
+            for code, xt_code in zip(stock_codes, xt_codes):
+                for kind in requested_kinds:
+                    self._subscribe_xt_quote(
+                        subscribe_key=(code, kind),
+                        xt_code=xt_code,
+                        period=kind,
+                        callback=self._get_l2_callback(kind),
+                        subscription_ids=self._l2_subscription_ids,
+                    )
+            logger.info(
+                "DataSubscription: subscribed %d stocks for Level2 kinds=%s",
+                len(stock_codes),
+                ",".join(sorted(requested_kinds)),
+            )
+        except Exception as e:
+            logger.error("DataSubscription: subscribe_l2_stocks failed: %s", e, exc_info=True)
+
+    def unsubscribe_l2_stocks(
+        self,
+        stock_codes: List[str],
+        kinds: Optional[List[str] | set[str] | tuple[str, ...]] = None,
+    ) -> None:
+        """Unsubscribe Level2 feeds for a list of stocks."""
+        requested_kinds = self._normalize_l2_kinds(kinds or self.SUPPORTED_L2_KINDS)
+        sub_ids: Dict[tuple[str, str], Optional[int]] = {}
+
+        with self._lock:
+            for code in stock_codes:
+                existing = self._l2_subscriptions.get(code, set())
+                for kind in requested_kinds:
+                    sub_ids[(code, kind)] = self._l2_subscription_ids.get((code, kind))
+                    existing.discard(kind)
+                    self._l2_subscription_ids.pop((code, kind), None)
+                if existing:
+                    self._l2_subscriptions[code] = existing
+                else:
+                    self._l2_subscriptions.pop(code, None)
+
+        if not _XT_AVAILABLE:
+            return
+
+        try:
+            for subscribe_key, sub_id in sub_ids.items():
+                if sub_id is not None:
+                    xtdata.unsubscribe_quote(sub_id)
+            logger.info(
+                "DataSubscription: unsubscribed Level2 for %d stocks kinds=%s",
+                len(stock_codes),
+                ",".join(sorted(requested_kinds)),
+            )
+        except Exception as e:
+            logger.error("DataSubscription: unsubscribe_l2_stocks failed: %s", e, exc_info=True)
 
     def subscribe_whole_market(self, period: SubscriptionPeriod | str = "") -> None:
-        """开启全市场订阅。"""
+        """Subscribe the whole market using the ordinary quote pipeline."""
         period = self._normalize_period(period or self._default_period)
         self._whole_market = True
         if not _XT_AVAILABLE:
-            logger.warning("DataSubscription: xtquant 未安装，跳过全市场订阅")
+            logger.warning("DataSubscription: xtquant not installed, skip whole-market subscribe")
             return
+
         try:
             self._ensure_xtdata_connected()
             self._whole_market_subscribe_id = xtdata.subscribe_whole_quote(["SH", "SZ"], callback=self._on_data)
-            logger.info("DataSubscription: 全市场订阅已启动 [%s]", period)
+            logger.info("DataSubscription: whole market subscribed [%s]", period)
         except Exception as e:
-            logger.error("DataSubscription: 全市场订阅失败: %s", e, exc_info=True)
+            logger.error("DataSubscription: subscribe_whole_market failed: %s", e, exc_info=True)
 
     def get_subscription_list(self) -> List[str]:
-        """返回当前已记录的订阅股票代码列表。"""
+        """Return subscribed ordinary-tick stock codes."""
         with self._lock:
             return list(self._subscriptions.keys())
 
+    def get_l2_subscription_map(self) -> Dict[str, List[str]]:
+        """Return subscribed Level2 intents grouped by stock."""
+        with self._lock:
+            return {
+                code: sorted(kinds)
+                for code, kinds in self._l2_subscriptions.items()
+                if kinds
+            }
+
     def set_data_callback(self, callback: Callable[[Dict[str, TickData]], None]) -> None:
-        """设置数据分发回调 — 由 StrategyRunner 注册"""
         self._data_callback = callback
 
+    def set_l2_quote_callback(self, callback: Callable[[Dict[str, L2QuoteEvent]], None]) -> None:
+        self._l2_quote_callback = callback
+
+    def set_l2_transaction_callback(
+        self, callback: Callable[[Dict[str, List[L2TransactionEvent]]], None]
+    ) -> None:
+        self._l2_transaction_callback = callback
+
+    def set_l2_order_callback(self, callback: Callable[[Dict[str, List[L2OrderEvent]]], None]) -> None:
+        self._l2_order_callback = callback
+
+    def set_l2_orderqueue_callback(self, callback: Callable[[Dict[str, L2OrderQueueEvent]], None]) -> None:
+        self._l2_orderqueue_callback = callback
+
     def get_latest_data_status(self) -> dict:
-        """返回最近一笔行情的时间与延迟快照。"""
         with self._lock:
             latest_data_time = self._latest_data_time
             latest_latency_ms = self._latest_latency_ms
@@ -145,13 +241,10 @@ class DataSubscriptionManager:
         }
 
     def resubscribe_all(self) -> None:
-        """重连后重建全量订阅。
-
-        这是连接恢复后的关键补偿逻辑。
-        没有这一步，系统虽然重新连上了，但策略可能再也收不到行情。
-        """
+        """Restore subscription intents after reconnect."""
         with self._lock:
             subscriptions = dict(self._subscriptions)
+            l2_subscriptions = {code: set(kinds) for code, kinds in self._l2_subscriptions.items()}
             whole_market = self._whole_market
 
         if whole_market:
@@ -160,43 +253,47 @@ class DataSubscriptionManager:
         if subscriptions:
             period_groups: Dict[str, List[str]] = {}
             for code, period in subscriptions.items():
-                # 相同周期的订阅合并处理，避免重复逻辑。
                 period_groups.setdefault(period, []).append(code)
             for period, codes in period_groups.items():
                 self.subscribe_stocks(codes, period)
         else:
-            logger.info("DataSubscription: 没有已订阅的股票")
+            logger.info("DataSubscription: no ordinary subscriptions to restore")
 
-        logger.info("DataSubscription: 已完成重连后的订阅恢复（%d 只股票, whole=%s)",
-                    len(subscriptions), whole_market)
+        if l2_subscriptions:
+            for code, kinds in l2_subscriptions.items():
+                self.subscribe_l2_stocks([code], kinds=sorted(kinds))
+        else:
+            logger.info("DataSubscription: no Level2 subscriptions to restore")
+
+        logger.info(
+            "DataSubscription: resubscribe_all done tick=%d l2=%d whole=%s",
+            len(subscriptions),
+            len(l2_subscriptions),
+            whole_market,
+        )
 
     def start(self) -> None:
-        """启动订阅主循环。
-
-        xtquant 的 ``xtdata.run()`` 是阻塞式的，所以通常放到独立线程中运行。
-        """
+        """Run the xtdata event loop."""
         self._running = True
-        logger.info("DataSubscription: 启动 xtdata.run()")
+        logger.info("DataSubscription: start xtdata.run()")
         if _XT_AVAILABLE:
             try:
                 self._ensure_xtdata_connected()
                 xtdata.run()
             except Exception as e:
-                logger.error("DataSubscription: xtdata.run() 异常: %s", e, exc_info=True)
+                logger.error("DataSubscription: xtdata.run() failed: %s", e, exc_info=True)
         else:
-            # Mock 模式：空转
             while self._running:
                 time.sleep(1)
 
     def stop(self) -> None:
-        """停止订阅主循环。"""
         self._running = False
-        logger.info("DataSubscription: 已停止")
+        logger.info("DataSubscription: stopped")
 
-    # ------------------------------------------------------------------ Internal callback
+    # ------------------------------------------------------------------ Internal callbacks
 
     def _on_data(self, raw_data: dict) -> None:
-        """处理 xtquant 推送：解析、告警、再转发给策略层。"""
+        """Handle ordinary quote/tick payloads."""
         try:
             recv_time = datetime.now()
             ticks: Dict[str, TickData] = {}
@@ -209,27 +306,82 @@ class DataSubscriptionManager:
                 if latest_tick is None or (tick.data_time or recv_time) >= (latest_tick.data_time or recv_time):
                     latest_tick = tick
 
-                # 延迟告警
                 if tick.latency_ms > self._latency_threshold * 1000:
                     logger.warning(
-                        "DataSubscription: 数据延迟 %.1fs > %.1fs [%s]",
-                        tick.latency_ms / 1000, self._latency_threshold, code
+                        "DataSubscription: data latency %.1fs > %.1fs [%s]",
+                        tick.latency_ms / 1000,
+                        self._latency_threshold,
+                        code,
                     )
 
             if latest_tick is not None:
                 self._update_latest_data_status(latest_tick)
 
             if ticks and self._data_callback:
-                # 只把已经标准化过的数据对象传给上层，降低策略层复杂度。
                 self._data_callback(ticks)
 
         except Exception as e:
-            logger.error("DataSubscription: _on_data 异常: %s", e, exc_info=True)
+            logger.error("DataSubscription: _on_data failed: %s", e, exc_info=True)
 
-    # ------------------------------------------------------------------ Mock push (for testing)
+    def _on_l2_quote_data(self, raw_data: dict) -> None:
+        try:
+            recv_time = datetime.now()
+            events: Dict[str, L2QuoteEvent] = {}
+            for xt_code, data in raw_data.items():
+                code = xt_code.split(".")[0] if "." in xt_code else xt_code
+                event = self._parse_l2_quote(code, data, recv_time)
+                events[code] = event
+            if events and self._l2_quote_callback:
+                self._l2_quote_callback(events)
+        except Exception as e:
+            logger.error("DataSubscription: _on_l2_quote_data failed: %s", e, exc_info=True)
+
+    def _on_l2_transaction_data(self, raw_data: dict) -> None:
+        try:
+            recv_time = datetime.now()
+            events_by_code: Dict[str, List[L2TransactionEvent]] = {}
+            for xt_code, data in raw_data.items():
+                code = xt_code.split(".")[0] if "." in xt_code else xt_code
+                records = self._normalize_record_payloads(code, data)
+                events = [self._parse_l2_transaction_record(code, record, recv_time) for record in records]
+                if events:
+                    events_by_code[code] = events
+            if events_by_code and self._l2_transaction_callback:
+                self._l2_transaction_callback(events_by_code)
+        except Exception as e:
+            logger.error("DataSubscription: _on_l2_transaction_data failed: %s", e, exc_info=True)
+
+    def _on_l2_order_data(self, raw_data: dict) -> None:
+        try:
+            recv_time = datetime.now()
+            events_by_code: Dict[str, List[L2OrderEvent]] = {}
+            for xt_code, data in raw_data.items():
+                code = xt_code.split(".")[0] if "." in xt_code else xt_code
+                records = self._normalize_record_payloads(code, data)
+                events = [self._parse_l2_order_record(code, record, recv_time) for record in records]
+                if events:
+                    events_by_code[code] = events
+            if events_by_code and self._l2_order_callback:
+                self._l2_order_callback(events_by_code)
+        except Exception as e:
+            logger.error("DataSubscription: _on_l2_order_data failed: %s", e, exc_info=True)
+
+    def _on_l2_orderqueue_data(self, raw_data: dict) -> None:
+        try:
+            recv_time = datetime.now()
+            events: Dict[str, L2OrderQueueEvent] = {}
+            for xt_code, data in raw_data.items():
+                code = xt_code.split(".")[0] if "." in xt_code else xt_code
+                event = self._parse_l2_orderqueue(code, data, recv_time)
+                events[code] = event
+            if events and self._l2_orderqueue_callback:
+                self._l2_orderqueue_callback(events)
+        except Exception as e:
+            logger.error("DataSubscription: _on_l2_orderqueue_data failed: %s", e, exc_info=True)
+
+    # ------------------------------------------------------------------ Mock push
 
     def push_mock_tick(self, code: str, price: float, volume: int = 1000) -> None:
-        """测试用：手动推送一条模拟 tick。"""
         recv_time = datetime.now()
         tick = TickData(
             stock_code=code,
@@ -240,11 +392,9 @@ class DataSubscriptionManager:
             pre_close=price * 0.99,
             volume=volume,
             amount=price * volume,
-            bid_prices=[price - 0.01, price - 0.02, price - 0.03,
-                        price - 0.04, price - 0.05],
+            bid_prices=[price - 0.01, price - 0.02, price - 0.03, price - 0.04, price - 0.05],
             bid_volumes=[100] * 5,
-            ask_prices=[price + 0.01, price + 0.02, price + 0.03,
-                        price + 0.04, price + 0.05],
+            ask_prices=[price + 0.01, price + 0.02, price + 0.03, price + 0.04, price + 0.05],
             ask_volumes=[100] * 5,
             data_time=recv_time,
             recv_time=recv_time,
@@ -254,10 +404,129 @@ class DataSubscriptionManager:
         if self._data_callback:
             self._data_callback({code: tick})
 
+    def push_mock_l2_quote(self, code: str, price: float, limit_up_price: float = 0.0) -> None:
+        if not self._l2_quote_callback:
+            return
+        now = datetime.now()
+        self._l2_quote_callback(
+            {
+                code: L2QuoteEvent(
+                    stock_code=code,
+                    last_price=price,
+                    pre_close=price * 0.99,
+                    bid1=price,
+                    ask1=price + 0.01,
+                    limit_up_price=limit_up_price,
+                    event_time=now,
+                    recv_time=now,
+                    raw_xt_fields={"mock": True},
+                )
+            }
+        )
+
+    def push_mock_l2_transaction(self, code: str, price: float, volume: int, side: str = "BUY") -> None:
+        if not self._l2_transaction_callback:
+            return
+        now = datetime.now()
+        self._l2_transaction_callback(
+            {
+                code: [
+                    L2TransactionEvent(
+                        stock_code=code,
+                        price=price,
+                        volume=volume,
+                        amount=price * volume,
+                        side=side,
+                        event_time=now,
+                        recv_time=now,
+                        raw_xt_fields={"mock": True},
+                    )
+                ]
+            }
+        )
+
+    def push_mock_l2_order(
+        self,
+        code: str,
+        price: float,
+        volume: int,
+        side: str = "BUY",
+        is_cancel: bool = False,
+        entrust_no: str = "",
+    ) -> None:
+        if not self._l2_order_callback:
+            return
+        now = datetime.now()
+        self._l2_order_callback(
+            {
+                code: [
+                    L2OrderEvent(
+                        stock_code=code,
+                        price=price,
+                        volume=volume,
+                        amount=price * volume,
+                        side=side,
+                        entrust_no=entrust_no,
+                        is_cancel=is_cancel,
+                        event_time=now,
+                        recv_time=now,
+                        raw_xt_fields={"mock": True},
+                    )
+                ]
+            }
+        )
+
+    def push_mock_l2_orderqueue(self, code: str, price: float, bid_level_volume: List[int]) -> None:
+        if not self._l2_orderqueue_callback:
+            return
+        now = datetime.now()
+        self._l2_orderqueue_callback(
+            {
+                code: L2OrderQueueEvent(
+                    stock_code=code,
+                    price=price,
+                    bid_level_volume=[int(v) for v in bid_level_volume],
+                    event_time=now,
+                    recv_time=now,
+                    raw_xt_fields={"mock": True},
+                )
+            }
+        )
+
     # ------------------------------------------------------------------ Private
 
+    def _subscribe_xt_quote(
+        self,
+        subscribe_key: Any,
+        xt_code: str,
+        period: str,
+        callback,
+        subscription_ids: dict,
+    ) -> None:
+        old_sub_id = subscription_ids.get(subscribe_key)
+        if old_sub_id is not None:
+            try:
+                xtdata.unsubscribe_quote(old_sub_id)
+            except Exception:
+                pass
+        sub_id = xtdata.subscribe_quote(
+            xt_code,
+            period=period,
+            count=-1,
+            callback=callback,
+        )
+        subscription_ids[subscribe_key] = int(sub_id) if sub_id is not None else -1
+
+    def _get_l2_callback(self, kind: str):
+        callback_map = {
+            "l2quote": self._on_l2_quote_data,
+            "l2transaction": self._on_l2_transaction_data,
+            "l2order": self._on_l2_order_data,
+            "l2orderqueue": self._on_l2_orderqueue_data,
+        }
+        return callback_map[kind]
+
     def _ensure_xtdata_connected(self):
-        """确保 xtdata 已与当前 QMT 数据目录建立连接。"""
         if not _XT_AVAILABLE or self._xtdata_connected:
             return None
 
@@ -267,11 +536,10 @@ class DataSubscriptionManager:
 
             client = xtdata.connect()
             self._xtdata_connected = True
-            logger.info("DataSubscription: xtdata 已连接 data_dir=%s", xtdata.get_data_dir())
+            logger.info("DataSubscription: xtdata connected data_dir=%s", xtdata.get_data_dir())
             return client
 
     def _update_latest_data_status(self, tick: TickData) -> None:
-        """更新最近一笔行情快照，并在交互终端中单行刷新显示。"""
         latest_data_time = tick.data_time or tick.recv_time or datetime.now()
         last_recv_time = tick.recv_time or datetime.now()
         with self._lock:
@@ -283,54 +551,51 @@ class DataSubscriptionManager:
 
     @staticmethod
     def _print_latest_data_status(latest_data_time: datetime, latency_ms: float) -> None:
-        """在本地交互终端中刷新显示最新行情时间与延迟。"""
         if not getattr(sys.stdout, "isatty", lambda: False)():
             return
 
         latest_text = latest_data_time.strftime("%Y-%m-%d %H:%M:%S")
-        if latency_ms >= 1000:
-            delay_text = f"{latency_ms / 1000:.2f}s"
-        else:
-            delay_text = f"{latency_ms:.0f}ms"
-
-        sys.stdout.write(f"\r最新数据时间: {latest_text} | 数据延迟: {delay_text}      ")
+        delay_text = f"{latency_ms / 1000:.2f}s" if latency_ms >= 1000 else f"{latency_ms:.0f}ms"
+        sys.stdout.write(f"\rLatest data time: {latest_text} | Latency: {delay_text}      ")
         sys.stdout.flush()
 
     @staticmethod
     def _normalize_period(period: SubscriptionPeriod | str) -> str:
-        """把订阅周期统一标准化为 xtquant 需要的字符串值。"""
         if isinstance(period, SubscriptionPeriod):
             return period.value
         try:
             return SubscriptionPeriod(str(period)).value
         except ValueError:
-            logger.warning("DataSubscription: 非法订阅周期 %s，回退为 tick", period)
+            logger.warning("DataSubscription: invalid period %s, fallback to tick", period)
             return SubscriptionPeriod.TICK.value
+
+    @classmethod
+    def _normalize_l2_kinds(cls, kinds: List[str] | set[str] | tuple[str, ...]) -> List[str]:
+        normalized = []
+        seen = set()
+        for kind in kinds:
+            text = str(kind or "").strip().lower()
+            if not text or text not in cls.SUPPORTED_L2_KINDS or text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        if not normalized:
+            raise ValueError("No valid Level2 kinds provided")
+        return normalized
 
     @staticmethod
     def _parse_tick(code: str, data: dict | list, recv_time: datetime) -> TickData:
-        """把 xtquant 原始数据解析成统一 ``TickData`` 对象。"""
         data = DataSubscriptionManager._normalize_tick_payload(code, data)
 
-        # time 字段可能是时间戳（ms）或 datetime
-        raw_time = (DataSubscriptionManager._extract_scalar(data.get("time"))
-                    or DataSubscriptionManager._extract_scalar(data.get("sysTime")))
-        data_time = recv_time
-        latency_ms = 0.0
-        if raw_time:
-            try:
-                if isinstance(raw_time, (int, float)):
-                    data_time = datetime.fromtimestamp(raw_time / 1000)
-                elif isinstance(raw_time, datetime):
-                    data_time = raw_time
-                latency_ms = (recv_time - data_time).total_seconds() * 1000
-            except Exception:
-                pass
+        raw_time = DataSubscriptionManager._extract_scalar(data.get("time")) or DataSubscriptionManager._extract_scalar(
+            data.get("sysTime")
+        )
+        data_time = DataSubscriptionManager._coerce_datetime(raw_time, recv_time)
+        latency_ms = max(0.0, (recv_time - data_time).total_seconds() * 1000)
 
         def _get(key, default=0.0):
-            """统一处理字段缺失，避免到处写 ``None`` 判空。"""
-            v = DataSubscriptionManager._extract_scalar(data.get(key))
-            return v if v is not None else default
+            value = DataSubscriptionManager._extract_scalar(data.get(key))
+            return value if value is not None else default
 
         bids_p = DataSubscriptionManager._extract_book_values(data.get("bidPrice"))
         bids_v = DataSubscriptionManager._extract_book_values(data.get("bidVol"), cast_type=int)
@@ -356,8 +621,123 @@ class DataSubscriptionManager:
         )
 
     @staticmethod
+    def _parse_l2_quote(code: str, data: dict | list, recv_time: datetime) -> L2QuoteEvent:
+        payload = DataSubscriptionManager._normalize_tick_payload(code, data)
+        event_time = DataSubscriptionManager._coerce_datetime(
+            DataSubscriptionManager._extract_scalar(payload.get("time"))
+            or DataSubscriptionManager._extract_scalar(payload.get("sysTime")),
+            recv_time,
+        )
+        bids = DataSubscriptionManager._extract_book_values(payload.get("bidPrice"))
+        asks = DataSubscriptionManager._extract_book_values(payload.get("askPrice"))
+        return L2QuoteEvent(
+            stock_code=code,
+            last_price=float(DataSubscriptionManager._extract_scalar(payload.get("lastPrice"), 0.0) or 0.0),
+            pre_close=float(DataSubscriptionManager._extract_scalar(payload.get("lastClose"), 0.0) or 0.0),
+            bid1=float(bids[0] if bids else 0.0),
+            ask1=float(asks[0] if asks else 0.0),
+            limit_up_price=float(
+                DataSubscriptionManager._extract_scalar(payload.get("upLimitPrice"))
+                or DataSubscriptionManager._extract_scalar(payload.get("upperLimitPrice"))
+                or DataSubscriptionManager._extract_scalar(payload.get("limitUp"))
+                or 0.0
+            ),
+            event_time=event_time,
+            recv_time=recv_time,
+            raw_xt_fields=dict(payload),
+        )
+
+    @staticmethod
+    def _parse_l2_transaction_record(code: str, record: dict, recv_time: datetime) -> L2TransactionEvent:
+        price = float(DataSubscriptionManager._extract_scalar(record.get("price"), 0.0) or 0.0)
+        volume = int(DataSubscriptionManager._extract_scalar(record.get("volume"), 0) or 0)
+        amount = float(DataSubscriptionManager._extract_scalar(record.get("amount"), price * volume) or (price * volume))
+        side = str(
+            DataSubscriptionManager._extract_scalar(record.get("side"))
+            or DataSubscriptionManager._extract_scalar(record.get("bsflag"))
+            or DataSubscriptionManager._extract_scalar(record.get("bsFlag"))
+            or DataSubscriptionManager._extract_scalar(record.get("direction"))
+            or ""
+        )
+        event_time = DataSubscriptionManager._coerce_datetime(
+            DataSubscriptionManager._extract_scalar(record.get("time"))
+            or DataSubscriptionManager._extract_scalar(record.get("tradeTime"))
+            or DataSubscriptionManager._extract_scalar(record.get("transTime")),
+            recv_time,
+        )
+        return L2TransactionEvent(
+            stock_code=code,
+            price=price,
+            volume=volume,
+            amount=amount,
+            side=side,
+            event_time=event_time,
+            recv_time=recv_time,
+            raw_xt_fields=dict(record),
+        )
+
+    @staticmethod
+    def _parse_l2_order_record(code: str, record: dict, recv_time: datetime) -> L2OrderEvent:
+        price = float(DataSubscriptionManager._extract_scalar(record.get("price"), 0.0) or 0.0)
+        volume = int(DataSubscriptionManager._extract_scalar(record.get("volume"), 0) or 0)
+        amount = float(DataSubscriptionManager._extract_scalar(record.get("amount"), price * volume) or (price * volume))
+        side = str(
+            DataSubscriptionManager._extract_scalar(record.get("side"))
+            or DataSubscriptionManager._extract_scalar(record.get("bsflag"))
+            or DataSubscriptionManager._extract_scalar(record.get("bsFlag"))
+            or DataSubscriptionManager._extract_scalar(record.get("direction"))
+            or ""
+        )
+        entrust_no = str(
+            DataSubscriptionManager._extract_scalar(record.get("entrustNo"))
+            or DataSubscriptionManager._extract_scalar(record.get("entrust_no"))
+            or DataSubscriptionManager._extract_scalar(record.get("seq"))
+            or ""
+        )
+        event_time = DataSubscriptionManager._coerce_datetime(
+            DataSubscriptionManager._extract_scalar(record.get("time"))
+            or DataSubscriptionManager._extract_scalar(record.get("entrustTime"))
+            or DataSubscriptionManager._extract_scalar(record.get("orderTime")),
+            recv_time,
+        )
+        return L2OrderEvent(
+            stock_code=code,
+            price=price,
+            volume=volume,
+            amount=amount,
+            side=side,
+            entrust_no=entrust_no,
+            is_cancel=DataSubscriptionManager._infer_order_cancel(record),
+            event_time=event_time,
+            recv_time=recv_time,
+            raw_xt_fields=dict(record),
+        )
+
+    @staticmethod
+    def _parse_l2_orderqueue(code: str, data: dict | list, recv_time: datetime) -> L2OrderQueueEvent:
+        payload = DataSubscriptionManager._normalize_tick_payload(code, data)
+        event_time = DataSubscriptionManager._coerce_datetime(
+            DataSubscriptionManager._extract_scalar(payload.get("time"))
+            or DataSubscriptionManager._extract_scalar(payload.get("sysTime")),
+            recv_time,
+        )
+        return L2OrderQueueEvent(
+            stock_code=code,
+            price=float(
+                DataSubscriptionManager._extract_scalar(payload.get("bidLevelPrice"))
+                or DataSubscriptionManager._extract_scalar(payload.get("price"))
+                or 0.0
+            ),
+            bid_level_volume=DataSubscriptionManager._extract_book_values(
+                payload.get("bidLevelVolume"), cast_type=int, limit=None
+            ),
+            event_time=event_time,
+            recv_time=recv_time,
+            raw_xt_fields=dict(payload),
+        )
+
+    @staticmethod
     def _normalize_tick_payload(code: str, data: dict | list) -> dict:
-        """兼容 xtquant 可能返回的多种 tick 结构。"""
         if isinstance(data, dict):
             return data
 
@@ -365,23 +745,93 @@ class DataSubscriptionManager:
             for item in reversed(data):
                 if isinstance(item, dict):
                     return item
-            logger.warning("DataSubscription: %s 收到无法解析的列表行情结构", code)
+            logger.warning("DataSubscription: %s received unsupported list payload", code)
             return {}
 
-        logger.warning("DataSubscription: %s 收到未知行情结构 %s", code, type(data).__name__)
+        logger.warning("DataSubscription: %s received unknown payload type %s", code, type(data).__name__)
         return {}
 
     @staticmethod
+    def _normalize_record_payloads(code: str, data: dict | list) -> List[dict]:
+        if isinstance(data, list):
+            records = [item for item in data if isinstance(item, dict)]
+            if records:
+                return records
+            logger.warning("DataSubscription: %s received non-dict record list", code)
+            return []
+
+        if isinstance(data, dict):
+            if any(isinstance(value, dict) for value in data.values()):
+                nested_records = [value for value in data.values() if isinstance(value, dict)]
+                if nested_records:
+                    return nested_records
+
+            sequence_lengths = []
+            for value in data.values():
+                normalized = DataSubscriptionManager._to_python_sequence(value)
+                if isinstance(normalized, Sequence) and not isinstance(normalized, (str, bytes, bytearray)):
+                    sequence_lengths.append(len(normalized))
+
+            if sequence_lengths and len(set(sequence_lengths)) == 1 and sequence_lengths[0] > 0:
+                length = sequence_lengths[0]
+                records = []
+                for index in range(length):
+                    record = {}
+                    for key, value in data.items():
+                        record[key] = DataSubscriptionManager._extract_indexed_value(value, index)
+                    records.append(record)
+                return records
+
+            return [data]
+
+        logger.warning("DataSubscription: %s received unknown record payload type %s", code, type(data).__name__)
+        return []
+
+    @staticmethod
+    def _coerce_datetime(raw_time: Any, default: Optional[datetime] = None) -> datetime:
+        fallback = default or datetime.now()
+        if raw_time in (None, ""):
+            return fallback
+        try:
+            if isinstance(raw_time, datetime):
+                return raw_time
+            if isinstance(raw_time, (int, float)):
+                timestamp = float(raw_time)
+                if timestamp > 1e12:
+                    return datetime.fromtimestamp(timestamp / 1000)
+                if timestamp > 1e10:
+                    return datetime.fromtimestamp(timestamp / 1000)
+                return datetime.fromtimestamp(timestamp)
+        except Exception:
+            return fallback
+        return fallback
+
+    @staticmethod
+    def _infer_order_cancel(record: dict) -> bool:
+        explicit = DataSubscriptionManager._extract_scalar(record.get("isCancel"))
+        if explicit is not None:
+            return bool(explicit)
+        explicit = DataSubscriptionManager._extract_scalar(record.get("cancelFlag"))
+        if explicit is not None:
+            text = str(explicit).strip().lower()
+            return text in {"1", "true", "y", "yes", "cancel", "c"}
+        text_fields = [
+            DataSubscriptionManager._extract_scalar(record.get("execType")),
+            DataSubscriptionManager._extract_scalar(record.get("orderKind")),
+            DataSubscriptionManager._extract_scalar(record.get("type")),
+        ]
+        for value in text_fields:
+            text = str(value or "").strip().lower()
+            if "cancel" in text or text == "c":
+                return True
+        return False
+
+    @staticmethod
     def _extract_scalar(value, default=None):
-        """从 xtquant 字段中提取单值，兼容历史列表/数组格式。"""
         if value is None:
             return default
 
-        if hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
-            try:
-                value = value.tolist()
-            except Exception:
-                pass
+        value = DataSubscriptionManager._to_python_sequence(value)
 
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             if not value:
@@ -394,16 +844,11 @@ class DataSubscriptionManager:
         return value
 
     @staticmethod
-    def _extract_book_values(value, cast_type=float) -> list:
-        """提取五档盘口数据，兼容嵌套列表/数组格式。"""
+    def _extract_book_values(value, cast_type=float, limit: Optional[int] = 5) -> list:
         if value is None:
             return []
 
-        if hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
-            try:
-                value = value.tolist()
-            except Exception:
-                pass
+        value = DataSubscriptionManager._to_python_sequence(value)
 
         if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
             scalar = DataSubscriptionManager._extract_scalar(value)
@@ -418,7 +863,8 @@ class DataSubscriptionManager:
             value = value[-1]
 
         result = []
-        for item in list(value)[:5]:
+        items = list(value) if limit is None else list(value)[:limit]
+        for item in items:
             scalar = DataSubscriptionManager._extract_scalar(item)
             if scalar is None:
                 continue
@@ -429,11 +875,36 @@ class DataSubscriptionManager:
         return result
 
     @staticmethod
+    def _to_python_sequence(value):
+        if hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
+            try:
+                return value.tolist()
+            except Exception:
+                return value
+        return value
+
+    @staticmethod
+    def _extract_indexed_value(value, index: int):
+        value = DataSubscriptionManager._to_python_sequence(value)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            if not value:
+                return None
+            if index >= len(value):
+                return value[-1]
+            current = value[index]
+            current = DataSubscriptionManager._to_python_sequence(current)
+            if isinstance(current, Sequence) and not isinstance(current, (str, bytes, bytearray)):
+                return current[-1] if current else None
+            return current
+        return value
+
+    @staticmethod
     def _to_xt(code: str) -> str:
-        """6位代码 → xtquant 格式"""
         code = str(code).strip().zfill(6)
         if code.startswith(("6", "5")):
             return f"{code}.SH"
+        if code.startswith(("8", "4", "9")):
+            return f"{code}.BJ"
         return f"{code}.SZ"
 
 
