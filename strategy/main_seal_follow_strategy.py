@@ -77,7 +77,7 @@ class MainSealFollowStrategy(BaseStrategy):
         self._plan_amount = float(params.get("plan_amount", 0.0) or 0.0)
         self._dry_run = bool(params.get("dry_run", True))
         self._big_amount_min = float(params.get("big_amount_min", 2_000_000.0) or 2_000_000.0)
-        self._queue_vol_unit = str(params.get("queue_vol_unit") or "share").strip().lower()
+        self._queue_vol_unit = str(params.get("queue_vol_unit") or "lot").strip().lower()
         self._order_vol_unit = str(params.get("order_vol_unit") or "share").strip().lower()
         self._trade_vol_unit = str(params.get("trade_vol_unit") or "share").strip().lower()
         self._sweep_window_ms = int(params.get("sweep_window_ms", 1_200) or 1_200)

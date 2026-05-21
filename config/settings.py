@@ -44,6 +44,20 @@ def _setting_str(name: str, default: str = "") -> str:
     return str(value) if value is not None else default
 
 
+def _setting_bool(name: str, default: bool = False) -> bool:
+    """读取布尔配置，优先环境变量，其次本地固定配置文件。"""
+    raw = os.getenv(name)
+    if raw is not None and raw != "":
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    value = _LOCAL_RUNTIME_CONFIG.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _env_str(name: str, default: str = "") -> str:
     """读取字符串环境变量。
 
@@ -159,11 +173,11 @@ class Settings:
         "CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH",
         "",
     )
-    CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION: bool = _env_bool(
+    CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION: bool = _setting_bool(
         "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION",
         False,
     )
-    CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION_DIR: str = _env_str(
+    CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION_DIR: str = _setting_str(
         "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION_DIR",
         "",
     )

@@ -3,5 +3,7 @@
   "ACCOUNT_ID": "88011588",
   "ACCOUNT_TYPE": "STOCK",
   "ACCOUNT_PASSWORD": "",
-  "CYTRADE_BBPP_CSV_PATH": "D:\\proj\\chenyee\\cytrade2\\config\\bbpp_signals_20260326.csv"
+  "CYTRADE_BBPP_CSV_PATH": "D:\\proj\\chenyee\\cytrade2\\config\\bbpp_signals_20260326.csv",
+  "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION": true,
+  "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION_DIR": "C:\\Users\\ysun\\workspace\\cytrade\\logs\\l2_calibration"
 }

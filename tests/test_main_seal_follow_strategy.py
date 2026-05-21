@@ -117,6 +117,7 @@ def test_main_seal_follow_snapshot_restores_cached_l2_and_order_state():
                 "plan_amount": 2200.0,
                 "dry_run": False,
                 "big_amount_min": 2_000_000.0,
+                "queue_vol_unit": "share",
             },
         ),
         trade_executor=trade_executor,
@@ -181,6 +182,7 @@ def test_main_seal_follow_auto_triggers_dry_run_entry_from_l2_signals():
                 "dry_run": True,
                 "big_amount_min": 2_000_000.0,
                 "sweep_min_amount": 5_000_000.0,
+                "queue_vol_unit": "share",
             },
         )
     )
@@ -270,6 +272,7 @@ def test_main_seal_follow_recent_big_limit_cancel_blocks_entry():
                 "big_amount_min": 2_000_000.0,
                 "sweep_min_amount": 5_000_000.0,
                 "block_on_recent_big_limit_cancel": True,
+                "queue_vol_unit": "share",
             },
         )
     )
@@ -332,6 +335,7 @@ def test_main_seal_follow_l2_calibration_mode_writes_jsonl_samples(tmp_path: Pat
                 "dry_run": True,
                 "l2_calibration_enabled": True,
                 "l2_calibration_dir": str(calibration_dir),
+                "queue_vol_unit": "share",
             },
         )
     )
@@ -374,6 +378,7 @@ def test_main_seal_follow_estimates_queue_position_and_cancels_weak_queue():
                 "dry_run": False,
                 "big_amount_min": 2_000_000.0,
                 "back_big_min_amount": 2_000_000.0,
+                "queue_vol_unit": "share",
             },
         ),
         trade_executor=trade_executor,
@@ -421,6 +426,7 @@ def test_main_seal_follow_price_falls_off_limit_and_cancels_entry_queue():
             params={
                 "plan_amount": 2200.0,
                 "dry_run": False,
+                "queue_vol_unit": "share",
             },
         ),
         trade_executor=trade_executor,
@@ -454,6 +460,7 @@ def test_main_seal_follow_estimates_queue_position_from_front_anchor_fallback():
             params={
                 "plan_amount": 2200.0,
                 "dry_run": False,
+                "queue_vol_unit": "share",
             },
         ),
         trade_executor=trade_executor,
@@ -517,6 +524,7 @@ def test_main_seal_follow_position_danger_cancel_rule():
                 "dry_run": False,
                 "big_amount_min": 2_000_000.0,
                 "back_big_min_amount": 2_000_000.0,
+                "queue_vol_unit": "share",
             },
         ),
         trade_executor=trade_executor,
@@ -551,6 +559,7 @@ def test_main_seal_follow_timeout_cancel_rule():
                 "big_amount_min": 2_000_000.0,
                 "back_big_min_amount": 2_000_000.0,
                 "max_queue_ms": 1_000,
+                "queue_vol_unit": "share",
             },
         ),
         trade_executor=trade_executor,
@@ -585,6 +594,7 @@ def test_main_seal_follow_cooldown_blocks_immediate_reentry_after_cancel():
                 "big_amount_min": 2_000_000.0,
                 "sweep_min_amount": 5_000_000.0,
                 "cooldown_ms": 5_000,
+                "queue_vol_unit": "share",
             },
         )
     )
