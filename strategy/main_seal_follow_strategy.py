@@ -81,6 +81,7 @@ class MainSealFollowStrategy(BaseStrategy):
         self._sweep_min_amount = float(params.get("sweep_min_amount", 5_000_000.0) or 5_000_000.0)
         self._main_seal_window_ms = int(params.get("main_seal_window_ms", 1_000) or 1_000)
         self._require_recent_big_limit_buy = bool(params.get("require_recent_big_limit_buy", True))
+        self._block_on_recent_big_limit_cancel = bool(params.get("block_on_recent_big_limit_cancel", True))
         self._main_seal_front_max_index = int(params.get("main_seal_front_max_index", 5) or 5)
         self._front_big_weak_ratio = float(params.get("front_big_weak_ratio", 0.50) or 0.50)
         self._back_big_min_amount = float(params.get("back_big_min_amount", 2_000_000.0) or 2_000_000.0)
@@ -157,6 +158,7 @@ class MainSealFollowStrategy(BaseStrategy):
                                 "sweep_min_amount": self._sweep_min_amount,
                                 "main_seal_window_ms": self._main_seal_window_ms,
                                 "require_recent_big_limit_buy": self._require_recent_big_limit_buy,
+                                "block_on_recent_big_limit_cancel": self._block_on_recent_big_limit_cancel,
                                 "main_seal_front_max_index": self._main_seal_front_max_index,
                                 "front_big_weak_ratio": self._front_big_weak_ratio,
                                 "back_big_min_amount": self._back_big_min_amount,
@@ -390,6 +392,7 @@ class MainSealFollowStrategy(BaseStrategy):
             "_sweep_min_amount",
             "_main_seal_window_ms",
             "_require_recent_big_limit_buy",
+            "_block_on_recent_big_limit_cancel",
             "_main_seal_front_max_index",
             "_front_big_weak_ratio",
             "_back_big_min_amount",
@@ -885,12 +888,26 @@ class MainSealFollowStrategy(BaseStrategy):
             return False
         return bool(self._recent_items(self._recent_big_limit_buy_orders, self._main_seal_window_ms))
 
+    def _recent_big_limit_cancel_blocked(self) -> bool:
+        if self._limit_up_price <= 0:
+            return False
+        recent_cancels = self._recent_items(self._recent_big_limit_cancel_orders, self._main_seal_window_ms)
+        if not recent_cancels:
+            return False
+        recent_buys = self._recent_items(self._recent_big_limit_buy_orders, self._main_seal_window_ms)
+        if not recent_buys:
+            return True
+        latest_buy_time = max(int(item.get("time", 0) or 0) for item in recent_buys)
+        return any(int(item.get("time", 0) or 0) >= latest_buy_time for item in recent_cancels)
+
     def _main_seal_ok(self) -> bool:
         if self._limit_up_price <= 0 or not self._current_queue:
             return False
         if not self._detect_main_seal_from_queue(self._current_queue, self._limit_up_price):
             return False
         if self._require_recent_big_limit_buy and not self._recent_big_limit_buy_ok():
+            return False
+        if self._block_on_recent_big_limit_cancel and self._recent_big_limit_cancel_blocked():
             return False
         return True
 

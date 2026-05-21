@@ -260,6 +260,68 @@ def test_main_seal_follow_does_not_trigger_without_recent_big_limit_buy():
     assert strategy._entry_order_uuids == []
 
 
+def test_main_seal_follow_recent_big_limit_cancel_blocks_entry():
+    strategy = MainSealFollowStrategy(
+        StrategyConfig(
+            stock_code="000001",
+            params={
+                "plan_amount": 2200.0,
+                "dry_run": True,
+                "big_amount_min": 2_000_000.0,
+                "sweep_min_amount": 5_000_000.0,
+                "block_on_recent_big_limit_cancel": True,
+            },
+        )
+    )
+    now_ms = strategy._now_ms()
+
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="000001", last_price=10.8, limit_up_price=11.0))
+    strategy.on_l2_transaction(
+        L2TransactionEvent(
+            stock_code="000001",
+            price=11.0,
+            volume=500_000,
+            amount=5_500_000.0,
+            side="BUY",
+            event_time=now_ms - 100,
+        )
+    )
+    strategy.on_l2_order(
+        L2OrderEvent(
+            stock_code="000001",
+            price=11.0,
+            volume=200_000,
+            amount=2_200_000.0,
+            side="BUY",
+            entrust_no="E1",
+            event_time=now_ms - 90,
+        )
+    )
+    strategy.on_l2_order(
+        L2OrderEvent(
+            stock_code="000001",
+            price=11.0,
+            volume=200_000,
+            amount=2_200_000.0,
+            side="BUY",
+            entrust_no="E1",
+            is_cancel=True,
+            event_time=now_ms - 50,
+        )
+    )
+    strategy.on_l2_orderqueue(
+        L2OrderQueueEvent(
+            stock_code="000001",
+            price=11.0,
+            bid_level_volume=[10_000, 200_000, 150_000],
+            event_time=now_ms,
+        )
+    )
+
+    assert strategy._entry_state == strategy.STATE_WAIT_SIGNAL
+    assert strategy._entry_order_uuids == []
+
+
 def test_main_seal_follow_estimates_queue_position_and_cancels_weak_queue():
     trade_executor = _FakeCancelableTradeExecutor()
     strategy = MainSealFollowStrategy(
@@ -306,6 +368,39 @@ def test_main_seal_follow_estimates_queue_position_and_cancels_weak_queue():
     )
 
     assert strategy._last_cancel_reason == "front_big_weak_and_back_big_empty"
+    assert {item[0] for item in trade_executor.canceled} == {order.order_uuid for order in orders}
+
+
+def test_main_seal_follow_price_falls_off_limit_and_cancels_entry_queue():
+    trade_executor = _FakeCancelableTradeExecutor()
+    strategy = MainSealFollowStrategy(
+        StrategyConfig(
+            stock_code="000001",
+            params={
+                "plan_amount": 2200.0,
+                "dry_run": False,
+            },
+        ),
+        trade_executor=trade_executor,
+    )
+    strategy._limit_up_price = 11.0
+
+    orders = strategy.submit_feature_entry_orders(11.0, trigger_reason="price-fallback")
+    for order in orders:
+        order.status = OrderStatus.REPORTED
+        strategy.on_order_update(order)
+
+    strategy.on_l2_orderqueue(
+        L2OrderQueueEvent(
+            stock_code="000001",
+            price=10.99,
+            bid_level_volume=[200_000, 100, 100],
+            event_time=1_000,
+        )
+    )
+
+    assert strategy._current_queue == []
+    assert strategy._last_cancel_reason == "bid_level_price_not_limit_fallback"
     assert {item[0] for item in trade_executor.canceled} == {order.order_uuid for order in orders}
 
 
@@ -436,3 +531,54 @@ def test_main_seal_follow_timeout_cancel_rule():
     assert reason == "queue_timeout_and_back_big_empty"
     assert strategy._last_cancel_reason == reason
     assert {item[0] for item in trade_executor.canceled} == {order.order_uuid for order in orders}
+
+
+def test_main_seal_follow_cooldown_blocks_immediate_reentry_after_cancel():
+    strategy = MainSealFollowStrategy(
+        StrategyConfig(
+            stock_code="000001",
+            params={
+                "plan_amount": 2200.0,
+                "dry_run": True,
+                "big_amount_min": 2_000_000.0,
+                "sweep_min_amount": 5_000_000.0,
+                "cooldown_ms": 5_000,
+            },
+        )
+    )
+    now_ms = strategy._now_ms()
+    strategy._last_cancel_time_ms = now_ms - 1_000
+
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="000001", last_price=10.8, limit_up_price=11.0))
+    strategy.on_l2_transaction(
+        L2TransactionEvent(
+            stock_code="000001",
+            price=11.0,
+            volume=500_000,
+            amount=5_500_000.0,
+            side="BUY",
+            event_time=now_ms - 100,
+        )
+    )
+    strategy.on_l2_order(
+        L2OrderEvent(
+            stock_code="000001",
+            price=11.0,
+            volume=200_000,
+            amount=2_200_000.0,
+            side="BUY",
+            entrust_no="E1",
+            event_time=now_ms - 50,
+        )
+    )
+    strategy.on_l2_orderqueue(
+        L2OrderQueueEvent(
+            stock_code="000001",
+            price=11.0,
+            bid_level_volume=[10_000, 200_000, 150_000],
+            event_time=now_ms,
+        )
+    )
+
+    assert strategy._entry_state == strategy.STATE_WAIT_SIGNAL
+    assert strategy._entry_order_uuids == []
