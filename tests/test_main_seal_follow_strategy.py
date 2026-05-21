@@ -322,6 +322,48 @@ def test_main_seal_follow_recent_big_limit_cancel_blocks_entry():
     assert strategy._entry_order_uuids == []
 
 
+def test_main_seal_follow_l2_calibration_mode_writes_jsonl_samples(tmp_path: Path):
+    calibration_dir = tmp_path / "l2_calibration"
+    strategy = MainSealFollowStrategy(
+        StrategyConfig(
+            stock_code="000001",
+            params={
+                "stock_name": "平安银行",
+                "dry_run": True,
+                "l2_calibration_enabled": True,
+                "l2_calibration_dir": str(calibration_dir),
+            },
+        )
+    )
+
+    strategy.on_l2_quote(
+        L2QuoteEvent(
+            stock_code="000001",
+            last_price=10.8,
+            pre_close=10.0,
+            bid1=10.8,
+            ask1=10.81,
+            limit_up_price=11.0,
+            event_time=123456,
+            raw_xt_fields={"lastPrice": 10.8, "upLimitPrice": 11.0},
+        )
+    )
+
+    files = list(calibration_dir.glob("*.jsonl"))
+    assert len(files) == 1
+
+    lines = files[0].read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    payload = __import__("json").loads(lines[0])
+
+    assert payload["event_type"] == "l2quote"
+    assert payload["stock_code"] == "000001"
+    assert payload["stock_name"] == "平安银行"
+    assert payload["normalized"]["limit_up_price"] == 11.0
+    assert payload["raw_xt_fields"]["upLimitPrice"] == 11.0
+    assert payload["units"]["queue_vol_unit"] == "share"
+
+
 def test_main_seal_follow_estimates_queue_position_and_cancels_weak_queue():
     trade_executor = _FakeCancelableTradeExecutor()
     strategy = MainSealFollowStrategy(

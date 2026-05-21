@@ -13,8 +13,12 @@ next iteration after the infrastructure is stable.
 from __future__ import annotations
 
 import csv
+import json
+import os
+import threading
 import time
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import Deque, Dict, List, Optional
 
@@ -87,6 +91,19 @@ class MainSealFollowStrategy(BaseStrategy):
         self._back_big_min_amount = float(params.get("back_big_min_amount", 2_000_000.0) or 2_000_000.0)
         self._max_queue_ms = int(params.get("max_queue_ms", 8_000) or 8_000)
         self._cooldown_ms = int(params.get("cooldown_ms", 5_000) or 5_000)
+        self._l2_calibration_enabled = bool(
+            params.get(
+                "l2_calibration_enabled",
+                getattr(global_settings, "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION", False),
+            )
+        )
+        self._l2_calibration_dir = str(
+            params.get(
+                "l2_calibration_dir",
+                getattr(global_settings, "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION_DIR", "") or "",
+            )
+            or ""
+        )
 
         self._entry_state = self.STATE_WAIT_SIGNAL
         self._limit_up_price = float(params.get("limit_up_price", 0.0) or 0.0)
@@ -112,6 +129,8 @@ class MainSealFollowStrategy(BaseStrategy):
         self._recent_trades: Deque[dict] = deque(maxlen=500)
         self._recent_big_limit_buy_orders: Deque[dict] = deque(maxlen=200)
         self._recent_big_limit_cancel_orders: Deque[dict] = deque(maxlen=200)
+        self._l2_calibration_lock = threading.Lock()
+        self._l2_calibration_path = self._resolve_l2_calibration_path()
 
     @classmethod
     def required_data_kinds(cls) -> set[str]:
@@ -164,6 +183,8 @@ class MainSealFollowStrategy(BaseStrategy):
                                 "back_big_min_amount": self._back_big_min_amount,
                                 "max_queue_ms": self._max_queue_ms,
                                 "cooldown_ms": self._cooldown_ms,
+                                "l2_calibration_enabled": self._l2_calibration_enabled,
+                                "l2_calibration_dir": self._l2_calibration_dir,
                                 "source_row": row_no,
                             },
                         )
@@ -213,6 +234,18 @@ class MainSealFollowStrategy(BaseStrategy):
         return True
 
     def on_l2_quote(self, event: L2QuoteEvent) -> None:
+        self._write_l2_calibration_sample(
+            "l2quote",
+            event.raw_xt_fields,
+            {
+                "last_price": float(event.last_price or 0.0),
+                "pre_close": float(event.pre_close or 0.0),
+                "bid1": float(event.bid1 or 0.0),
+                "ask1": float(event.ask1 or 0.0),
+                "limit_up_price": float(event.limit_up_price or 0.0),
+            },
+            event.event_time,
+        )
         self._last_price = float(event.last_price or self._last_price or 0.0)
         if float(event.limit_up_price or 0.0) > 0:
             self._limit_up_price = float(event.limit_up_price)
@@ -226,6 +259,19 @@ class MainSealFollowStrategy(BaseStrategy):
     def on_l2_transaction(self, event: L2TransactionEvent) -> None:
         shares = self._trade_vol_to_shares(event.volume)
         amount = float(event.amount or self._amount_of(float(event.price or 0.0), shares))
+        self._write_l2_calibration_sample(
+            "l2transaction",
+            event.raw_xt_fields,
+            {
+                "price": float(event.price or 0.0),
+                "volume_raw": int(event.volume or 0),
+                "volume_shares": shares,
+                "amount": amount,
+                "side": str(event.side or ""),
+                "trade_vol_unit": self._trade_vol_unit,
+            },
+            event.event_time,
+        )
         self._recent_trades.append(
             {
                 "time": self._to_ms(event.event_time),
@@ -242,6 +288,21 @@ class MainSealFollowStrategy(BaseStrategy):
             return
         shares = self._order_vol_to_shares(event.volume)
         amount = float(event.amount or self._amount_of(float(event.price or 0.0), shares))
+        self._write_l2_calibration_sample(
+            "l2order",
+            event.raw_xt_fields,
+            {
+                "price": float(event.price or 0.0),
+                "volume_raw": int(event.volume or 0),
+                "volume_shares": shares,
+                "amount": amount,
+                "side": str(event.side or ""),
+                "entrust_no": str(event.entrust_no or ""),
+                "is_cancel": bool(event.is_cancel),
+                "order_vol_unit": self._order_vol_unit,
+            },
+            event.event_time,
+        )
         if amount < self._big_amount_min:
             return
         if not self._price_eq(float(event.price or 0.0), self._limit_up_price):
@@ -265,12 +326,24 @@ class MainSealFollowStrategy(BaseStrategy):
     def on_l2_orderqueue(self, event: L2OrderQueueEvent) -> None:
         queue_price = float(event.price or 0.0)
         self._current_queue_time_ms = self._to_ms(event.event_time)
+        normalized_queue = self._queue_to_shares_list(event.bid_level_volume or [])
+        self._write_l2_calibration_sample(
+            "l2orderqueue",
+            event.raw_xt_fields,
+            {
+                "price": queue_price,
+                "bid_level_volume_raw": list(event.bid_level_volume or []),
+                "bid_level_volume_shares": normalized_queue,
+                "queue_vol_unit": self._queue_vol_unit,
+            },
+            event.event_time,
+        )
         if self._limit_up_price > 0 and queue_price > 0 and not self._price_eq(queue_price, self._limit_up_price):
             self._current_queue = []
             if self._has_reported_entry_order() and self._entry_state != self.STATE_HAS_POSITION:
                 self._request_cancel_entry_orders("bid_level_price_not_limit_fallback")
             return
-        self._current_queue = self._queue_to_shares_list(event.bid_level_volume or [])
+        self._current_queue = normalized_queue
         if self._has_active_entry_order() and self._entry_state != self.STATE_HAS_POSITION:
             if self._has_reported_entry_order():
                 if not self._entry_position:
@@ -398,6 +471,8 @@ class MainSealFollowStrategy(BaseStrategy):
             "_back_big_min_amount",
             "_max_queue_ms",
             "_cooldown_ms",
+            "_l2_calibration_enabled",
+            "_l2_calibration_dir",
             "_entry_state",
             "_limit_up_price",
             "_last_price",
@@ -747,6 +822,57 @@ class MainSealFollowStrategy(BaseStrategy):
     @staticmethod
     def _default_csv_path() -> str:
         return str(getattr(global_settings, "CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH", "") or "")
+
+    def _resolve_l2_calibration_path(self) -> str:
+        if not self._l2_calibration_enabled:
+            return ""
+        base_dir = str(self._l2_calibration_dir or "").strip() or os.path.join(global_settings.LOG_DIR, "l2_calibration")
+        safe_code = str(self.stock_code or "unknown").strip() or "unknown"
+        safe_name = str(self._stock_name or self.strategy_name).strip().replace(" ", "_")
+        return str(Path(base_dir) / f"main_seal_follow_{safe_code}_{safe_name}.jsonl")
+
+    def _write_l2_calibration_sample(
+        self,
+        event_type: str,
+        raw_fields: dict,
+        normalized: dict,
+        event_time=None,
+    ) -> None:
+        if not self._l2_calibration_path:
+            return
+        path = Path(self._l2_calibration_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "event_type": str(event_type or ""),
+            "stock_code": self.stock_code,
+            "stock_name": self._stock_name,
+            "strategy_id": self.strategy_id,
+            "event_time_ms": self._to_ms(event_time),
+            "units": {
+                "queue_vol_unit": self._queue_vol_unit,
+                "order_vol_unit": self._order_vol_unit,
+                "trade_vol_unit": self._trade_vol_unit,
+            },
+            "normalized": normalized,
+            "raw_xt_fields": self._json_safe(raw_fields or {}),
+        }
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        with self._l2_calibration_lock:
+            with path.open("a", encoding="utf-8") as fp:
+                fp.write(line)
+
+    @staticmethod
+    def _json_safe(value):
+        if isinstance(value, datetime):
+            return value.isoformat(timespec="milliseconds")
+        if isinstance(value, dict):
+            return {str(k): MainSealFollowStrategy._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [MainSealFollowStrategy._json_safe(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
 
     @staticmethod
     def _get_first_present(row: dict, keys, default=""):

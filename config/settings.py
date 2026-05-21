@@ -159,6 +159,14 @@ class Settings:
         "CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH",
         "",
     )
+    CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION: bool = _env_bool(
+        "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION",
+        False,
+    )
+    CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION_DIR: str = _env_str(
+        "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION_DIR",
+        "",
+    )
 
     # ---- 数据订阅 ----
     SUBSCRIPTION_PERIOD: SubscriptionPeriod = _env_enum(
