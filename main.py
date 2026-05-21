@@ -40,6 +40,10 @@ from typing import Iterable
 # 确保项目根目录在 sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from config.xtquant_bootstrap import bootstrap_xtquant_sys_path
+
+XTQUANT_BOOTSTRAP_ROOT = bootstrap_xtquant_sys_path()
+
 from config.settings import Settings
 from config.fee_schedule import FeeSchedule
 from monitor.logger import LogManager, get_logger
@@ -126,6 +130,8 @@ def build_app(strategy_classes=None, settings: Settings = None):
     logger = get_logger("system")
     logger.info("=" * 50)
     logger.info("cytrade 启动")
+    if XTQUANT_BOOTSTRAP_ROOT:
+        logger.info("cytrade: xtquant root=%s", XTQUANT_BOOTSTRAP_ROOT)
 
     # ---- 数据管理 ----
     data_mgr = DataManager(
@@ -189,6 +195,7 @@ def build_app(strategy_classes=None, settings: Settings = None):
     runner = StrategyRunner(
         data_subscription=data_sub,
         trade_executor=trade_exec,
+        order_manager=order_mgr,
         position_manager=pos_mgr,
         data_manager=data_mgr,
         connection_manager=conn_mgr,

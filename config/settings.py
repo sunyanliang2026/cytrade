@@ -147,12 +147,17 @@ class Settings:
 
     # ---- QMT 连接 ----
     QMT_PATH: str = _setting_str("QMT_PATH", "")
+    XTQUANT_PATH: str = _setting_str("XTQUANT_PATH", "")
     ACCOUNT_ID: str = _setting_str("ACCOUNT_ID", "")
     ACCOUNT_TYPE: str = _setting_str("ACCOUNT_TYPE", "STOCK")
     ACCOUNT_PASSWORD: str = _setting_str("ACCOUNT_PASSWORD", "")
     CYTRADE_BBPP_CSV_PATH: str = _setting_str(
         "CYTRADE_BBPP_CSV_PATH",
         os.path.join(_CONFIG_DIR, "bbpp_signals_20260324.csv"),
+    )
+    CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH: str = _setting_str(
+        "CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH",
+        "",
     )
 
     # ---- 数据订阅 ----
