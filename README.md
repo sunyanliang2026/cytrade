@@ -156,7 +156,7 @@ pip install cytrade
 
 | 变量名 | 说明 | 示例 |
 |---|---|---|
-| `QMT_PATH` | QMT 客户端路径 | `D:\QMT\XtMiniQmt.exe` |
+| `QMT_PATH` | QMT 客户端 `userdata_mini` / `userdata` 路径 | `D:\QMT\userdata_mini` |
 | `ACCOUNT_ID` | 资金账号 | `your_account_id` |
 | `ACCOUNT_TYPE` | 账号类型，默认股票账号 | `STOCK` / `CREDIT` |
 | `ACCOUNT_PASSWORD` | 登录密码 | `your_password` |
@@ -168,6 +168,11 @@ pip install cytrade
 | `LOG_LEVEL` | 日志级别 | `INFO` |
 | `ENABLE_REMOTE_DB` | 是否启用远程同步 | `false` |
 | `FEE_TABLE_PATH` | 费率表路径 | `./config/fee_rates.csv` |
+
+说明：
+- `QMT_PATH` 传给 `XtQuantTrader(...)` 的应是 `userdata_mini` / `userdata` 目录，不是 `XtMiniQmt.exe`。
+- 实时行情与历史数据依赖 `xtdata` 连接本机已启动并登录的 QMT 服务；仅配置目录路径不能替代启动客户端。
+- 推荐直接在当前 Python 环境安装 `xtquant`；项目启动时会优先使用环境里已安装的包。
 | `DEFAULT_BUY_FEE_RATE` | 默认买入手续费率 | `0.0001` |
 | `DEFAULT_SELL_FEE_RATE` | 默认卖出手续费率 | `0.0001` |
 | `DEFAULT_STAMP_TAX_RATE` | 默认印花税率 | `0.0003` |
