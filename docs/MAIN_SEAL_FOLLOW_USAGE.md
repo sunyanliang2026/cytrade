@@ -131,3 +131,21 @@ are throttled.
 如果任一条件不满足，下单会被登记为 `JUNK`，日志包含
 `live_trading_not_ready` 或具体校验原因，不会生成 `[MOCK]` 活动委托。
 撤单同样要求交易就绪；未就绪时直接返回失败，不会把订单误标为已撤。
+
+`dry_run=false` 时，启动阶段还会执行 `Live trading preflight`：
+
+- 执行器必须是 live enabled。
+- `xtquant`、trader、account、账户订阅状态必须全部就绪。
+- 能查询到账户资产，并能识别可用资金字段。
+
+真实买入每次发柜台前还会重新做资金校验：
+
+```text
+required_amount = order.price * order.quantity
+available_cash >= required_amount
+```
+
+资金不足、资产查询失败、无法识别可用资金、非法代码、非法价格或非法数量时，
+订单会被登记为 `JUNK` 并写清 `available_cash / required_amount / reason`。
+校验通过后，日志会先打印 `[ORDER] LIVE preflight passed`，再调用真实
+`order_stock_async`。

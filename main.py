@@ -291,6 +291,75 @@ def _log_connection_failure(conn_mgr: ConnectionManager, mode: str) -> None:
     )
 
 
+def _validate_live_trading_preflight(ctx: dict, mode: str) -> bool:
+    """Block live runtime unless the final trading guard is fully ready."""
+    logger = get_logger("system")
+    settings = ctx["settings"]
+    dry_run = bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True))
+    trade_exec = ctx.get("trade_exec")
+    status = (
+        trade_exec.get_live_guard_status()
+        if trade_exec and hasattr(trade_exec, "get_live_guard_status")
+        else {}
+    )
+    last_error = status.get("last_error") or {}
+    logger.info(
+        (
+            "Live trading preflight mode=%s dry_run=%s live_enabled=%s "
+            "xtquant_available=%s has_trader=%s has_account=%s trading_ready=%s "
+            "stage=%s return_code=%s error=%s"
+        ),
+        mode,
+        dry_run,
+        status.get("live_trading_enabled", False),
+        status.get("xtquant_available", False),
+        status.get("has_trader", False),
+        status.get("has_account", False),
+        status.get("trading_ready", False),
+        last_error.get("stage", ""),
+        last_error.get("return_code", ""),
+        last_error.get("error", ""),
+    )
+    if dry_run:
+        return True
+
+    required = (
+        status.get("live_trading_enabled") is True
+        and status.get("xtquant_available") is True
+        and status.get("has_trader") is True
+        and status.get("has_account") is True
+        and status.get("trading_ready") is True
+    )
+    if not required:
+        logger.error(
+            "Runtime startup blocked mode=%s reason=live_trading_preflight_failed status=%s",
+            mode,
+            status,
+        )
+        return False
+
+    snapshot = (
+        trade_exec.get_live_account_snapshot()
+        if trade_exec and hasattr(trade_exec, "get_live_account_snapshot")
+        else {"asset_available": False}
+    )
+    logger.info(
+        "Live account preflight mode=%s asset_available=%s available_cash=%s total_asset=%s",
+        mode,
+        snapshot.get("asset_available", False),
+        snapshot.get("available_cash", None),
+        snapshot.get("total_asset", None),
+    )
+    if not snapshot.get("asset_available") or snapshot.get("available_cash") is None:
+        logger.error(
+            "Runtime startup blocked mode=%s reason=live_account_asset_unavailable snapshot=%s",
+            mode,
+            snapshot,
+        )
+        return False
+    return True
+
+
 def _start_runtime_heartbeat(ctx: dict, stop_event: threading.Event, mode: str) -> threading.Thread:
     """Log an operational heartbeat so quiet markets are distinguishable from hangs."""
     logger = get_logger("system")
@@ -391,6 +460,9 @@ def run(strategy_classes=None, settings: Settings = None):
     if not conn_mgr.connect():
         _log_connection_failure(conn_mgr, mode="live")
         logger.error("Unable to connect QMT; live trading is disabled and runtime exits")
+        return
+    if not _validate_live_trading_preflight(ctx, mode="live"):
+        conn_mgr.disconnect()
         return
 
     # ---- Web 服务 ----
@@ -582,6 +654,9 @@ def _run_managed_session(strategy_classes=None, settings: Settings = None,
         _log_connection_failure(conn_mgr, mode="managed")
         logger.error("Unable to connect QMT; live trading is disabled and runtime exits")
         _shutdown("交易连接建立失败")
+        return
+    if not _validate_live_trading_preflight(ctx, mode="managed"):
+        _shutdown("live 交易启动前置校验失败")
         return
 
     try:

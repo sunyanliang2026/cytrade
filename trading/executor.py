@@ -75,6 +75,56 @@ class TradeExecutor:
         """返回执行器是否允许真实下单/撤单。"""
         return self._live_trading_enabled
 
+    def get_live_guard_status(self) -> dict:
+        """返回执行器真实交易保护状态，供启动自检和日志展示。"""
+        has_conn = self._conn_mgr is not None
+        trader = self._conn_mgr.get_trader() if has_conn and hasattr(self._conn_mgr, "get_trader") else None
+        account = getattr(self._conn_mgr, "account", None) if has_conn else None
+        last_error = {}
+        if has_conn and hasattr(self._conn_mgr, "get_last_error"):
+            try:
+                last_error = self._conn_mgr.get_last_error()
+            except Exception as exc:
+                last_error = {"error": str(exc)}
+        trading_ready = False
+        if has_conn and hasattr(self._conn_mgr, "is_trading_ready"):
+            try:
+                trading_ready = bool(self._conn_mgr.is_trading_ready())
+            except Exception:
+                trading_ready = False
+        return {
+            "live_trading_enabled": self._live_trading_enabled,
+            "xtquant_available": _XT_AVAILABLE,
+            "has_connection_manager": has_conn,
+            "has_trader": trader is not None,
+            "has_account": account is not None,
+            "trading_ready": trading_ready,
+            "last_error": last_error,
+        }
+
+    def get_live_account_snapshot(self) -> dict:
+        """查询 live 账户资金快照，供启动自检展示。"""
+        asset = self._query_live_asset()
+        if asset is None:
+            return {"asset_available": False, "available_cash": None, "total_asset": None}
+        total_asset = None
+        for name in ("total_asset", "total_balance", "asset_balance"):
+            value = getattr(asset, name, None)
+            if value is None and isinstance(asset, dict):
+                value = asset.get(name)
+            if value is None or value == "":
+                continue
+            try:
+                total_asset = float(value)
+                break
+            except (TypeError, ValueError):
+                continue
+        return {
+            "asset_available": True,
+            "available_cash": self._extract_available_cash(asset),
+            "total_asset": total_asset,
+        }
+
     # ------------------------------------------------------------------ 买入
 
     def buy_limit(self, strategy_id: str, strategy_name: str,
@@ -315,6 +365,10 @@ class TradeExecutor:
         if readiness_error:
             return self._reject_order(order, f"live_trading_not_ready:{readiness_error}")
 
+        buying_power_error = self._validate_live_buying_power(order)
+        if buying_power_error:
+            return self._reject_order(order, buying_power_error)
+
         trader = self._conn_mgr.get_trader() if self._conn_mgr else None
 
         if not trader or not _XT_AVAILABLE:
@@ -341,6 +395,7 @@ class TradeExecutor:
                                                   OrderType.BY_QUANTITY)
                           else order.price_type)
             order.price_type = price_type
+            self._log_live_order_preflight(order, account)
 
             # order_stock_async 返回的是本地下单序列号 seq，真正的柜台订单号要等异步回报再绑定。
             seq = trader.order_stock_async(
@@ -428,6 +483,8 @@ class TradeExecutor:
 
     def _validate_order_for_submission(self, order: Order) -> str:
         """提交前做执行层通用校验，避免非法订单进入真实柜台。"""
+        if not self._is_valid_stock_code(order.stock_code):
+            return "invalid_stock_code"
         if order.quantity <= 0:
             return "invalid_quantity"
         if order.direction == OrderDirection.BUY and order.quantity % self._LOT_SIZE != 0:
@@ -435,6 +492,96 @@ class TradeExecutor:
         if order.order_type in (OrderType.LIMIT, OrderType.BY_AMOUNT, OrderType.BY_QUANTITY) and order.price <= 0:
             return "invalid_limit_price"
         return ""
+
+    def _validate_live_buying_power(self, order: Order) -> str:
+        """真实买入前查询账户可用资金，资金不足或无法查询都禁止进柜台。"""
+        if not self._live_trading_enabled or order.direction != OrderDirection.BUY:
+            return ""
+        required_amount = self._estimate_required_amount(order)
+        if required_amount <= 0:
+            return "buying_power_price_missing"
+        asset = self._query_live_asset()
+        if asset is None:
+            return f"buying_power_asset_unavailable:required_amount={required_amount:.2f}"
+        available_cash = self._extract_available_cash(asset)
+        if available_cash is None:
+            return f"buying_power_cash_unavailable:required_amount={required_amount:.2f}"
+        if available_cash + 1e-6 < required_amount:
+            return (
+                "insufficient_cash"
+                f":available_cash={available_cash:.2f}"
+                f":required_amount={required_amount:.2f}"
+            )
+        order.xt_fields["preflight_available_cash"] = available_cash
+        order.xt_fields["preflight_required_amount"] = required_amount
+        return ""
+
+    def _query_live_asset(self):
+        if not self._conn_mgr or not hasattr(self._conn_mgr, "query_stock_asset"):
+            return None
+        try:
+            return self._conn_mgr.query_stock_asset()
+        except Exception as exc:
+            logger.error("TradeExecutor: query asset before live order failed: %s", exc, exc_info=True)
+            return None
+
+    @staticmethod
+    def _extract_available_cash(asset) -> Optional[float]:
+        """兼容不同 xtquant 字段名，优先取可用资金字段。"""
+        for name in (
+            "cash",
+            "available_cash",
+            "enable_balance",
+            "enable_bail_balance",
+            "available_balance",
+            "fetch_balance",
+        ):
+            value = getattr(asset, name, None)
+            if value is None and isinstance(asset, dict):
+                value = asset.get(name)
+            if value is None or value == "":
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _estimate_required_amount(order: Order) -> float:
+        price = float(order.price or 0.0)
+        quantity = int(order.quantity or 0)
+        if price <= 0 or quantity <= 0:
+            return 0.0
+        return price * quantity
+
+    @staticmethod
+    def _is_valid_stock_code(stock_code: str) -> bool:
+        code = str(stock_code or "").strip().upper()
+        if "." in code:
+            code = code.split(".", 1)[0]
+        return len(code) == 6 and code.isdigit()
+
+    def _log_live_order_preflight(self, order: Order, account) -> None:
+        if not self._live_trading_enabled:
+            return
+        logger.warning(
+            (
+                "[ORDER] LIVE preflight passed uuid=%s trace=%s account=%s code=%s "
+                "dir=%s price=%.3f qty=%d required_amount=%.2f available_cash=%.2f "
+                "remark=%s"
+            ),
+            order.order_uuid[:8],
+            order.order_trace_id,
+            getattr(account, "account_id", ""),
+            order.stock_code,
+            order.direction.value,
+            order.price,
+            order.quantity,
+            float(order.xt_fields.get("preflight_required_amount", 0.0) or 0.0),
+            float(order.xt_fields.get("preflight_available_cash", 0.0) or 0.0),
+            order.remark,
+        )
 
     def _reject_order(self, order: Order, reason: str) -> Order:
         """把执行层拦截的订单登记为 JUNK，保留审计记录但不形成活动委托。"""
