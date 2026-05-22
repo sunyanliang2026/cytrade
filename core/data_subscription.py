@@ -416,6 +416,8 @@ class DataSubscriptionManager:
                     pre_close=price * 0.99,
                     bid1=price,
                     ask1=price + 0.01,
+                    bid1_volume=100,
+                    ask1_volume=100,
                     limit_up_price=limit_up_price,
                     event_time=now,
                     recv_time=now,
@@ -437,6 +439,7 @@ class DataSubscriptionManager:
                         volume=volume,
                         amount=price * volume,
                         side=side,
+                        trade_flag=1 if str(side or "").upper() == "BUY" else 2,
                         event_time=now,
                         recv_time=now,
                         raw_xt_fields={"mock": True},
@@ -467,6 +470,8 @@ class DataSubscriptionManager:
                         amount=price * volume,
                         side=side,
                         entrust_no=entrust_no,
+                        entrust_type=1,
+                        entrust_direction=1 if str(side or "").upper() == "BUY" else 2,
                         is_cancel=is_cancel,
                         event_time=now,
                         recv_time=now,
@@ -486,6 +491,9 @@ class DataSubscriptionManager:
                     stock_code=code,
                     price=price,
                     bid_level_volume=[int(v) for v in bid_level_volume],
+                    reported_total_order_count=len(bid_level_volume),
+                    observed_queue_count=len(bid_level_volume),
+                    is_partial_queue=False,
                     event_time=now,
                     recv_time=now,
                     raw_xt_fields={"mock": True},
@@ -630,12 +638,16 @@ class DataSubscriptionManager:
         )
         bids = DataSubscriptionManager._extract_book_values(payload.get("bidPrice"))
         asks = DataSubscriptionManager._extract_book_values(payload.get("askPrice"))
+        bid_volumes = DataSubscriptionManager._extract_book_values(payload.get("bidVol"), cast_type=int)
+        ask_volumes = DataSubscriptionManager._extract_book_values(payload.get("askVol"), cast_type=int)
         return L2QuoteEvent(
             stock_code=code,
             last_price=float(DataSubscriptionManager._extract_scalar(payload.get("lastPrice"), 0.0) or 0.0),
             pre_close=float(DataSubscriptionManager._extract_scalar(payload.get("lastClose"), 0.0) or 0.0),
             bid1=float(bids[0] if bids else 0.0),
             ask1=float(asks[0] if asks else 0.0),
+            bid1_volume=int(bid_volumes[0] if bid_volumes else 0),
+            ask1_volume=int(ask_volumes[0] if ask_volumes else 0),
             limit_up_price=float(
                 DataSubscriptionManager._extract_scalar(payload.get("upLimitPrice"))
                 or DataSubscriptionManager._extract_scalar(payload.get("upperLimitPrice"))
@@ -659,6 +671,11 @@ class DataSubscriptionManager:
             or DataSubscriptionManager._extract_scalar(record.get("direction"))
             or ""
         )
+        trade_index = DataSubscriptionManager._extract_string_scalar(record.get("tradeIndex"))
+        buy_no = DataSubscriptionManager._extract_string_scalar(record.get("buyNo"))
+        sell_no = DataSubscriptionManager._extract_string_scalar(record.get("sellNo"))
+        trade_type = DataSubscriptionManager._extract_optional_int(record.get("tradeType"))
+        trade_flag = DataSubscriptionManager._extract_optional_int(record.get("tradeFlag"))
         event_time = DataSubscriptionManager._coerce_datetime(
             DataSubscriptionManager._extract_scalar(record.get("time"))
             or DataSubscriptionManager._extract_scalar(record.get("tradeTime"))
@@ -671,6 +688,11 @@ class DataSubscriptionManager:
             volume=volume,
             amount=amount,
             side=side,
+            trade_index=trade_index,
+            buy_no=buy_no,
+            sell_no=sell_no,
+            trade_type=trade_type,
+            trade_flag=trade_flag,
             event_time=event_time,
             recv_time=recv_time,
             raw_xt_fields=dict(record),
@@ -681,18 +703,20 @@ class DataSubscriptionManager:
         price = float(DataSubscriptionManager._extract_scalar(record.get("price"), 0.0) or 0.0)
         volume = int(DataSubscriptionManager._extract_scalar(record.get("volume"), 0) or 0)
         amount = float(DataSubscriptionManager._extract_scalar(record.get("amount"), price * volume) or (price * volume))
+        entrust_type = DataSubscriptionManager._extract_optional_int(record.get("entrustType"))
+        entrust_direction = DataSubscriptionManager._extract_optional_int(record.get("entrustDirection"))
         side = str(
             DataSubscriptionManager._extract_scalar(record.get("side"))
             or DataSubscriptionManager._extract_scalar(record.get("bsflag"))
             or DataSubscriptionManager._extract_scalar(record.get("bsFlag"))
             or DataSubscriptionManager._extract_scalar(record.get("direction"))
+            or DataSubscriptionManager._map_entrust_direction_side(entrust_direction)
             or ""
         )
-        entrust_no = str(
-            DataSubscriptionManager._extract_scalar(record.get("entrustNo"))
-            or DataSubscriptionManager._extract_scalar(record.get("entrust_no"))
-            or DataSubscriptionManager._extract_scalar(record.get("seq"))
-            or ""
+        entrust_no = (
+            DataSubscriptionManager._extract_string_scalar(record.get("entrustNo"))
+            or DataSubscriptionManager._extract_string_scalar(record.get("entrust_no"))
+            or DataSubscriptionManager._extract_string_scalar(record.get("seq"))
         )
         event_time = DataSubscriptionManager._coerce_datetime(
             DataSubscriptionManager._extract_scalar(record.get("time"))
@@ -707,6 +731,8 @@ class DataSubscriptionManager:
             amount=amount,
             side=side,
             entrust_no=entrust_no,
+            entrust_type=entrust_type,
+            entrust_direction=entrust_direction,
             is_cancel=DataSubscriptionManager._infer_order_cancel(record),
             event_time=event_time,
             recv_time=recv_time,
@@ -721,6 +747,13 @@ class DataSubscriptionManager:
             or DataSubscriptionManager._extract_scalar(payload.get("sysTime")),
             recv_time,
         )
+        bid_level_volume = DataSubscriptionManager._extract_book_values(
+            payload.get("bidLevelVolume"), cast_type=int, limit=None
+        )
+        reported_total_order_count = int(
+            DataSubscriptionManager._extract_scalar(payload.get("bidLevelNumber"), 0) or 0
+        )
+        observed_queue_count = len(bid_level_volume)
         return L2OrderQueueEvent(
             stock_code=code,
             price=float(
@@ -728,9 +761,10 @@ class DataSubscriptionManager:
                 or DataSubscriptionManager._extract_scalar(payload.get("price"))
                 or 0.0
             ),
-            bid_level_volume=DataSubscriptionManager._extract_book_values(
-                payload.get("bidLevelVolume"), cast_type=int, limit=None
-            ),
+            bid_level_volume=bid_level_volume,
+            reported_total_order_count=reported_total_order_count,
+            observed_queue_count=observed_queue_count,
+            is_partial_queue=reported_total_order_count > observed_queue_count,
             event_time=event_time,
             recv_time=recv_time,
             raw_xt_fields=dict(payload),
@@ -808,6 +842,9 @@ class DataSubscriptionManager:
 
     @staticmethod
     def _infer_order_cancel(record: dict) -> bool:
+        entrust_direction = DataSubscriptionManager._extract_optional_int(record.get("entrustDirection"))
+        if entrust_direction in (3, 4):
+            return True
         explicit = DataSubscriptionManager._extract_scalar(record.get("isCancel"))
         if explicit is not None:
             return bool(explicit)
@@ -825,6 +862,35 @@ class DataSubscriptionManager:
             if "cancel" in text or text == "c":
                 return True
         return False
+
+    @staticmethod
+    def _map_entrust_direction_side(entrust_direction: Optional[int]) -> str:
+        if entrust_direction == 1:
+            return "BUY"
+        if entrust_direction == 2:
+            return "SELL"
+        if entrust_direction == 3:
+            return "CANCEL_BUY"
+        if entrust_direction == 4:
+            return "CANCEL_SELL"
+        return ""
+
+    @staticmethod
+    def _extract_optional_int(value) -> Optional[int]:
+        scalar = DataSubscriptionManager._extract_scalar(value)
+        if scalar in (None, ""):
+            return None
+        try:
+            return int(scalar)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _extract_string_scalar(value) -> str:
+        scalar = DataSubscriptionManager._extract_scalar(value)
+        if scalar is None:
+            return ""
+        return str(scalar)
 
     @staticmethod
     def _extract_scalar(value, default=None):

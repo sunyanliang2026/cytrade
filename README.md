@@ -708,6 +708,20 @@ if is_market_day("20260306"):
 python -m pytest tests/ -v
 ```
 
+如果当前终端里的 `python` 命中的是 WindowsApps 占位符，可直接使用项目内测试入口：
+
+```powershell
+.\run_tests.ps1
+```
+
+当前默认测试解释器：
+
+```text
+C:\Users\ysun\miniconda3\envs\cytrade311\python.exe
+```
+
+默认会把 `pytest` 临时目录落到项目内 `.tmp_pytest_run`，避免系统 `%TEMP%` 目录权限问题。
+
 当前已覆盖：
 
 - 连接管理

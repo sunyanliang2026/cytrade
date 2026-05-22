@@ -16,6 +16,8 @@ class L2QuoteEvent:
     pre_close: float = 0.0
     bid1: float = 0.0
     ask1: float = 0.0
+    bid1_volume: int = 0
+    ask1_volume: int = 0
     limit_up_price: float = 0.0
     event_time: Optional[datetime] = None
     recv_time: Optional[datetime] = None
@@ -29,6 +31,11 @@ class L2TransactionEvent:
     volume: int = 0
     amount: float = 0.0
     side: str = ""
+    trade_index: str = ""
+    buy_no: str = ""
+    sell_no: str = ""
+    trade_type: Optional[int] = None
+    trade_flag: Optional[int] = None
     event_time: Optional[datetime] = None
     recv_time: Optional[datetime] = None
     raw_xt_fields: dict[str, Any] = field(default_factory=dict)
@@ -42,6 +49,8 @@ class L2OrderEvent:
     amount: float = 0.0
     side: str = ""
     entrust_no: str = ""
+    entrust_type: Optional[int] = None
+    entrust_direction: Optional[int] = None
     is_cancel: bool = False
     event_time: Optional[datetime] = None
     recv_time: Optional[datetime] = None
@@ -53,6 +62,9 @@ class L2OrderQueueEvent:
     stock_code: str = ""
     price: float = 0.0
     bid_level_volume: list[int] = field(default_factory=list)
+    reported_total_order_count: int = 0
+    observed_queue_count: int = 0
+    is_partial_queue: bool = False
     event_time: Optional[datetime] = None
     recv_time: Optional[datetime] = None
     raw_xt_fields: dict[str, Any] = field(default_factory=dict)

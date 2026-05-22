@@ -247,6 +247,7 @@ class StrategyRunner:
     def on_l2_quote_data(self, events_by_code: Dict[str, L2QuoteEvent]) -> None:
         """Dispatch Level2 quote events to matching strategies."""
         self._dispatch_l2_single(events_by_code, "on_l2_quote")
+        self._sync_subscriptions()
 
     def on_l2_transaction_data(self, events_by_code: Dict[str, List[L2TransactionEvent]]) -> None:
         """Dispatch Level2 transaction events to matching strategies."""
@@ -969,7 +970,11 @@ class StrategyRunner:
 
     @staticmethod
     def _normalize_strategy_data_kinds(strategy: BaseStrategy) -> set[str]:
-        raw_kinds = getattr(strategy.__class__, "required_data_kinds", lambda: {"tick"})()
+        current_data_kinds = getattr(strategy, "current_data_kinds", None)
+        if callable(current_data_kinds):
+            raw_kinds = current_data_kinds()
+        else:
+            raw_kinds = getattr(strategy.__class__, "required_data_kinds", lambda: {"tick"})()
         normalized = {str(kind or "").strip().lower() for kind in (raw_kinds or {"tick"})}
         normalized.discard("")
         allowed = getattr(strategy.__class__, "_supported_data_kinds", {"tick"})
@@ -1182,6 +1187,7 @@ class StrategyRunner:
         strategy = self.get_strategy(order.strategy_id)
         if strategy:
             strategy.on_order_update(order)
+            self._sync_subscriptions()
 
     def _sync_orders_and_trades_job(self) -> None:
         """浠呭湪浜ゆ槗鏃舵杩愯涓诲姩鍚屾锛岃ˉ鍋挎紡鍥炴姤鍦烘櫙銆?"""

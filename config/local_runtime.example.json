@@ -1,0 +1,11 @@
+{
+  "QMT_PATH": "C:\\path\\to\\QMT\\userdata_mini",
+  "XTQUANT_PATH": "",
+  "ACCOUNT_ID": "your_account_id",
+  "ACCOUNT_TYPE": "STOCK",
+  "ACCOUNT_PASSWORD": "",
+  "CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH": "C:\\path\\to\\cytrade\\config\\main_seal_follow_pool.csv",
+  "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN": true,
+  "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION": false,
+  "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION_DIR": ""
+}

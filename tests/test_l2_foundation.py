@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from core.data_subscription import DataSubscriptionManager
 from core.l2_models import L2OrderEvent, L2OrderQueueEvent, L2QuoteEvent, L2TransactionEvent
 from core.models import TickData
@@ -103,6 +105,33 @@ class _DummyTickStrategy(BaseStrategy):
         return []
 
 
+class _DummyDynamicL2Strategy(BaseStrategy):
+    strategy_name = "DummyDynamicL2Strategy"
+
+    def __init__(self, config: StrategyConfig, trade_executor=None, position_manager=None):
+        super().__init__(config, trade_executor, position_manager)
+        self.detail_enabled = False
+
+    @classmethod
+    def required_data_kinds(cls) -> set[str]:
+        return {"l2quote"}
+
+    def current_data_kinds(self):
+        if self.detail_enabled:
+            return {"l2quote", "l2transaction", "l2order", "l2orderqueue"}
+        return {"l2quote"}
+
+    def on_l2_quote(self, event):
+        if float(event.last_price or 0.0) >= 10.0:
+            self.detail_enabled = True
+
+    def on_tick(self, tick):
+        return None
+
+    def select_stocks(self):
+        return []
+
+
 def test_data_subscription_mock_callbacks_cover_tick_and_l2():
     manager = DataSubscriptionManager()
     captured = {}
@@ -126,6 +155,83 @@ def test_data_subscription_mock_callbacks_cover_tick_and_l2():
     assert isinstance(captured["l2orderqueue"]["000001"], L2OrderQueueEvent)
 
 
+def test_data_subscription_parses_l2_order_direction_and_cancel():
+    buy = DataSubscriptionManager._parse_l2_order_record(
+        "001259",
+        {
+            "time": 1779342217070,
+            "price": 88.58,
+            "volume": 800,
+            "entrustNo": 43360644,
+            "entrustType": 1,
+            "entrustDirection": 1,
+        },
+        datetime.now(),
+    )
+    cancel_buy = DataSubscriptionManager._parse_l2_order_record(
+        "600604",
+        {
+            "time": 1779342217070,
+            "price": 5.94,
+            "volume": 100,
+            "entrustNo": 12480951,
+            "entrustType": 1,
+            "entrustDirection": 3,
+        },
+        datetime.now(),
+    )
+
+    assert buy.side == "BUY"
+    assert buy.entrust_type == 1
+    assert buy.entrust_direction == 1
+    assert buy.is_cancel is False
+    assert cancel_buy.side == "CANCEL_BUY"
+    assert cancel_buy.is_cancel is True
+
+
+def test_data_subscription_parses_l2_transaction_cancel_fields():
+    event = DataSubscriptionManager._parse_l2_transaction_record(
+        "001259",
+        {
+            "time": 1779341718330,
+            "price": 0.0,
+            "volume": 600,
+            "amount": 0.0,
+            "tradeIndex": 42120464,
+            "buyNo": 41505515,
+            "sellNo": 0,
+            "tradeType": 0,
+            "tradeFlag": 3,
+        },
+        datetime.now(),
+    )
+
+    assert event.trade_index == "42120464"
+    assert event.buy_no == "41505515"
+    assert event.sell_no == "0"
+    assert event.trade_type == 0
+    assert event.trade_flag == 3
+    assert event.price == 0.0
+
+
+def test_data_subscription_parses_l2_orderqueue_partial_coverage():
+    event = DataSubscriptionManager._parse_l2_orderqueue(
+        "001259",
+        {
+            "time": 1779342231000,
+            "bidLevelPrice": 88.58,
+            "bidLevelVolume": [1, 2, 2, 5],
+            "bidLevelNumber": 704,
+        },
+        datetime.now(),
+    )
+
+    assert event.bid_level_volume == [1, 2, 2, 5]
+    assert event.observed_queue_count == 4
+    assert event.reported_total_order_count == 704
+    assert event.is_partial_queue is True
+
+
 def test_runner_syncs_l2_subscription_plan_and_dispatches_events():
     fake_data_sub = _FakeDataSubscription()
     runner = StrategyRunner(data_subscription=fake_data_sub)
@@ -147,6 +253,33 @@ def test_runner_syncs_l2_subscription_plan_and_dispatches_events():
     assert len(strategy.l2_transaction_events) == 1
     assert len(strategy.l2_order_events) == 1
     assert len(strategy.l2_orderqueue_events) == 1
+
+
+def test_runner_expands_dynamic_l2_subscription_after_quote():
+    fake_data_sub = _FakeDataSubscription()
+    runner = StrategyRunner(data_subscription=fake_data_sub)
+    strategy = _DummyDynamicL2Strategy(StrategyConfig(stock_code="000001"))
+    runner.add_strategy(strategy)
+
+    runner._sync_subscriptions()
+
+    assert fake_data_sub.tick_codes == set()
+    assert fake_data_sub.l2_map["000001"] == {"l2quote"}
+
+    runner._running = True
+    runner.on_l2_quote_data({"000001": L2QuoteEvent(stock_code="000001", last_price=10.0)})
+
+    assert fake_data_sub.l2_map["000001"] == {
+        "l2quote",
+        "l2transaction",
+        "l2order",
+        "l2orderqueue",
+    }
+
+    strategy.detail_enabled = False
+    runner._sync_subscriptions()
+
+    assert fake_data_sub.l2_map["000001"] == {"l2quote"}
 
 
 def test_runner_keeps_tick_only_subscription_and_dispatch_flow():

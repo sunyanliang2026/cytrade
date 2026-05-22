@@ -173,6 +173,10 @@ class Settings:
         "CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH",
         "",
     )
+    CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN: bool = _setting_bool(
+        "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN",
+        True,
+    )
     CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION: bool = _setting_bool(
         "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION",
         False,
