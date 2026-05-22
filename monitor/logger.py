@@ -33,11 +33,11 @@ except ImportError:
 
 
 class _SummaryFilter(logging.Filter):
-    """摘要模式过滤器：只放行含 [ORDER] / [TRADE] 标签的日志"""
+    """摘要模式过滤器：只放行订单、成交与关键策略事件。"""
     def filter(self, record: logging.LogRecord) -> bool:
-        """只允许订单与成交摘要日志通过。"""
+        """只允许订单、成交与 MainSealFollow 关键事件通过。"""
         msg = record.getMessage()
-        return "[ORDER]" in msg or "[TRADE]" in msg
+        return "[ORDER]" in msg or "[TRADE]" in msg or "MSF_EVENT" in msg
 
 
 class LogManager:

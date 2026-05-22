@@ -135,6 +135,7 @@ class MainSealFollowStrategy(BaseStrategy):
         )
         self._warning_throttle_ms = int(params.get("warning_throttle_ms", 60_000) or 60_000)
         self._warning_last_emit_ms: Dict[str, int] = {}
+        self._event_last_emit_ms: Dict[str, int] = {}
         self._entry_disabled_reason = str(params.get("entry_disabled_reason") or "")
 
         self._entry_state = self.STATE_WAIT_SIGNAL
@@ -526,18 +527,28 @@ class MainSealFollowStrategy(BaseStrategy):
 
     def submit_feature_entry_orders(self, limit_price: float, trigger_reason: str = "") -> List[Order]:
         if self._has_position():
+            self._log_event("entry_submit_skipped", reason="already_has_position", source=trigger_reason)
             logger.info("MainSealFollow[%s]: already has position, skip entry", self.strategy_id[:8])
             return []
         if self._has_active_entry_order():
+            self._log_event("entry_submit_skipped", reason="active_entry_order_exists", source=trigger_reason)
             logger.info("MainSealFollow[%s]: active entry orders exist, skip duplicate submit", self.strategy_id[:8])
             return []
         if not self._dry_run and not self._trade_executor:
+            self._log_event("entry_submit_skipped", level="warning", reason="trade_executor_missing", source=trigger_reason)
             logger.warning(
                 "MainSealFollow[%s]: trade executor is not configured, skip entry submit",
                 self.strategy_id[:8],
             )
             return []
         if limit_price <= 0 or self._plan_amount <= 0:
+            self._log_event(
+                "entry_submit_skipped",
+                level="warning",
+                reason="invalid_submit_params",
+                source=trigger_reason,
+                metrics={"limit_price": limit_price, "plan_amount": self._plan_amount},
+            )
             logger.warning(
                 "MainSealFollow[%s]: invalid submit params limit_price=%s plan_amount=%s",
                 self.strategy_id[:8],
@@ -553,6 +564,13 @@ class MainSealFollowStrategy(BaseStrategy):
 
         planned_parts = self._plan_entry_parts(limit_price, trigger_reason=trigger_reason)
         if not planned_parts:
+            self._log_event(
+                "entry_submit_skipped",
+                level="warning",
+                reason="no_valid_split_orders",
+                source=trigger_reason,
+                metrics={"limit_price": limit_price, "target_lots": self._target_lots},
+            )
             logger.warning(
                 "MainSealFollow[%s]: no valid split orders generated at limit price %.3f",
                 self.strategy_id[:8],
@@ -569,10 +587,35 @@ class MainSealFollowStrategy(BaseStrategy):
         self._probe_filled_quantity = 0
         self._main_keep_decision_time_ms = 0
         self._last_decision_metrics = {}
+        self._log_event(
+            "entry_plan_created",
+            reason=trigger_reason or "manual",
+            source=trigger_reason,
+            metrics={
+                "limit_price": limit_price,
+                "target_lots": self._target_lots,
+                "target_shares": self._target_shares,
+                "parts": [(item["role"], item["quantity"]) for item in planned_parts],
+                "front_qty_anchor": self._front_qty_anchor,
+                "queue_before_send_count": len(self._queue_before_send),
+                "current_bid1_volume_lot": self._current_bid1_volume_lot,
+                "current_front50_depth_lot": self._current_front50_depth_lot,
+            },
+        )
 
         if self._dry_run:
             if not self._dry_run_replay_probe_logic:
                 self._entry_state = self.STATE_DRY_RUN_READY
+                self._log_event(
+                    "dry_run_entry_ready",
+                    reason=trigger_reason or "manual",
+                    source=trigger_reason,
+                    metrics={
+                        "limit_price": limit_price,
+                        "target_shares": self._target_shares,
+                        "parts": [(item["role"], item["quantity"]) for item in planned_parts],
+                    },
+                )
                 logger.info(
                     "MainSealFollow[%s] [DRY_RUN]: ready to submit %d entry orders stock=%s name=%s state=%s limit=%.3f shares=%d parts=%s reason=%s",
                     self.strategy_id[:8],
@@ -614,6 +657,16 @@ class MainSealFollowStrategy(BaseStrategy):
                     self._probe_order_uuid = orders[0].order_uuid
                     self._main_order_uuids = [order.order_uuid for order in orders[1:]]
                 self._entry_state = self.STATE_WAIT_PROBE_FILL
+                self._log_event(
+                    "dry_run_entry_submitted",
+                    reason=trigger_reason or "manual",
+                    source=trigger_reason,
+                    metrics={
+                        "order_count": len(orders),
+                        "probe_order_uuid": self._short_uuid(self._probe_order_uuid),
+                        "main_order_uuids": [self._short_uuid(order_id) for order_id in self._main_order_uuids],
+                    },
+                )
                 self.request_state_persist(reason=f"msf_dry_run_submit:{self.strategy_id}")
             logger.info(
                 "MainSealFollow[%s] [DRY_RUN]: virtual submit %d entry orders stock=%s name=%s state=%s limit=%.3f shares=%d parts=%s reason=%s",
@@ -657,6 +710,17 @@ class MainSealFollowStrategy(BaseStrategy):
                 self._probe_order_uuid = orders[0].order_uuid
                 self._main_order_uuids = [order.order_uuid for order in orders[1:]]
             self._entry_state = self.STATE_CHAIN_SUBMITTED
+            self._log_event(
+                "live_entry_submitted",
+                reason=trigger_reason or "manual",
+                source=trigger_reason,
+                metrics={
+                    "order_count": len(orders),
+                    "probe_order_uuid": self._short_uuid(self._probe_order_uuid),
+                    "main_order_uuids": [self._short_uuid(order_id) for order_id in self._main_order_uuids],
+                    "orders": [self._order_event_metrics(order) for order in orders],
+                },
+            )
             self.request_state_persist(reason=f"msf_submit:{self.strategy_id}")
         return orders
 
@@ -815,21 +879,44 @@ class MainSealFollowStrategy(BaseStrategy):
         if order.direction != OrderDirection.BUY:
             if order.direction == OrderDirection.SELL and not self._has_position():
                 self._entry_state = self.STATE_EXITED
+                self._log_event(
+                    "state_changed",
+                    reason="sell_order_update_without_position",
+                    metrics=self._order_event_metrics(order),
+                )
             return
 
         if order.order_uuid not in self._entry_order_uuids:
             self._entry_order_uuids.append(order.order_uuid)
+
+        self._log_event(
+            "order_update",
+            reason=str(getattr(order, "status_msg", "") or getattr(order.status, "value", order.status) or ""),
+            metrics=self._order_event_metrics(order),
+            throttle_key=f"order_update:{order.order_uuid}:{getattr(order.status, 'value', order.status)}",
+            throttle_ms=1_000,
+        )
 
         if order.order_uuid == self._probe_order_uuid and self._order_has_any_fill(order):
             if self._probe_fill_time_ms <= 0:
                 self._probe_fill_time_ms = self._now_ms()
                 self._probe_filled_quantity = int(getattr(order, "filled_quantity", 0) or 0)
                 self._entry_state = self.STATE_PROBE_FILLED_DECISION
+                self._log_event(
+                    "probe_filled",
+                    reason="probe_order_has_fill",
+                    metrics=self._order_event_metrics(order),
+                )
                 self._decide_main_after_probe_fill()
             return
 
         if order.order_uuid in set(self._main_order_uuids) and self._order_has_any_fill(order):
             self._entry_state = self.STATE_HAS_POSITION
+            self._log_event(
+                "main_filled",
+                reason="main_order_has_fill",
+                metrics=self._order_event_metrics(order),
+            )
             self._cancel_remaining_main_orders("main_deal_happened_cancel_remaining")
             return
 
@@ -865,6 +952,11 @@ class MainSealFollowStrategy(BaseStrategy):
             OrderStatus.UNKNOWN,
         ) and not self._has_active_entry_order():
             self._entry_state = self.STATE_HAS_POSITION if self._has_any_recorded_entry_fill() else self.STATE_WAIT_SIGNAL
+            self._log_event(
+                "entry_cycle_finished",
+                reason=str(getattr(order.status, "value", order.status) or ""),
+                metrics=self._order_event_metrics(order),
+            )
 
     def _refresh_target_from_limit_price(self, limit_price: float) -> None:
         self._target_lots = self._calc_target_lots(self._plan_amount, limit_price)
@@ -880,6 +972,18 @@ class MainSealFollowStrategy(BaseStrategy):
         required_amount = float(limit_price) * 100
         self._entry_disabled_reason = "planned_amount_below_one_lot"
         self._l2_detail_enabled = False
+        self._log_event(
+            "entry_disabled",
+            level="warning",
+            reason=self._entry_disabled_reason,
+            metrics={
+                "plan_amount": self._plan_amount,
+                "required_amount": required_amount,
+                "limit_price": limit_price,
+            },
+            throttle_key=f"entry_disabled:{self._entry_disabled_reason}",
+            throttle_ms=self._warning_throttle_ms,
+        )
         self._throttled_warning(
             "planned_amount_below_one_lot",
             (
@@ -906,6 +1010,66 @@ class MainSealFollowStrategy(BaseStrategy):
         self._warning_last_emit_ms[key] = now_ms
         logger.warning(message, *args)
         return True
+
+    def _log_event(
+        self,
+        event: str,
+        *,
+        level: str = "info",
+        reason: str = "",
+        source: str = "",
+        metrics: Optional[dict] = None,
+        throttle_key: str = "",
+        throttle_ms: Optional[int] = None,
+    ) -> bool:
+        """统一输出策略关键事件，方便实盘时按 `MSF_EVENT` 过滤。"""
+        if throttle_key:
+            now_ms = self._now_ms()
+            interval = int(throttle_ms if throttle_ms is not None else self._warning_throttle_ms)
+            last_ms = int(self._event_last_emit_ms.get(throttle_key, 0) or 0)
+            if last_ms > 0 and now_ms - last_ms < interval:
+                return False
+            self._event_last_emit_ms[throttle_key] = now_ms
+
+        payload = {
+            "event": str(event or ""),
+            "strategy_id": self.strategy_id,
+            "stock": self.stock_code,
+            "name": self._stock_name,
+            "state": self._entry_state,
+            "dry_run": self._dry_run,
+            "reason": str(reason or ""),
+            "source": str(source or ""),
+            "limit_up_price": self._limit_up_price,
+            "last_price": self._last_price,
+            "plan_amount": self._plan_amount,
+            "target_shares": self._target_shares,
+            "probe_order_uuid": self._short_uuid(self._probe_order_uuid),
+            "main_order_uuids": [self._short_uuid(item) for item in self._main_order_uuids],
+            "metrics": metrics or {},
+        }
+        message = "MSF_EVENT %s" % json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)
+        log_fn = logger.warning if str(level).lower() == "warning" else logger.info
+        log_fn(message)
+        return True
+
+    @staticmethod
+    def _short_uuid(value: str) -> str:
+        text = str(value or "")
+        return text[:8] if text else ""
+
+    def _order_event_metrics(self, order: Order) -> dict:
+        return {
+            "order_uuid": self._short_uuid(getattr(order, "order_uuid", "")),
+            "status": str(getattr(getattr(order, "status", ""), "value", getattr(order, "status", "")) or ""),
+            "status_msg": str(getattr(order, "status_msg", "") or ""),
+            "direction": str(getattr(getattr(order, "direction", ""), "value", getattr(order, "direction", "")) or ""),
+            "price": float(getattr(order, "price", 0.0) or 0.0),
+            "quantity": int(getattr(order, "quantity", 0) or 0),
+            "filled_quantity": int(getattr(order, "filled_quantity", 0) or 0),
+            "filled_amount": float(getattr(order, "filled_amount", 0.0) or 0.0),
+            "remark": str(getattr(order, "remark", "") or ""),
+        }
 
     def _plan_entry_parts(self, limit_price: float, trigger_reason: str = "") -> List[Dict[str, object]]:
         if not self._feature_split_lots:
@@ -941,22 +1105,52 @@ class MainSealFollowStrategy(BaseStrategy):
 
     def _maybe_trigger_entry(self, trigger_source: str) -> bool:
         if self._entry_disabled_reason:
+            self._log_entry_blocked("entry_disabled", trigger_source, {"disabled_reason": self._entry_disabled_reason})
             return False
         if self._entry_state != self.STATE_WAIT_SIGNAL:
+            self._log_entry_blocked("state_not_wait_signal", trigger_source)
             return False
         if self._has_position() or self._has_active_entry_order():
+            self._log_entry_blocked("position_or_active_order_exists", trigger_source)
             return False
         if self._limit_up_price <= 0 or not self._current_queue:
+            self._log_entry_blocked(
+                "limit_price_or_queue_missing",
+                trigger_source,
+                {"has_queue": bool(self._current_queue), "limit_up_price": self._limit_up_price},
+            )
             return False
         if self._last_cancel_time_ms > 0 and self._now_ms() - self._last_cancel_time_ms < self._cooldown_ms:
+            self._log_entry_blocked(
+                "cooldown_after_cancel",
+                trigger_source,
+                {"last_cancel_reason": self._last_cancel_reason, "cooldown_ms": self._cooldown_ms},
+            )
             return False
         if not self._main_seal_ok():
+            self._log_entry_blocked("main_seal_not_ok", trigger_source, self._main_seal_diagnostics())
             return False
+        self._log_event(
+            "entry_signal_accepted",
+            reason=f"l2:{trigger_source}",
+            source=trigger_source,
+            metrics=self._main_seal_diagnostics(),
+        )
         orders = self.submit_feature_entry_orders(
             self._limit_up_price,
             trigger_reason=f"l2:{trigger_source}",
         )
         return bool(orders) or self._entry_state == self.STATE_DRY_RUN_READY
+
+    def _log_entry_blocked(self, reason: str, source: str, metrics: Optional[dict] = None) -> None:
+        self._log_event(
+            "entry_signal_blocked",
+            reason=reason,
+            source=source,
+            metrics=metrics or self._main_seal_diagnostics(),
+            throttle_key=f"entry_signal_blocked:{self.stock_code}:{reason}",
+            throttle_ms=self._warning_throttle_ms,
+        )
 
     def _remember_l2_order(self, event: L2OrderEvent, shares: int, amount: float) -> None:
         entrust_no = str(event.entrust_no or "").strip()
@@ -1044,6 +1238,12 @@ class MainSealFollowStrategy(BaseStrategy):
             if self._probe_submit_time_ms > 0:
                 elapsed = now_ms - int(self._probe_submit_time_ms or 0)
                 if elapsed > self._probe_wait_timeout_ms and self._should_cancel_before_probe_fill():
+                    self._log_event(
+                        "probe_wait_timeout_cancel",
+                        reason="probe_wait_timeout_market_weak",
+                        source=source,
+                        metrics=self._last_decision_metrics,
+                    )
                     self._request_cancel_entry_orders("probe_wait_timeout_market_weak")
                     self._entry_state = self.STATE_MAIN_CANCELING
                     return "probe_wait_timeout_market_weak"
@@ -1060,11 +1260,23 @@ class MainSealFollowStrategy(BaseStrategy):
                 return ""
             reason = self._main_cancel_reason_after_probe()
             if reason:
+                self._log_event(
+                    "main_cancel_decision",
+                    reason=reason,
+                    source=source,
+                    metrics=self._last_decision_metrics,
+                )
                 self._request_cancel_main_orders(reason)
                 return reason
             if self._entry_state == self.STATE_PROBE_FILLED_DECISION:
                 self._entry_state = self.STATE_MAIN_KEEPING
                 self._main_keep_decision_time_ms = now_ms
+                self._log_event(
+                    "main_keep_decision",
+                    reason="market_still_strong_after_probe",
+                    source=source,
+                    metrics=self._last_decision_metrics,
+                )
                 logger.info(
                     "MainSealFollow[%s]: keep main order after probe fill source=%s metrics=%s",
                     self.strategy_id[:8],
@@ -1079,10 +1291,22 @@ class MainSealFollowStrategy(BaseStrategy):
         self._last_decision_metrics = metrics
         reason = self._main_cancel_reason_from_metrics(metrics)
         if reason:
+            self._log_event(
+                "main_cancel_decision",
+                reason=reason,
+                source="probe_fill",
+                metrics=metrics,
+            )
             self._request_cancel_main_orders(reason)
             return reason
         self._entry_state = self.STATE_MAIN_KEEPING
         self._main_keep_decision_time_ms = self._now_ms()
+        self._log_event(
+            "main_keep_decision",
+            reason="probe_filled_market_ok",
+            source="probe_fill",
+            metrics=metrics,
+        )
         logger.info(
             "MainSealFollow[%s]: probe filled, keep main order stock=%s name=%s state=%s probe_fill_ms=%s metrics=%s",
             self.strategy_id[:8],
@@ -1217,6 +1441,19 @@ class MainSealFollowStrategy(BaseStrategy):
         self._entry_position = self._analyze_position(self._current_queue)
         self._queue_enter_time_ms = self._current_queue_time_ms or self._now_ms()
         self._entry_state = self.STATE_IN_QUEUE
+        self._log_event(
+            "queue_position_estimated",
+            reason="order_accepted_seen_in_queue",
+            metrics={
+                "my_start": self._my_start,
+                "my_end": self._my_end,
+                "position_method": self._position_method,
+                "position_confidence": self._position_confidence,
+                "entry_position": self._entry_position,
+                "queue_count": len(self._entry_queue),
+                "current_queue_is_partial": self._current_queue_is_partial,
+            },
+        )
         self.request_state_persist(reason=f"msf_queue_estimated:{self.strategy_id}", min_interval_sec=0.0)
         return True
 
@@ -1245,15 +1482,19 @@ class MainSealFollowStrategy(BaseStrategy):
         timeout_weak = elapsed > self._max_queue_ms and back_big_weak
 
         if front_big_weak and back_big_weak and self._position_method == "pattern_contiguous":
+            self._log_event("queue_cancel_decision", reason="front_big_weak_and_back_big_empty", metrics=position)
             self._request_cancel_entry_orders("front_big_weak_and_back_big_empty")
             return "front_big_weak_and_back_big_empty"
         if position_danger and back_big_weak:
+            self._log_event("queue_cancel_decision", reason="position_danger_and_back_big_empty", metrics=position)
             self._request_cancel_entry_orders("position_danger_and_back_big_empty")
             return "position_danger_and_back_big_empty"
         if front_big_weak and back_big_weak:
+            self._log_event("queue_cancel_decision", reason="front_big_weak_and_back_big_empty", metrics=position)
             self._request_cancel_entry_orders("front_big_weak_and_back_big_empty")
             return "front_big_weak_and_back_big_empty"
         if timeout_weak:
+            self._log_event("queue_cancel_decision", reason="queue_timeout_and_back_big_empty", metrics=position)
             self._request_cancel_entry_orders("queue_timeout_and_back_big_empty")
             return "queue_timeout_and_back_big_empty"
         return ""
@@ -1282,6 +1523,11 @@ class MainSealFollowStrategy(BaseStrategy):
         if submitted > 0:
             self._last_cancel_time_ms = self._now_ms()
             self._last_cancel_reason = str(reason or "")
+            self._log_event(
+                "entry_cancel_submitted",
+                reason=reason,
+                metrics={"submitted": submitted, "scope": "entry"},
+            )
             self.request_state_persist(reason=f"msf_cancel:{self.strategy_id}", min_interval_sec=0.0)
         return submitted
 
@@ -1313,6 +1559,11 @@ class MainSealFollowStrategy(BaseStrategy):
             self._entry_state = self.STATE_MAIN_CANCELING
             self._last_cancel_time_ms = self._now_ms()
             self._last_cancel_reason = str(reason or "")
+            self._log_event(
+                "main_cancel_submitted",
+                reason=reason,
+                metrics={"submitted": submitted, "scope": "main"},
+            )
             self.request_state_persist(reason=f"msf_cancel_main:{self.strategy_id}", min_interval_sec=0.0)
         return submitted
 
@@ -1386,6 +1637,16 @@ class MainSealFollowStrategy(BaseStrategy):
         self._probe_fill_time_ms = self._now_ms()
         self._probe_filled_quantity = probe_qty
         self._entry_state = self.STATE_PROBE_FILLED_DECISION
+        self._log_event(
+            "dry_run_probe_filled",
+            reason="simulated_probe_fill",
+            source=source or "market",
+            metrics={
+                "traded_shares": traded_shares,
+                "threshold_shares": threshold_shares,
+                "probe_qty": probe_qty,
+            },
+        )
         logger.info(
             "MainSealFollow[%s] [DRY_RUN]: simulated probe fill stock=%s name=%s state=%s source=%s traded_shares=%d threshold_shares=%d",
             self.strategy_id[:8],
@@ -1424,6 +1685,11 @@ class MainSealFollowStrategy(BaseStrategy):
         if finalized > 0:
             self._last_cancel_time_ms = self._now_ms()
             self._last_cancel_reason = str(reason or "")
+            self._log_event(
+                "dry_run_orders_finalized",
+                reason=reason,
+                metrics={"finalized": finalized, "scope": scope or "entry"},
+            )
             logger.info(
                 "MainSealFollow[%s] [DRY_RUN]: finalize %s orders=%d stock=%s name=%s state=%s reason=%s",
                 self.strategy_id[:8],
@@ -1443,6 +1709,12 @@ class MainSealFollowStrategy(BaseStrategy):
         orders = self._get_active_main_orders()
         if not orders:
             return False
+        self._log_event(
+            "dry_run_keep_window_complete",
+            reason="dry_run_keep_window_complete",
+            source=source or "market",
+            metrics=self._last_decision_metrics,
+        )
         logger.info(
             "MainSealFollow[%s] [DRY_RUN]: keep window complete stock=%s name=%s state=%s source=%s metrics=%s",
             self.strategy_id[:8],
@@ -1816,6 +2088,46 @@ class MainSealFollowStrategy(BaseStrategy):
         if self._existing_limit_seen_since_ms <= 0:
             self._existing_limit_seen_since_ms = now_ms
         return now_ms - self._existing_limit_seen_since_ms >= self._existing_limit_observe_ms
+
+    def _main_seal_diagnostics(self) -> dict:
+        """Return a non-mutating snapshot explaining current entry conditions."""
+        big_metrics = self._calc_big_metrics(self._current_queue, self._limit_up_price) if self._current_queue else {}
+        recent_big_buys = self._recent_items(self._recent_big_limit_buy_orders, self._main_seal_window_ms)
+        recent_big_cancels = self._recent_items(self._recent_big_limit_cancel_orders, self._main_seal_window_ms)
+        recent_big_buy_ok = bool(recent_big_buys)
+        recent_big_cancel_blocked = self._recent_big_limit_cancel_blocked()
+        detected_main_seal = (
+            self._detect_main_seal_from_queue(self._current_queue, self._limit_up_price)
+            if self._current_queue and self._limit_up_price > 0
+            else False
+        )
+        bid1_price = 0.0
+        if self._recent_quote_points:
+            bid1_price = float(self._recent_quote_points[-1].get("bid1", 0.0) or 0.0)
+        existing_limit_observed_ms = (
+            max(0, self._now_ms() - int(self._existing_limit_seen_since_ms or 0))
+            if self._existing_limit_seen_since_ms > 0
+            else 0
+        )
+        return {
+            "detected_main_seal": detected_main_seal,
+            "big_metrics": big_metrics,
+            "require_recent_big_limit_buy": self._require_recent_big_limit_buy,
+            "recent_big_limit_buy_ok": recent_big_buy_ok,
+            "recent_big_limit_buy_count": len(recent_big_buys),
+            "block_on_recent_big_limit_cancel": self._block_on_recent_big_limit_cancel,
+            "recent_big_limit_cancel_blocked": recent_big_cancel_blocked,
+            "recent_big_limit_cancel_count": len(recent_big_cancels),
+            "allow_existing_limit_queue": self._allow_existing_limit_queue,
+            "existing_limit_observed_ms": existing_limit_observed_ms,
+            "existing_limit_observe_ms": self._existing_limit_observe_ms,
+            "bid1_price": bid1_price,
+            "current_queue_count": len(self._current_queue),
+            "current_queue_reported_count": self._current_queue_reported_count,
+            "current_queue_is_partial": self._current_queue_is_partial,
+            "current_bid1_volume_lot": self._current_bid1_volume_lot,
+            "current_front50_depth_lot": self._current_front50_depth_lot,
+        }
 
     def _main_seal_ok(self) -> bool:
         if self._limit_up_price <= 0 or not self._current_queue:

@@ -1,7 +1,10 @@
+import json
 from pathlib import Path
 
 from config.enums import OrderStatus
 from core.l2_models import L2OrderEvent, L2OrderQueueEvent, L2QuoteEvent, L2TransactionEvent
+from monitor.logger import _SummaryFilter
+import strategy.main_seal_follow_strategy as msf_module
 from strategy.main_seal_follow_strategy import MainSealFollowStrategy
 from strategy.models import StrategyConfig
 
@@ -38,6 +41,30 @@ class _FakeCancelableTradeExecutor(_FakeTradeExecutor):
                 order.status_msg = remark
                 break
         return True
+
+
+class _CaptureLogger:
+    def __init__(self):
+        self.messages = []
+
+    def info(self, message, *args):
+        self.messages.append(str(message) % args if args else str(message))
+
+    def warning(self, message, *args):
+        self.messages.append(str(message) % args if args else str(message))
+
+    def error(self, message, *args, **kwargs):
+        self.messages.append(str(message) % args if args else str(message))
+
+
+def _extract_msf_events(messages):
+    events = []
+    for message in messages:
+        marker = "MSF_EVENT "
+        if marker not in message:
+            continue
+        events.append(json.loads(message.split(marker, 1)[1]))
+    return events
 
 
 def test_main_seal_follow_select_stocks_from_csv_supports_chinese_headers_and_wan_amount(tmp_path: Path):
@@ -90,6 +117,49 @@ def test_main_seal_follow_submit_feature_orders_tracks_split_orders():
     assert strategy._entry_order_uuids == [order.order_uuid for order in orders]
     assert strategy._probe_order_uuid == orders[0].order_uuid
     assert strategy._main_order_uuids == [orders[1].order_uuid]
+
+
+def test_main_seal_follow_emits_structured_events_for_entry_submit(monkeypatch):
+    capture = _CaptureLogger()
+    monkeypatch.setattr(msf_module, "logger", capture)
+    strategy = MainSealFollowStrategy(
+        StrategyConfig(
+            stock_code="000001",
+            params={
+                "stock_name": "平安银行",
+                "plan_amount": 2200.0,
+                "dry_run": True,
+            },
+        )
+    )
+
+    orders = strategy.submit_feature_entry_orders(11.0, trigger_reason="unit-test")
+    events = _extract_msf_events(capture.messages)
+    event_names = [event["event"] for event in events]
+
+    assert len(orders) == 2
+    assert "entry_plan_created" in event_names
+    assert "dry_run_entry_submitted" in event_names
+    submit_event = next(event for event in events if event["event"] == "dry_run_entry_submitted")
+    assert submit_event["stock"] == "000001"
+    assert submit_event["name"] == "平安银行"
+    assert submit_event["state"] == "WAIT_PROBE_FILL"
+    assert submit_event["dry_run"] is True
+    assert submit_event["metrics"]["order_count"] == 2
+
+
+def test_summary_filter_keeps_msf_events():
+    record = __import__("logging").LogRecord(
+        name="cytrade.trade",
+        level=20,
+        pathname=__file__,
+        lineno=1,
+        msg='MSF_EVENT {"event":"entry_signal_accepted"}',
+        args=(),
+        exc_info=None,
+    )
+
+    assert _SummaryFilter().filter(record) is True
 
 
 def test_main_seal_follow_submit_feature_orders_requires_executor_when_live():
