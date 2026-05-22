@@ -58,6 +58,21 @@ def _setting_bool(name: str, default: bool = False) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _setting_int(name: str, default: int) -> int:
+    """读取整数配置，优先环境变量，其次本地固定配置文件。"""
+    raw = os.getenv(name)
+    if raw is not None and raw != "":
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+    value = _LOCAL_RUNTIME_CONFIG.get(name, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _env_str(name: str, default: str = "") -> str:
     """读取字符串环境变量。
 
@@ -198,6 +213,7 @@ class Settings:
     LOG_MAX_DAYS: int = _env_int("LOG_MAX_DAYS", 30)                     # 日志最长保存天数
     LOG_LEVEL: str = _env_str("LOG_LEVEL", "INFO")                    # INFO / DEBUG
     LOG_SUMMARY_MODE: bool = _env_bool("LOG_SUMMARY_MODE", False)             # True=仅打印成交与下单摘要
+    RUNTIME_HEARTBEAT_INTERVAL_SEC: int = _setting_int("RUNTIME_HEARTBEAT_INTERVAL_SEC", 30)
 
     # ---- 持仓管理 ----
     COST_METHOD: str = _env_str("COST_METHOD", "moving_average")        # moving_average / fifo

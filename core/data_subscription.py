@@ -139,9 +139,10 @@ class DataSubscriptionManager:
                         subscription_ids=self._l2_subscription_ids,
                     )
             logger.info(
-                "DataSubscription: subscribed %d stocks for Level2 kinds=%s",
+                "DataSubscription: subscribed %d stocks for Level2 kinds=%s stocks=%s",
                 len(stock_codes),
                 ",".join(sorted(requested_kinds)),
+                ",".join(stock_codes),
             )
         except Exception as e:
             logger.error("DataSubscription: subscribe_l2_stocks failed: %s", e, exc_info=True)
@@ -175,9 +176,10 @@ class DataSubscriptionManager:
                 if sub_id is not None:
                     xtdata.unsubscribe_quote(sub_id)
             logger.info(
-                "DataSubscription: unsubscribed Level2 for %d stocks kinds=%s",
+                "DataSubscription: unsubscribed Level2 for %d stocks kinds=%s stocks=%s",
                 len(stock_codes),
                 ",".join(sorted(requested_kinds)),
+                ",".join(stock_codes),
             )
         except Exception as e:
             logger.error("DataSubscription: unsubscribe_l2_stocks failed: %s", e, exc_info=True)
@@ -331,6 +333,9 @@ class DataSubscriptionManager:
                 code = xt_code.split(".")[0] if "." in xt_code else xt_code
                 event = self._parse_l2_quote(code, data, recv_time)
                 events[code] = event
+            if events:
+                latest = max((event.event_time or recv_time) for event in events.values())
+                self._update_latest_data_status_from_times(latest, recv_time)
             if events and self._l2_quote_callback:
                 self._l2_quote_callback(events)
         except Exception as e:
@@ -346,6 +351,9 @@ class DataSubscriptionManager:
                 events = [self._parse_l2_transaction_record(code, record, recv_time) for record in records]
                 if events:
                     events_by_code[code] = events
+            if events_by_code:
+                latest = max((event.event_time or recv_time) for events in events_by_code.values() for event in events)
+                self._update_latest_data_status_from_times(latest, recv_time)
             if events_by_code and self._l2_transaction_callback:
                 self._l2_transaction_callback(events_by_code)
         except Exception as e:
@@ -361,6 +369,9 @@ class DataSubscriptionManager:
                 events = [self._parse_l2_order_record(code, record, recv_time) for record in records]
                 if events:
                     events_by_code[code] = events
+            if events_by_code:
+                latest = max((event.event_time or recv_time) for events in events_by_code.values() for event in events)
+                self._update_latest_data_status_from_times(latest, recv_time)
             if events_by_code and self._l2_order_callback:
                 self._l2_order_callback(events_by_code)
         except Exception as e:
@@ -374,6 +385,9 @@ class DataSubscriptionManager:
                 code = xt_code.split(".")[0] if "." in xt_code else xt_code
                 event = self._parse_l2_orderqueue(code, data, recv_time)
                 events[code] = event
+            if events:
+                latest = max((event.event_time or recv_time) for event in events.values())
+                self._update_latest_data_status_from_times(latest, recv_time)
             if events and self._l2_orderqueue_callback:
                 self._l2_orderqueue_callback(events)
         except Exception as e:
@@ -408,6 +422,7 @@ class DataSubscriptionManager:
         if not self._l2_quote_callback:
             return
         now = datetime.now()
+        self._update_latest_data_status_from_times(now, now)
         self._l2_quote_callback(
             {
                 code: L2QuoteEvent(
@@ -430,6 +445,7 @@ class DataSubscriptionManager:
         if not self._l2_transaction_callback:
             return
         now = datetime.now()
+        self._update_latest_data_status_from_times(now, now)
         self._l2_transaction_callback(
             {
                 code: [
@@ -460,6 +476,7 @@ class DataSubscriptionManager:
         if not self._l2_order_callback:
             return
         now = datetime.now()
+        self._update_latest_data_status_from_times(now, now)
         self._l2_order_callback(
             {
                 code: [
@@ -485,6 +502,7 @@ class DataSubscriptionManager:
         if not self._l2_orderqueue_callback:
             return
         now = datetime.now()
+        self._update_latest_data_status_from_times(now, now)
         self._l2_orderqueue_callback(
             {
                 code: L2OrderQueueEvent(
@@ -550,12 +568,19 @@ class DataSubscriptionManager:
     def _update_latest_data_status(self, tick: TickData) -> None:
         latest_data_time = tick.data_time or tick.recv_time or datetime.now()
         last_recv_time = tick.recv_time or datetime.now()
+        latency_ms = float(tick.latency_ms or 0.0)
+        self._set_latest_data_status(latest_data_time, last_recv_time, latency_ms)
+        self._print_latest_data_status(latest_data_time, latency_ms)
+
+    def _update_latest_data_status_from_times(self, latest_data_time: datetime, recv_time: datetime) -> None:
+        latency_ms = max(0.0, (recv_time - latest_data_time).total_seconds() * 1000)
+        self._set_latest_data_status(latest_data_time, recv_time, latency_ms)
+
+    def _set_latest_data_status(self, latest_data_time: datetime, last_recv_time: datetime, latency_ms: float) -> None:
         with self._lock:
             self._last_recv_time = last_recv_time
             self._latest_data_time = latest_data_time
-            self._latest_latency_ms = float(tick.latency_ms or 0.0)
-
-        self._print_latest_data_status(latest_data_time, self._latest_latency_ms)
+            self._latest_latency_ms = float(latency_ms or 0.0)
 
     @staticmethod
     def _print_latest_data_status(latest_data_time: datetime, latency_ms: float) -> None:

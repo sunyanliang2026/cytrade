@@ -249,6 +249,87 @@ def build_app(strategy_classes=None, settings: Settings = None):
     }
 
 
+def _format_dt(value) -> str:
+    if not value:
+        return ""
+    formatter = getattr(value, "strftime", None)
+    if callable(formatter):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
+
+
+def _log_runtime_startup_config(settings: Settings, conn_mgr: ConnectionManager, mode: str) -> None:
+    logger = get_logger("system")
+    conn_cfg = conn_mgr.get_startup_config() if hasattr(conn_mgr, "get_startup_config") else {}
+    logger.info(
+        "Runtime startup mode=%s dry_run=%s qmt_path=%s account_id=%s account_type=%s",
+        mode,
+        bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True)),
+        conn_cfg.get("qmt_path", getattr(settings, "QMT_PATH", "")),
+        conn_cfg.get("account_id", getattr(settings, "ACCOUNT_ID", "")),
+        conn_cfg.get("account_type", getattr(settings, "ACCOUNT_TYPE", "")),
+    )
+
+
+def _log_connection_failure(conn_mgr: ConnectionManager, mode: str) -> None:
+    logger = get_logger("system")
+    last_error = conn_mgr.get_last_error() if hasattr(conn_mgr, "get_last_error") else {}
+    logger.error(
+        "Runtime startup blocked mode=%s live_trading_allowed=false stage=%s account_id=%s account_type=%s qmt_path=%s return_code=%s error=%s",
+        mode,
+        last_error.get("stage", "connect"),
+        last_error.get("account_id", ""),
+        last_error.get("account_type", ""),
+        last_error.get("qmt_path", ""),
+        last_error.get("return_code", ""),
+        last_error.get("error", ""),
+    )
+
+
+def _start_runtime_heartbeat(ctx: dict, stop_event: threading.Event, mode: str) -> threading.Thread:
+    """Log an operational heartbeat so quiet markets are distinguishable from hangs."""
+    logger = get_logger("system")
+    settings = ctx["settings"]
+    runner = ctx["runner"]
+    data_sub = ctx["data_sub"]
+    conn_mgr = ctx.get("conn_mgr")
+    interval = max(5, int(getattr(settings, "RUNTIME_HEARTBEAT_INTERVAL_SEC", 30) or 30))
+
+    def _loop() -> None:
+        while not stop_event.wait(interval):
+            try:
+                l2_map = data_sub.get_l2_subscription_map()
+                data_status = data_sub.get_latest_data_status()
+                runner_status = runner.get_runtime_status() if hasattr(runner, "get_runtime_status") else {}
+                logger.info(
+                    (
+                        "Runtime heartbeat mode=%s dry_run=%s connected=%s strategies=%s "
+                        "tick_subscriptions=%d l2_stocks=%d l2_kinds=%d latest_data_time=%s "
+                        "last_recv_time=%s data_delay_ms=%.0f last_strategy_event=%s "
+                        "last_strategy_event_time=%s process_ms=%.1f"
+                    ),
+                    mode,
+                    bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True)),
+                    bool(conn_mgr.is_connected()) if conn_mgr else False,
+                    runner_status.get("strategy_count", ""),
+                    len(data_sub.get_subscription_list()),
+                    len(l2_map),
+                    sum(len(kinds) for kinds in l2_map.values()),
+                    _format_dt(data_status.get("latest_data_time")),
+                    _format_dt(data_status.get("last_recv_time")),
+                    float(data_status.get("data_delay_ms", 0.0) or 0.0),
+                    runner_status.get("last_strategy_event", ""),
+                    _format_dt(runner_status.get("last_strategy_event_time")),
+                    float(runner_status.get("last_round_total_process_ms", 0.0) or 0.0),
+                )
+            except Exception as exc:
+                logger.warning("Runtime heartbeat failed mode=%s error=%s", mode, exc)
+
+    thread = threading.Thread(target=_loop, daemon=True, name=f"runtime-heartbeat-{mode}")
+    thread.start()
+    return thread
+
+
 def run(strategy_classes=None, settings: Settings = None):
     """启动主程序。
 
@@ -301,8 +382,10 @@ def run(strategy_classes=None, settings: Settings = None):
     signal.signal(signal.SIGTERM, _signal_handler)
 
     # ---- 连接 QMT ----
+    _log_runtime_startup_config(settings, conn_mgr, mode="live")
     if not conn_mgr.connect():
-        logger.error("无法连接 QMT，退出")
+        _log_connection_failure(conn_mgr, mode="live")
+        logger.error("Unable to connect QMT; live trading is disabled and runtime exits")
         return
 
     # ---- Web 服务 ----
@@ -340,6 +423,7 @@ def run(strategy_classes=None, settings: Settings = None):
         target=data_sub.start, daemon=True, name="data-sub"
     )
     data_thread.start()
+    _start_runtime_heartbeat(ctx, _stop_event, mode="live")
 
     logger.info("cytrade 运行中。按 Ctrl+C 退出。")
     _stop_event.wait()
@@ -488,8 +572,10 @@ def _run_managed_session(strategy_classes=None, settings: Settings = None,
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
+    _log_runtime_startup_config(settings, conn_mgr, mode="managed")
     if not conn_mgr.connect():
-        logger.error("无法连接 QMT，退出")
+        _log_connection_failure(conn_mgr, mode="managed")
+        logger.error("Unable to connect QMT; live trading is disabled and runtime exits")
         _shutdown("交易连接建立失败")
         return
 
@@ -516,6 +602,7 @@ def _run_managed_session(strategy_classes=None, settings: Settings = None,
 
     data_thread = threading.Thread(target=data_sub.start, daemon=True, name="data-sub")
     data_thread.start()
+    _start_runtime_heartbeat(ctx, stop_event, mode="managed")
 
     def _session_guard() -> None:
         """监控是否已到收盘退出时间。"""

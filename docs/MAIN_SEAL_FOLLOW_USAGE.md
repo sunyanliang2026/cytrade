@@ -78,3 +78,43 @@ Level2 订阅采用两层模式：
 
 - `docs/MAIN_SEAL_FOLLOW_DESIGN.md`
 - `docs/MAIN_SEAL_FOLLOW_TRIGGER_PARAMS.md`
+
+## Runtime Diagnostics
+
+Live startup now writes a structured startup line with:
+
+- `mode`: `managed`, `live`, or `market-only`.
+- `dry_run`: whether the strategy is allowed to simulate only.
+- `qmt_path`: active QMT `userdata_mini` / `userdata` path.
+- `account_id`: active trading account id.
+- `account_type`: account type, normally `STOCK`.
+
+If account subscription fails, the log writes `Runtime startup blocked` with
+`stage/account_id/account_type/qmt_path/return_code`, and live trading is not
+allowed to continue.
+
+Market-only dry-run should be started with:
+
+```powershell
+python scripts\run_main_seal_follow_market_only.py
+```
+
+This script has a normal `if __name__ == "__main__"` guard and is intended for
+market data / Level2 / signal validation only. It does not connect the trading
+account.
+
+Every runtime writes a `Runtime heartbeat` line every 30 seconds by default.
+The heartbeat includes current mode, dry-run flag, connection status, strategy
+count, tick/L2 subscription counts, latest market-data time, latest receive
+time, latest strategy event, and last strategy processing cost.
+
+After the first limit-up price is known, each stock is prechecked with:
+
+```text
+planned_amount >= limit_up_price * 100
+```
+
+If the planned amount cannot buy one lot, the strategy marks that stock as
+`entry_disabled reason=planned_amount_below_one_lot`, keeps only lightweight
+`l2quote`, and skips trigger/order logic. Repeated warnings for the same reason
+are throttled.

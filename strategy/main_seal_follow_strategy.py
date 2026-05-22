@@ -133,6 +133,9 @@ class MainSealFollowStrategy(BaseStrategy):
             )
             or ""
         )
+        self._warning_throttle_ms = int(params.get("warning_throttle_ms", 60_000) or 60_000)
+        self._warning_last_emit_ms: Dict[str, int] = {}
+        self._entry_disabled_reason = str(params.get("entry_disabled_reason") or "")
 
         self._entry_state = self.STATE_WAIT_SIGNAL
         self._limit_up_price = float(params.get("limit_up_price", 0.0) or 0.0)
@@ -264,6 +267,7 @@ class MainSealFollowStrategy(BaseStrategy):
                                 "min_limit_buy_net_amount": self._min_limit_buy_net_amount,
                                 "l2_calibration_enabled": self._l2_calibration_enabled,
                                 "l2_calibration_dir": self._l2_calibration_dir,
+                                "warning_throttle_ms": self._warning_throttle_ms,
                                 "source_row": row_no,
                             },
                         )
@@ -287,6 +291,8 @@ class MainSealFollowStrategy(BaseStrategy):
         self._target_lots = 0
         self._target_shares = 0
         self._feature_split_lots = []
+        self._entry_disabled_reason = ""
+        self._warning_last_emit_ms.clear()
         self._entry_order_uuids = []
         self._probe_order_uuid = ""
         self._main_order_uuids = []
@@ -368,6 +374,7 @@ class MainSealFollowStrategy(BaseStrategy):
 
         if self._plan_amount > 0 and self._limit_up_price > 0 and self._target_lots <= 0:
             self._refresh_target_from_limit_price(self._limit_up_price)
+            self._precheck_one_lot_affordability(self._limit_up_price)
         if self._should_enable_l2_detail_from_quote(event):
             self._l2_detail_enabled = True
         self._evaluate_active_entry_market("l2quote")
@@ -541,11 +548,7 @@ class MainSealFollowStrategy(BaseStrategy):
 
         self._refresh_target_from_limit_price(limit_price)
         if self._target_lots <= 0 or self._target_shares <= 0:
-            logger.warning(
-                "MainSealFollow[%s]: planned amount is insufficient for one lot at limit price %.3f",
-                self.strategy_id[:8],
-                limit_price,
-            )
+            self._precheck_one_lot_affordability(limit_price)
             return []
 
         planned_parts = self._plan_entry_parts(limit_price, trigger_reason=trigger_reason)
@@ -571,10 +574,12 @@ class MainSealFollowStrategy(BaseStrategy):
             if not self._dry_run_replay_probe_logic:
                 self._entry_state = self.STATE_DRY_RUN_READY
                 logger.info(
-                    "MainSealFollow[%s] [DRY_RUN]: ready to submit %d entry orders stock=%s limit=%.3f shares=%d parts=%s reason=%s",
+                    "MainSealFollow[%s] [DRY_RUN]: ready to submit %d entry orders stock=%s name=%s state=%s limit=%.3f shares=%d parts=%s reason=%s",
                     self.strategy_id[:8],
                     len(planned_parts),
                     self.stock_code,
+                    self._stock_name,
+                    self._entry_state,
                     limit_price,
                     self._target_shares,
                     [(item["role"], item["quantity"]) for item in planned_parts],
@@ -611,10 +616,12 @@ class MainSealFollowStrategy(BaseStrategy):
                 self._entry_state = self.STATE_WAIT_PROBE_FILL
                 self.request_state_persist(reason=f"msf_dry_run_submit:{self.strategy_id}")
             logger.info(
-                "MainSealFollow[%s] [DRY_RUN]: virtual submit %d entry orders stock=%s limit=%.3f shares=%d parts=%s reason=%s",
+                "MainSealFollow[%s] [DRY_RUN]: virtual submit %d entry orders stock=%s name=%s state=%s limit=%.3f shares=%d parts=%s reason=%s",
                 self.strategy_id[:8],
                 len(planned_parts),
                 self.stock_code,
+                self._stock_name,
+                self._entry_state,
                 limit_price,
                 self._target_shares,
                 [(item["role"], item["quantity"]) for item in planned_parts],
@@ -719,6 +726,8 @@ class MainSealFollowStrategy(BaseStrategy):
             "_min_limit_buy_net_amount",
             "_l2_calibration_enabled",
             "_l2_calibration_dir",
+            "_warning_throttle_ms",
+            "_entry_disabled_reason",
             "_entry_state",
             "_limit_up_price",
             "_last_price",
@@ -862,6 +871,42 @@ class MainSealFollowStrategy(BaseStrategy):
         self._target_shares = self._target_lots * 100
         self._feature_split_lots = self._make_two_layer_lots(self._target_lots, self._probe_lots)
 
+    def _precheck_one_lot_affordability(self, limit_price: float) -> bool:
+        if limit_price <= 0 or self._plan_amount <= 0:
+            return True
+        if self._target_lots > 0 and self._target_shares > 0:
+            return True
+
+        required_amount = float(limit_price) * 100
+        self._entry_disabled_reason = "planned_amount_below_one_lot"
+        self._l2_detail_enabled = False
+        self._throttled_warning(
+            "planned_amount_below_one_lot",
+            (
+                "MainSealFollow[%s]: entry disabled stock=%s name=%s state=%s reason=%s "
+                "plan_amount=%.2f required_amount=%.2f limit_price=%.3f"
+            ),
+            self.strategy_id[:8],
+            self.stock_code,
+            self._stock_name,
+            self._entry_state,
+            self._entry_disabled_reason,
+            self._plan_amount,
+            required_amount,
+            limit_price,
+        )
+        return False
+
+    def _throttled_warning(self, key: str, message: str, *args, interval_ms: Optional[int] = None) -> bool:
+        now_ms = self._now_ms()
+        interval = int(interval_ms if interval_ms is not None else self._warning_throttle_ms)
+        last_ms = int(self._warning_last_emit_ms.get(key, 0) or 0)
+        if last_ms > 0 and now_ms - last_ms < interval:
+            return False
+        self._warning_last_emit_ms[key] = now_ms
+        logger.warning(message, *args)
+        return True
+
     def _plan_entry_parts(self, limit_price: float, trigger_reason: str = "") -> List[Dict[str, object]]:
         if not self._feature_split_lots:
             self._refresh_target_from_limit_price(limit_price)
@@ -895,6 +940,8 @@ class MainSealFollowStrategy(BaseStrategy):
         return parts
 
     def _maybe_trigger_entry(self, trigger_source: str) -> bool:
+        if self._entry_disabled_reason:
+            return False
         if self._entry_state != self.STATE_WAIT_SIGNAL:
             return False
         if self._has_position() or self._has_active_entry_order():
@@ -1037,9 +1084,11 @@ class MainSealFollowStrategy(BaseStrategy):
         self._entry_state = self.STATE_MAIN_KEEPING
         self._main_keep_decision_time_ms = self._now_ms()
         logger.info(
-            "MainSealFollow[%s]: probe filled, keep main order stock=%s probe_fill_ms=%s metrics=%s",
+            "MainSealFollow[%s]: probe filled, keep main order stock=%s name=%s state=%s probe_fill_ms=%s metrics=%s",
             self.strategy_id[:8],
             self.stock_code,
+            self._stock_name,
+            self._entry_state,
             metrics.get("probe_fill_ms"),
             metrics,
         )
@@ -1338,9 +1387,11 @@ class MainSealFollowStrategy(BaseStrategy):
         self._probe_filled_quantity = probe_qty
         self._entry_state = self.STATE_PROBE_FILLED_DECISION
         logger.info(
-            "MainSealFollow[%s] [DRY_RUN]: simulated probe fill stock=%s source=%s traded_shares=%d threshold_shares=%d",
+            "MainSealFollow[%s] [DRY_RUN]: simulated probe fill stock=%s name=%s state=%s source=%s traded_shares=%d threshold_shares=%d",
             self.strategy_id[:8],
             self.stock_code,
+            self._stock_name,
+            self._entry_state,
             source or "market",
             traded_shares,
             threshold_shares,
@@ -1374,11 +1425,13 @@ class MainSealFollowStrategy(BaseStrategy):
             self._last_cancel_time_ms = self._now_ms()
             self._last_cancel_reason = str(reason or "")
             logger.info(
-                "MainSealFollow[%s] [DRY_RUN]: finalize %s orders=%d stock=%s reason=%s",
+                "MainSealFollow[%s] [DRY_RUN]: finalize %s orders=%d stock=%s name=%s state=%s reason=%s",
                 self.strategy_id[:8],
                 scope or "entry",
                 finalized,
                 self.stock_code,
+                self._stock_name,
+                self._entry_state,
                 reason or "",
             )
             self.request_state_persist(reason=f"msf_dry_run_finalize:{self.strategy_id}", min_interval_sec=0.0)
@@ -1391,9 +1444,11 @@ class MainSealFollowStrategy(BaseStrategy):
         if not orders:
             return False
         logger.info(
-            "MainSealFollow[%s] [DRY_RUN]: keep window complete stock=%s source=%s metrics=%s",
+            "MainSealFollow[%s] [DRY_RUN]: keep window complete stock=%s name=%s state=%s source=%s metrics=%s",
             self.strategy_id[:8],
             self.stock_code,
+            self._stock_name,
+            self._entry_state,
             source or "market",
             self._last_decision_metrics,
         )
@@ -1778,6 +1833,9 @@ class MainSealFollowStrategy(BaseStrategy):
         return True
 
     def _needs_l2_detail_subscription(self) -> bool:
+        if self._entry_disabled_reason:
+            self._l2_detail_enabled = False
+            return False
         if self._entry_state in (self.STATE_HAS_POSITION, self.STATE_EXITED) or self._has_position():
             self._l2_detail_enabled = False
             return False
@@ -1790,6 +1848,8 @@ class MainSealFollowStrategy(BaseStrategy):
         return False
 
     def _should_enable_l2_detail_from_quote(self, event: L2QuoteEvent) -> bool:
+        if self._entry_disabled_reason:
+            return False
         if self._l2_detail_enabled:
             return False
         if self._entry_state != self.STATE_WAIT_SIGNAL:
@@ -1803,6 +1863,8 @@ class MainSealFollowStrategy(BaseStrategy):
         return bid1_price >= near_price or last_price >= near_price
 
     def _should_check_entry_on_quote(self) -> bool:
+        if self._entry_disabled_reason:
+            return False
         if self._entry_state != self.STATE_WAIT_SIGNAL:
             return False
         if self._has_position() or self._has_active_entry_order():

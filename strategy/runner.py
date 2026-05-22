@@ -95,6 +95,8 @@ class StrategyRunner:
         self._process_threshold_ms = process_threshold_ms
         # ``_last_round_total_process_ms`` 璁板綍鏈€杩戜竴杞鎯呮帹閫佸搴旂殑绛栫暐鎬诲鐞嗚€楁椂銆?
         self._last_round_total_process_ms = 0.0
+        self._last_strategy_event_time: Optional[datetime] = None
+        self._last_strategy_event: str = ""
         # ``_running`` 鏍囪杩愯鍣ㄦ槸鍚﹀凡杩涘叆宸ヤ綔鐘舵€併€?
         self._running = False
         # ``_scheduler`` 鏄?APScheduler 瀹炰緥锛岀敤浜庡畾鏃堕€夎偂涓庝繚瀛樼姸鎬併€?
@@ -190,6 +192,8 @@ class StrategyRunner:
         if not self._running:
             return
         try:
+            if tick_data:
+                self._mark_strategy_event(f"tick:{len(tick_data)}")
             if self._heartbeat_callback:
                 self._heartbeat_callback("strategy_runner")
 
@@ -246,19 +250,29 @@ class StrategyRunner:
 
     def on_l2_quote_data(self, events_by_code: Dict[str, L2QuoteEvent]) -> None:
         """Dispatch Level2 quote events to matching strategies."""
+        if events_by_code:
+            self._mark_strategy_event(f"l2quote:{len(events_by_code)}")
         self._dispatch_l2_single(events_by_code, "on_l2_quote")
         self._sync_subscriptions()
 
     def on_l2_transaction_data(self, events_by_code: Dict[str, List[L2TransactionEvent]]) -> None:
         """Dispatch Level2 transaction events to matching strategies."""
+        event_count = sum(len(events or []) for events in events_by_code.values())
+        if event_count:
+            self._mark_strategy_event(f"l2transaction:{event_count}")
         self._dispatch_l2_batch(events_by_code, "on_l2_transaction")
 
     def on_l2_order_data(self, events_by_code: Dict[str, List[L2OrderEvent]]) -> None:
         """Dispatch Level2 order events to matching strategies."""
+        event_count = sum(len(events or []) for events in events_by_code.values())
+        if event_count:
+            self._mark_strategy_event(f"l2order:{event_count}")
         self._dispatch_l2_batch(events_by_code, "on_l2_order")
 
     def on_l2_orderqueue_data(self, events_by_code: Dict[str, L2OrderQueueEvent]) -> None:
         """Dispatch Level2 order-queue events to matching strategies."""
+        if events_by_code:
+            self._mark_strategy_event(f"l2orderqueue:{len(events_by_code)}")
         self._dispatch_l2_single(events_by_code, "on_l2_orderqueue")
 
     def _dispatch_l2_single(self, events_by_code: Dict[str, object], handler_name: str) -> None:
@@ -320,6 +334,19 @@ class StrategyRunner:
     def get_last_round_total_process_ms(self) -> float:
         """杩斿洖鏈€杩戜竴杞鎯呮帹閫佸搴旂殑绛栫暐鎬诲鐞嗚€楁椂锛屽崟浣嶆绉掋€?"""
         return float(self._last_round_total_process_ms or 0.0)
+
+    def get_runtime_status(self) -> dict:
+        """Return compact runtime status for heartbeat logs."""
+        with self._lock:
+            strategy_count = len(self._strategies)
+            last_event_time = self._last_strategy_event_time
+            last_event = self._last_strategy_event
+        return {
+            "strategy_count": strategy_count,
+            "last_strategy_event_time": last_event_time,
+            "last_strategy_event": last_event,
+            "last_round_total_process_ms": float(self._last_round_total_process_ms or 0.0),
+        }
 
     def add_strategy(self, strategy: BaseStrategy) -> None:
         """鍚戣繍琛屽櫒涓坊鍔犱竴涓瓥鐣ュ疄渚嬨€?"""
@@ -1186,8 +1213,16 @@ class StrategyRunner:
         """灏嗚鍗曟洿鏂板垎鍙戠粰瀵瑰簲绛栫暐"""
         strategy = self.get_strategy(order.strategy_id)
         if strategy:
+            self._mark_strategy_event(
+                f"order_update:{getattr(order, 'stock_code', '')}:{getattr(order, 'status', '')}"
+            )
             strategy.on_order_update(order)
             self._sync_subscriptions()
+
+    def _mark_strategy_event(self, event: str) -> None:
+        with self._lock:
+            self._last_strategy_event_time = datetime.now()
+            self._last_strategy_event = str(event or "")
 
     def _sync_orders_and_trades_job(self) -> None:
         """浠呭湪浜ゆ槗鏃舵杩愯涓诲姩鍚屾锛岃ˉ鍋挎紡鍥炴姤鍦烘櫙銆?"""

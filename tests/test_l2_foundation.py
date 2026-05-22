@@ -1,5 +1,6 @@
 from datetime import datetime
 
+from core.connection import ConnectionManager
 from core.data_subscription import DataSubscriptionManager
 from core.l2_models import L2OrderEvent, L2OrderQueueEvent, L2QuoteEvent, L2TransactionEvent
 from core.models import TickData
@@ -153,6 +154,23 @@ def test_data_subscription_mock_callbacks_cover_tick_and_l2():
     assert isinstance(captured["l2transaction"]["000001"][0], L2TransactionEvent)
     assert isinstance(captured["l2order"]["000001"][0], L2OrderEvent)
     assert isinstance(captured["l2orderqueue"]["000001"], L2OrderQueueEvent)
+    assert manager.get_latest_data_status()["last_recv_time"] is not None
+
+
+def test_connection_manager_exposes_startup_diagnostics_without_secrets():
+    conn = ConnectionManager(
+        qmt_path=r"C:\QMT\userdata_mini",
+        account_id="123456",
+        account_type="STOCK",
+    )
+
+    info = conn.get_startup_config()
+
+    assert info["qmt_path"] == r"C:\QMT\userdata_mini"
+    assert info["account_id"] == "123456"
+    assert info["account_type"] == "STOCK"
+    assert "session_id" in info
+    assert "password" not in info
 
 
 def test_data_subscription_parses_l2_order_direction_and_cancel():
@@ -253,6 +271,10 @@ def test_runner_syncs_l2_subscription_plan_and_dispatches_events():
     assert len(strategy.l2_transaction_events) == 1
     assert len(strategy.l2_order_events) == 1
     assert len(strategy.l2_orderqueue_events) == 1
+    runtime_status = runner.get_runtime_status()
+    assert runtime_status["strategy_count"] == 1
+    assert runtime_status["last_strategy_event"].startswith("l2orderqueue:")
+    assert runtime_status["last_strategy_event_time"] is not None
 
 
 def test_runner_expands_dynamic_l2_subscription_after_quote():

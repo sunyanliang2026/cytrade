@@ -132,8 +132,23 @@ class ConnectionManager:
 
         # 会话 ID：每次启动使用时间戳，避免冲突
         self._session_id = int(time.time()) % 100000
+        self._last_error: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ Public
+
+    def get_startup_config(self) -> dict[str, Any]:
+        """Return non-secret connection settings for startup diagnostics."""
+        return {
+            "qmt_path": self._qmt_path,
+            "account_id": self._account_id,
+            "account_type": self._account_type,
+            "session_id": self._session_id,
+            "xtquant_available": _XT_AVAILABLE,
+        }
+
+    def get_last_error(self) -> dict[str, Any]:
+        """Return the latest connection or account-subscription error."""
+        return dict(self._last_error)
 
     def connect(self) -> bool:
         """连接到 QMT 客户端，返回是否成功。
@@ -165,19 +180,66 @@ class ConnectionManager:
                     # 连接成功后还要订阅账户，否则很多交易回报不会推送过来。
                     subscribe_ret = self._trader.subscribe(self._account)
                     if subscribe_ret != 0:
-                        logger.error("ConnectionManager: 账户订阅失败，返回码: %d", subscribe_ret)
+                        self._last_error = {
+                            "stage": "account_subscribe",
+                            "return_code": int(subscribe_ret),
+                            "account_id": self._account_id,
+                            "account_type": self._account_type,
+                            "qmt_path": self._qmt_path,
+                            "session_id": self._session_id,
+                        }
+                        logger.error(
+                            "ConnectionManager: account subscribe failed account_id=%s account_type=%s qmt_path=%s session=%d return_code=%d",
+                            self._account_id,
+                            self._account_type,
+                            self._qmt_path,
+                            self._session_id,
+                            subscribe_ret,
+                        )
                         self._connected = False
                         return False
                     self._connected = True
+                    self._last_error = {}
                     logger.info("ConnectionManager: 连接 QMT 成功并完成账户订阅 (session=%d)", self._session_id)
                     self._start_heartbeat()
                     return True
                 else:
-                    logger.error("ConnectionManager: 连接 QMT 失败，返回码: %d", ret)
+                    self._last_error = {
+                        "stage": "connect",
+                        "return_code": int(ret),
+                        "account_id": self._account_id,
+                        "account_type": self._account_type,
+                        "qmt_path": self._qmt_path,
+                        "session_id": self._session_id,
+                    }
+                    logger.error(
+                        "ConnectionManager: connect failed account_id=%s account_type=%s qmt_path=%s session=%d return_code=%d",
+                        self._account_id,
+                        self._account_type,
+                        self._qmt_path,
+                        self._session_id,
+                        ret,
+                    )
                     self._connected = False
                     return False
             except Exception as e:
-                logger.error("ConnectionManager: 连接异常: %s", e, exc_info=True)
+                self._last_error = {
+                    "stage": "exception",
+                    "error": str(e),
+                    "account_id": self._account_id,
+                    "account_type": self._account_type,
+                    "qmt_path": self._qmt_path,
+                    "session_id": self._session_id,
+                }
+                logger.error(
+                    "ConnectionManager: connect exception account_id=%s account_type=%s qmt_path=%s session=%d error=%s",
+                    self._account_id,
+                    self._account_type,
+                    self._qmt_path,
+                    self._session_id,
+                    e,
+                    exc_info=True,
+                )
                 self._connected = False
                 return False
 

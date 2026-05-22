@@ -91,6 +91,7 @@ class LogManager:
 
     def setup_logging(self) -> None:
         """初始化默认日志分类。"""
+        self._configure_console_encoding()
         for name in [self.TRADE_LOG, self.SYSTEM_LOG, self.DEBUG_LOG]:
             self._loggers[name] = self._create_logger(name)
         # 默认 logger 代理 system
@@ -205,6 +206,18 @@ class LogManager:
             os.remove(fpath)
         except Exception:
             pass
+
+    @staticmethod
+    def _configure_console_encoding() -> None:
+        """Keep redirected Windows console logs from failing on non-GBK text."""
+        for stream in (sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if not callable(reconfigure):
+                continue
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 
 # -------------------------------------------------------------------

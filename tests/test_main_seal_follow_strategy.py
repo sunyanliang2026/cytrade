@@ -295,6 +295,34 @@ def test_main_seal_follow_enables_detail_l2_only_near_limit():
 
     assert strategy.current_data_kinds() == {"l2quote", "l2transaction", "l2order", "l2orderqueue"}
 
+
+def test_main_seal_follow_disables_entry_when_plan_cannot_buy_one_lot():
+    strategy = MainSealFollowStrategy(
+        StrategyConfig(
+            stock_code="000001",
+            params={
+                "plan_amount": 1000.0,
+                "dry_run": True,
+                "quote_trigger_near_limit_ticks": 5,
+            },
+        )
+    )
+
+    strategy.on_l2_quote(
+        L2QuoteEvent(
+            stock_code="000001",
+            last_price=10.96,
+            bid1=10.95,
+            pre_close=10.0,
+            limit_up_price=11.0,
+        )
+    )
+
+    assert strategy._entry_disabled_reason == "planned_amount_below_one_lot"
+    assert strategy._target_lots == 0
+    assert strategy.current_data_kinds() == {"l2quote"}
+    assert strategy.submit_feature_entry_orders(11.0, trigger_reason="unit-test") == []
+
     strategy._entry_state = strategy.STATE_HAS_POSITION
 
     assert strategy.current_data_kinds() == {"l2quote"}
