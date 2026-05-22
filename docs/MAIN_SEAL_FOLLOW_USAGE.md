@@ -118,3 +118,16 @@ If the planned amount cannot buy one lot, the strategy marks that stock as
 `entry_disabled reason=planned_amount_below_one_lot`, keeps only lightweight
 `l2quote`, and skips trigger/order logic. Repeated warnings for the same reason
 are throttled.
+
+## Live Trading Guard
+
+`CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN=false` only means策略允许走实盘路径；真实下单还必须同时满足执行层硬保护：
+
+- `TradeExecutor.live_trading_enabled=true`，即执行器被显式装配为实盘模式。
+- `xtquant` 可用，不能用缺失柜台模块时的 mock 通道替代。
+- `ConnectionManager.is_trading_ready()` 为 `true`：底层 trader 在线、账户对象存在、账户订阅成功、最近连接错误为空。
+- 委托数量必须大于 0；买入数量必须是 100 股整数倍；限价类委托价格必须大于 0。
+
+如果任一条件不满足，下单会被登记为 `JUNK`，日志包含
+`live_trading_not_ready` 或具体校验原因，不会生成 `[MOCK]` 活动委托。
+撤单同样要求交易就绪；未就绪时直接返回失败，不会把订单误标为已撤。

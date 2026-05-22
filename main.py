@@ -175,7 +175,12 @@ def build_app(strategy_classes=None, settings: Settings = None):
     order_mgr.set_position_callback(pos_mgr.on_trade_callback)
 
     # ---- 交易执行器 ----
-    trade_exec = TradeExecutor(conn_mgr, order_mgr, pos_mgr)
+    trade_exec = TradeExecutor(
+        conn_mgr,
+        order_mgr,
+        pos_mgr,
+        live_trading_enabled=not bool(settings.CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN),
+    )
 
     # ---- XtQuant 回调 ----
     callback = MyXtQuantTraderCallback(

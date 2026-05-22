@@ -298,6 +298,25 @@ class ConnectionManager:
                 pass
         return self._connected
 
+    def is_trading_ready(self) -> bool:
+        """判断当前连接是否已经满足真实交易前置条件。
+
+        ``is_connected()`` 更偏向底层通道在线状态；真实交易还必须确认账户
+        已创建、账户订阅成功、且最近一次连接流程没有遗留错误。
+        """
+        if not self._trader or not self._account:
+            return False
+        if not self._connected:
+            return False
+        if self._last_error:
+            return False
+        if hasattr(self._trader, "is_connected"):
+            try:
+                return bool(self._trader.is_connected())
+            except Exception:
+                return False
+        return True
+
     def register_callback(self, callback) -> None:
         """注册交易回调对象。
 

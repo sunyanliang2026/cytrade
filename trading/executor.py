@@ -47,13 +47,14 @@ class TradeExecutor:
     _LOT_SIZE = 100
 
     def __init__(self, connection_mgr, order_mgr: OrderManager,
-                 position_mgr=None):
+                 position_mgr=None, live_trading_enabled: bool = False):
         """初始化交易执行器。
 
         Args:
             connection_mgr: 交易连接管理器。
             order_mgr: 订单管理器。
             position_mgr: 可选的持仓管理器，用于平仓前查询可用仓位。
+            live_trading_enabled: 是否允许真实下单/撤单。False 时保留 mock 演练行为。
         """
         # ``_conn_mgr`` 提供 trader/account 等底层交易通道对象。
         self._conn_mgr = connection_mgr
@@ -61,11 +62,18 @@ class TradeExecutor:
         self._order_mgr = order_mgr
         # ``_position_mgr`` 主要用于平仓前查询可卖数量。
         self._position_mgr = position_mgr
+        # 必须显式打开 live，执行器才允许把请求发到底层柜台。
+        self._live_trading_enabled = bool(live_trading_enabled)
 
     @property
     def connection_manager(self):
         """返回当前执行器关联的连接管理器。"""
         return self._conn_mgr
+
+    @property
+    def live_trading_enabled(self) -> bool:
+        """返回执行器是否允许真实下单/撤单。"""
+        return self._live_trading_enabled
 
     # ------------------------------------------------------------------ 买入
 
@@ -254,6 +262,15 @@ class TradeExecutor:
                            order_uuid[:8], order.status.value)
             return False
 
+        readiness_error = self._live_readiness_error()
+        if readiness_error:
+            logger.error(
+                "cancel_order blocked: live trading not ready uuid=%s reason=%s",
+                order_uuid[:8],
+                readiness_error,
+            )
+            return False
+
         trader = self._conn_mgr.get_trader() if self._conn_mgr else None
         if not trader or not _XT_AVAILABLE:
             logger.warning("cancel_order [MOCK]: uuid=%s xt_id=%d",
@@ -285,12 +302,20 @@ class TradeExecutor:
         - 这里的“成功”只表示请求已发出。
         - 最终是否成交、是否废单，要以后续回调结果为准。
         """
-        trader = self._conn_mgr.get_trader() if self._conn_mgr else None
-
         if order.order_type in (OrderType.LIMIT, OrderType.BY_AMOUNT, OrderType.BY_QUANTITY) and order.price > 0:
             order.price = self._normalize_limit_price(order.stock_code, order.direction, order.price)
 
         order.price_type = self._resolve_order_price_type(order)
+
+        order_error = self._validate_order_for_submission(order)
+        if order_error:
+            return self._reject_order(order, order_error)
+
+        readiness_error = self._live_readiness_error()
+        if readiness_error:
+            return self._reject_order(order, f"live_trading_not_ready:{readiness_error}")
+
+        trader = self._conn_mgr.get_trader() if self._conn_mgr else None
 
         if not trader or not _XT_AVAILABLE:
             # Mock 模式下没有真实柜台，因此直接生成一个伪订单号，
@@ -348,6 +373,86 @@ class TradeExecutor:
             self._order_mgr.register_order(order)
             logger.error("TradeExecutor: 下单失败 uuid=%s: %s",
                          order.order_uuid[:8], e, exc_info=True)
+        return order
+
+    def _live_readiness_error(self) -> str:
+        """返回 live 模式下不可交易的原因；非 live 模式返回空字符串。"""
+        if not self._live_trading_enabled:
+            return ""
+        if not _XT_AVAILABLE:
+            return "xtquant_unavailable"
+        if not self._conn_mgr:
+            return "connection_manager_missing"
+
+        trader = self._conn_mgr.get_trader() if hasattr(self._conn_mgr, "get_trader") else None
+        if not trader:
+            return "trader_missing"
+
+        account = getattr(self._conn_mgr, "account", None)
+        if not account:
+            return "account_missing"
+
+        if hasattr(self._conn_mgr, "is_trading_ready"):
+            try:
+                if self._conn_mgr.is_trading_ready():
+                    return ""
+                return self._format_connection_not_ready_reason()
+            except Exception as exc:
+                return f"trading_ready_check_exception:{exc}"
+
+        if hasattr(self._conn_mgr, "is_connected"):
+            try:
+                if not self._conn_mgr.is_connected():
+                    return self._format_connection_not_ready_reason()
+            except Exception as exc:
+                return f"connection_check_exception:{exc}"
+        return ""
+
+    def _format_connection_not_ready_reason(self) -> str:
+        """生成连接未就绪的结构化原因，便于日志直接定位账户订阅问题。"""
+        last_error = {}
+        if self._conn_mgr and hasattr(self._conn_mgr, "get_last_error"):
+            try:
+                last_error = self._conn_mgr.get_last_error()
+            except Exception:
+                last_error = {}
+        if last_error:
+            return (
+                "connection_not_ready"
+                f":stage={last_error.get('stage', '')}"
+                f":return_code={last_error.get('return_code', '')}"
+                f":account_id={last_error.get('account_id', '')}"
+                f":error={last_error.get('error', '')}"
+            )
+        return "connection_not_ready"
+
+    def _validate_order_for_submission(self, order: Order) -> str:
+        """提交前做执行层通用校验，避免非法订单进入真实柜台。"""
+        if order.quantity <= 0:
+            return "invalid_quantity"
+        if order.direction == OrderDirection.BUY and order.quantity % self._LOT_SIZE != 0:
+            return "buy_quantity_not_lot_multiple"
+        if order.order_type in (OrderType.LIMIT, OrderType.BY_AMOUNT, OrderType.BY_QUANTITY) and order.price <= 0:
+            return "invalid_limit_price"
+        return ""
+
+    def _reject_order(self, order: Order, reason: str) -> Order:
+        """把执行层拦截的订单登记为 JUNK，保留审计记录但不形成活动委托。"""
+        order.status = OrderStatus.JUNK
+        order.status_msg = reason
+        if reason not in order.remark:
+            order.remark = f"{order.remark} [{reason}]" if order.remark else f"[{reason}]"
+        self._order_mgr.register_order(order)
+        logger.error(
+            "[ORDER] 下单拦截 uuid=%s code=%s dir=%s price=%.3f qty=%d reason=%s live_enabled=%s",
+            order.order_uuid[:8],
+            order.stock_code,
+            order.direction.value,
+            order.price,
+            order.quantity,
+            reason,
+            self._live_trading_enabled,
+        )
         return order
 
     @staticmethod

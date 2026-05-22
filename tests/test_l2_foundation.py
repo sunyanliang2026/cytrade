@@ -173,6 +173,31 @@ def test_connection_manager_exposes_startup_diagnostics_without_secrets():
     assert "password" not in info
 
 
+def test_connection_manager_trading_ready_requires_account_subscription_success():
+    class _ConnectedTrader:
+        def is_connected(self):
+            return True
+
+    conn = ConnectionManager(
+        qmt_path=r"C:\QMT\userdata_mini",
+        account_id="123456",
+        account_type="STOCK",
+    )
+    conn._trader = _ConnectedTrader()
+    conn._account = object()
+    conn._connected = True
+    conn._last_error = {}
+
+    assert conn.is_trading_ready() is True
+
+    conn._last_error = {"stage": "account_subscribe", "return_code": -1}
+    assert conn.is_trading_ready() is False
+
+    conn._last_error = {}
+    conn._connected = False
+    assert conn.is_trading_ready() is False
+
+
 def test_data_subscription_parses_l2_order_direction_and_cancel():
     buy = DataSubscriptionManager._parse_l2_order_record(
         "001259",
