@@ -21,6 +21,45 @@ CSV 表头：
 - 计划买入金额：每只股票本次计划买入的总金额，支持纯数字，也支持 `2万` 这种写法。
 - 金额小于等于 0 的行会被跳过，可用于保留样例但不启用。
 
+## 股票池自动生成
+
+可以用 QMT 本地行情快照每天定时生成股票池：
+
+```powershell
+python scripts\collect_main_seal_pool.py --schedule-time 09:26 --amount 1000
+```
+
+默认筛选条件：
+
+- QMT 板块：`沪深A股`
+- 主板代码：`000/001/002/003/600/601/603/605`
+- 非 ST、非退市名称
+- 当前涨幅：大于 `6%` 且小于 `7%`
+- 输出：`config/main_seal_follow_pool.csv`
+
+单次立即生成：
+
+```powershell
+python scripts\collect_main_seal_pool.py --once --amount 1000
+```
+
+常用参数：
+
+- `--pct-min 6 --pct-max 7`：调整涨幅区间。
+- `--include-bounds`：涨幅区间包含边界。
+- `--max-count 50`：最多输出 50 只。
+- `--output path.csv`：输出到指定文件。
+- `--no-backup`：覆盖前不备份旧股票池。
+- `--no-market-day-check`：非交易日也执行。
+
+每次覆盖正式股票池前，默认会把旧文件备份为：
+
+```text
+config/main_seal_follow_pool.backup_YYYYMMDD_HHMMSS.csv
+```
+
+这个工具只读取 QMT/xtdata 行情，不连接交易账户，不会下单。
+
 ## 本地配置
 
 `config/local_runtime.json` 已配置：
@@ -152,18 +191,18 @@ available_cash >= required_amount
 
 ## Strategy Event Logs
 
-MainSealFollow ?????????????????????
+MainSealFollow 会为关键逻辑节点输出统一事件日志，前缀为：
 
-`	ext
+```text
 MSF_EVENT
-`
+```
 
-????? JSON????????
+事件正文是 JSON，核心字段包括：
 
-- vent???????? ntry_signal_accepted?ntry_signal_blocked?ntry_plan_created?dry_run_entry_submitted?live_entry_submitted?probe_filled?main_keep_decision?main_cancel_decision?ntry_cancel_submitted?
-- stock/name/state/dry_run?????????????? dry-run?
-- eason/source????????????????? L2 ???
-- metrics?????????????????????????????????/???????
+- `event`：事件类型，例如 `entry_signal_accepted`、`entry_signal_blocked`、`entry_plan_created`、`dry_run_entry_submitted`、`live_entry_submitted`、`probe_filled`、`main_keep_decision`、`main_cancel_decision`、`entry_cancel_submitted`。
+- `stock/name/state/dry_run`：标的、名称、当前状态和是否 dry-run。
+- `reason/source`：触发原因或阻断原因，以及来自哪类 L2 数据。
+- `metrics`：当时的关键指标，例如封单前排、撤买金额、观测单成交耗时、主单保留/撤单判断依据。
 
-??????????????????????????????????????????????
-???? LOG_SUMMARY_MODE=true?MSF_EVENT ?????????????????????
+阻断类事件按同一股票同一原因限频，避免每笔行情都刷屏；下单、成交、撤单和决策类事件实时记录。
+即使开启 `LOG_SUMMARY_MODE=true`，`MSF_EVENT` 也会保留输出，便于实盘时只看关键逻辑事件。
