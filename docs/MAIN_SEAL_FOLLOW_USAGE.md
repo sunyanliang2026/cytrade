@@ -2,6 +2,8 @@
 
 ## 股票池
 
+完整股票池生成逻辑见：`docs/STOCK_POOL_LOGIC.md`。
+
 默认股票池文件：
 
 ```text
@@ -23,18 +25,28 @@ CSV 表头：
 
 ## 股票池自动生成
 
-可以用 QMT 本地行情快照每天定时生成股票池：
+默认用 `pywencai` 调用 iWenCai 生成股票池，口径与问财查询保持一致：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --schedule-time 09:26 --amount 1000
+set IWENCAI_COOKIE=你的问财登录cookie
+python scripts\collect_main_seal_pool.py --schedule-time 08:45 --amount 1000
 ```
+
+也可以把 cookie 放到本机私有配置文件 `config/local_runtime.json`，该文件已被 `.gitignore` 忽略，不能提交：
+
+```json
+{
+  "IWENCAI_COOKIE": "你的问财登录cookie"
+}
+```
+
+读取优先级：`--iwencai-cookie` > 环境变量 `IWENCAI_COOKIE` > `config/local_runtime.json`。
 
 默认筛选条件：
 
-- QMT 板块：`沪深A股`
-- 主板代码：`000/001/002/003/600/601/603/605`
-- 非 ST、非退市名称
-- 当前涨幅：大于 `6%` 且小于 `7%`
+- 查询语句：`涨停，实际流通市值大于19亿,30日最大振幅小于50%，非st，主板`
+- 调用方式：`pywencai.get(query=..., query_type="stock", loop=True, cookie=...)`
+- 输出前仍会做代码归一、去重、主板过滤和非 ST 过滤
 - 输出：`config/main_seal_follow_pool.csv`
 
 单次立即生成：
@@ -45,12 +57,40 @@ python scripts\collect_main_seal_pool.py --once --amount 1000
 
 常用参数：
 
-- `--pct-min 6 --pct-max 7`：调整涨幅区间。
-- `--include-bounds`：涨幅区间包含边界。
+- `--iwencai-cookie "..."`：直接传入问财登录 cookie；不传则读取环境变量 `IWENCAI_COOKIE`，再读取 `config/local_runtime.json`。
+- `--iwencai-query "..."`：调整问财自然语言查询。
+- `--no-iwencai-loop`：不自动翻页。
 - `--max-count 50`：最多输出 50 只。
 - `--output path.csv`：输出到指定文件。
 - `--no-backup`：覆盖前不备份旧股票池。
 - `--no-market-day-check`：非交易日也执行。
+
+`pywencai` 需要本机安装 Node.js，并需要有效的问财登录 cookie。如果 cookie 失效，重新从浏览器登录问财后复制新的 cookie。
+
+### QMT 本地近似生成
+
+也可以用 QMT 本地日线和证券资料生成近似股票池：
+
+```powershell
+python scripts\collect_main_seal_pool.py --source qmt --once --amount 1000
+```
+
+QMT 来源筛选条件：
+
+- QMT 板块：`沪深A股`
+- 主板代码：`000/001/002/003/600/601/603/605`
+- 非 ST、非退市名称
+- 最近一个交易日收盘价等于涨停价
+- 本地流通市值：大于 `19亿`，口径为 QMT `FloatVolume * 最近收盘价`，不是问财“实际流通市值/自由流通市值”的严格口径
+- 30 日最大振幅：小于 `50%`，计算口径为 `30日最高价最大值 / 30日最低价最小值 - 1`
+- 输出：`config/main_seal_follow_pool.csv`
+
+QMT 常用参数：
+
+- `--min-float-market-value 1900000000`：调整最小实际流通市值。
+- `--max-amplitude-30d 50`：调整 30 日最大振幅上限。
+- `--history-count 31`：读取日线数量，默认需要最近 31 根日线，其中最后 30 根用于振幅，倒数第 2 根用于计算涨停价。
+- `--no-download-history`：不先增量下载日线，只读取本地已有数据。默认会先对股票池候选范围批量下载 `1d` 日线。
 
 每次覆盖正式股票池前，默认会把旧文件备份为：
 
@@ -58,7 +98,35 @@ python scripts\collect_main_seal_pool.py --once --amount 1000
 config/main_seal_follow_pool.backup_YYYYMMDD_HHMMSS.csv
 ```
 
-这个工具只读取 QMT/xtdata 行情，不连接交易账户，不会下单。
+股票池生成工具不连接交易账户，不会下单。
+
+### 韭研公社文章生成
+
+也可以从韭研公社用户页的最新文章生成股票池，用于每天盘前把热点事件、公告和涨停事件涉及的股票写入同一个 CSV：
+
+```powershell
+python scripts\collect_main_seal_pool.py --source jiuyangongshe --schedule-time 08:45 --amount 1000
+```
+
+单次调试指定文章：
+
+```powershell
+python scripts\collect_main_seal_pool.py --source jiuyangongshe --once --article-url https://www.jiuyangongshe.com/a/205ec428s8y --amount 1000
+```
+
+当前只解析这些节点：
+
+- `No.1 盘前热点事件`
+- `No.2 公告精选 -> 一、日常公告`
+- `No.4 连板梯队和涨停事件 -> 三、涨停事件`
+
+正式输出会通过 QMT `沪深A股` 名称表把股票名称解析成 6 位代码，并且只保留主板代码：`000/001/002/003/600/601/603/605`。所以需要本地 QMT/xtdata 服务可用。未解析代码时不能直接给策略实盘使用；如只想调试网页解析，可显式加：
+
+```powershell
+python scripts\collect_main_seal_pool.py --source jiuyangongshe --once --article-url https://www.jiuyangongshe.com/a/205ec428s8y --no-resolve-codes --allow-name-only-output --output data\tmp_jiuyangongshe_pool.csv --no-market-day-check
+```
+
+调试模式会输出名称作为代码，可能包含非股票短语，只用于检查文章结构和解析范围。
 
 ## 本地配置
 

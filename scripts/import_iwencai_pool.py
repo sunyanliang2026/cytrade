@@ -63,6 +63,10 @@ def _normalize_stock_code(value: object) -> str:
     return match.group(1)
 
 
+def _is_main_board_code(code: str) -> bool:
+    return str(code or "").startswith(("000", "001", "002", "003", "600", "601", "603", "605"))
+
+
 def _read_input(path: Path) -> pd.DataFrame:
     suffix = path.suffix.lower()
     if suffix in (".xlsx", ".xls"):
@@ -91,7 +95,7 @@ def import_pool(input_path: Path, output_path: Path, amount: float) -> int:
     rows: list[list[object]] = []
     for _, item in df.iterrows():
         code = _normalize_stock_code(item.get(code_column))
-        if not code or code in seen:
+        if not code or not _is_main_board_code(code) or code in seen:
             continue
         seen.add(code)
         name = str(item.get(name_column, "") or "").strip() if name_column else ""

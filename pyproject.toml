@@ -41,6 +41,7 @@ dependencies = [
   "python-json-logger>=2.0",
   "loguru>=0.7",
   "psycopg2-binary>=2.9",
+  "pywencai>=0.12",
 ]
 
 [project.scripts]

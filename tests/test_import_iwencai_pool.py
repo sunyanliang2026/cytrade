@@ -12,6 +12,7 @@ def test_import_iwencai_pool_writes_main_seal_pool_csv(tmp_path):
         [
             {"股票代码": "000001.SZ", "股票简称": "平安银行"},
             {"股票代码": "600000.SH", "股票简称": "浦发银行"},
+            {"股票代码": "300001.SZ", "股票简称": "特锐德"},
             {"股票代码": "000001.SZ", "股票简称": "平安银行"},
         ]
     ).to_csv(source, index=False, encoding="utf-8-sig")
