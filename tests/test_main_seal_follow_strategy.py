@@ -624,6 +624,77 @@ def test_main_seal_follow_dry_run_simulates_probe_fill_and_keeps_main():
     assert len(strategy._get_active_main_orders()) == 1
 
 
+def test_main_seal_follow_emits_mock_trade_record_for_dry_run_probe_fill(monkeypatch):
+    capture = _CaptureLogger()
+    monkeypatch.setattr(msf_module, "logger", capture)
+    strategy = MainSealFollowStrategy(
+        StrategyConfig(
+            stock_code="000001",
+            params={
+                "stock_name": "平安银行",
+                "plan_amount": 2200.0,
+                "dry_run": True,
+                "big_amount_min": 2_000_000.0,
+                "queue_vol_unit": "share",
+                "post_probe_keep_ms": 10_000,
+            },
+        )
+    )
+    now_ms = strategy._now_ms()
+
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="000001", last_price=10.8, bid1=10.8, limit_up_price=11.0))
+    strategy.on_l2_transaction(
+        L2TransactionEvent(
+            stock_code="000001",
+            price=11.0,
+            volume=500_000,
+            amount=5_500_000.0,
+            side="BUY",
+            event_time=now_ms - 100,
+        )
+    )
+    strategy.on_l2_order(
+        L2OrderEvent(
+            stock_code="000001",
+            price=11.0,
+            volume=200_000,
+            amount=2_200_000.0,
+            side="BUY",
+            entrust_no="E1",
+            event_time=now_ms - 50,
+        )
+    )
+    strategy.on_l2_orderqueue(
+        L2OrderQueueEvent(
+            stock_code="000001",
+            price=11.0,
+            bid_level_volume=[10_000, 200_000, 150_000],
+            event_time=now_ms,
+        )
+    )
+    strategy.on_l2_transaction(
+        L2TransactionEvent(
+            stock_code="000001",
+            price=11.0,
+            volume=400_000,
+            amount=4_400_000.0,
+            side="BUY",
+            event_time=now_ms + 10,
+        )
+    )
+
+    events = _extract_msf_events(capture.messages)
+    trade_event = next(event for event in events if event["event"] == "dry_run_probe_trade_recorded")
+
+    assert trade_event["stock"] == "000001"
+    assert trade_event["name"] == "平安银行"
+    assert trade_event["metrics"]["fill_price"] == 11.0
+    assert trade_event["metrics"]["fill_qty"] == 100
+    assert trade_event["metrics"]["trigger_reason"] == "l2:l2orderqueue"
+    assert trade_event["metrics"]["submit_front50_depth_lot"] == 360000
+    assert any("[ORDER] [TRADE] [MOCK] observation filled" in message for message in capture.messages)
+
+
 def test_main_seal_follow_dry_run_probe_fill_can_cancel_main():
     strategy = MainSealFollowStrategy(
         StrategyConfig(

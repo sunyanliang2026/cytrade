@@ -5,10 +5,16 @@ import types
 
 import pandas as pd
 
+import scripts.collect_main_seal_pool as pool_module
 from scripts.collect_main_seal_pool import (
     PoolCandidate,
+    collect_once,
     collect_from_iwencai,
+    extract_latest_jiuyangongshe_article,
+    filter_candidates_by_base,
+    evaluate_candidate_expression,
     extract_known_stock_names,
+    extract_jiuyangongshe_node_sections,
     extract_stock_names_from_sections,
     extract_target_sections,
     is_main_board_code,
@@ -19,7 +25,11 @@ from scripts.collect_main_seal_pool import (
     normalize_article_plain_text,
     normalize_stock_code,
     parse_metric_number,
+    read_iwencai_queries,
+    read_iwencai_queries_from_source_config,
+    read_source_sets_from_config,
     resolve_iwencai_cookie,
+    merge_candidates,
     should_include_candidate,
     should_include_limitup_candidate,
     write_pool,
@@ -112,7 +122,12 @@ def test_collect_main_seal_pool_collects_from_iwencai(monkeypatch):
     candidates = collect_from_iwencai(query="涨停，主板", cookie="x=y", query_type="stock", loop=True)
 
     assert calls == {"query": "涨停，主板", "query_type": "stock", "loop": True, "cookie": "x=y"}
-    assert [(item.code, item.name) for item in candidates] == [("002463", "沪电股份")]
+    assert [(item.code, item.name) for item in candidates] == [
+        ("002463", "沪电股份"),
+        ("300001", "特锐德"),
+        ("002463", "沪电股份"),
+        ("600000", "*ST测试"),
+    ]
     assert candidates[0].float_market_value == 149_944_000_000.0
     assert candidates[0].max_amplitude_30d == 45.2
     assert parse_metric_number("19亿") == 1_900_000_000.0
@@ -182,6 +197,273 @@ def test_collect_main_seal_pool_reads_iwencai_cookie_from_local_runtime(tmp_path
 
     assert resolve_iwencai_cookie("") == "cookie-from-file"
     assert resolve_iwencai_cookie("cookie-from-cli") == "cookie-from-cli"
+
+
+def test_collect_main_seal_pool_reads_iwencai_queries_from_file(tmp_path):
+    query_file = tmp_path / "queries.txt"
+    query_file.write_text(
+        "\n".join(
+            [
+                "# comment",
+                "涨停，实际流通市值大于19亿，主板",
+                "",
+                "昨日涨停，非st，主板",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    queries = read_iwencai_queries(query_file)
+    assert [(item.name, item.type, item.query) for item in queries] == [
+        ("query_2", "direct", "涨停，实际流通市值大于19亿，主板"),
+        ("query_4", "direct", "昨日涨停，非st，主板"),
+    ]
+
+
+def test_collect_main_seal_pool_reads_typed_iwencai_queries_from_json(tmp_path):
+    query_file = tmp_path / "queries.json"
+    query_file.write_text(
+        json.dumps(
+            {
+                "queries": [
+                    {"name": "base-a", "type": "base", "query": "base query"},
+                    {"name": "direct-a", "type": "direct", "query": "direct query"},
+                    {"name": "gated-a", "type": "gated", "query": "gated query"},
+                    {"name": "off", "type": "direct", "query": "off query", "enabled": False},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    queries = read_iwencai_queries(query_file)
+
+    assert [(item.name, item.type, item.query) for item in queries] == [
+        ("base-a", "base", "base query"),
+        ("direct-a", "direct", "direct query"),
+        ("gated-a", "gated", "gated query"),
+    ]
+
+
+def test_collect_main_seal_pool_reads_iwencai_queries_from_source_config(tmp_path):
+    config_file = tmp_path / "sources.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "iwencai": {
+                    "queries": [
+                        {"name": "base-a", "type": "base", "query": "base query"},
+                        {"name": "direct-a", "type": "direct", "query": "direct query"},
+                    ]
+                },
+                "jiuyangongshe": {"enabled": True, "require_today": True},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    queries = read_iwencai_queries_from_source_config(config_file)
+
+    assert [(item.name, item.type, item.query) for item in queries] == [
+        ("base-a", "base", "base query"),
+        ("direct-a", "direct", "direct query"),
+    ]
+
+
+def test_collect_main_seal_pool_reads_named_source_sets(tmp_path):
+    config_file = tmp_path / "sources.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "sets": {
+                    "iwencai.base": {"source": "iwencai", "query": "base query"},
+                    "jiuyangongshe.hot": {"source": "jiuyangongshe", "node": "hot_events"},
+                },
+                "final": {"intersect": ["iwencai.base", "jiuyangongshe.hot"]},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    source_sets, final_expression = read_source_sets_from_config(config_file)
+
+    assert source_sets["iwencai.base"].query == "base query"
+    assert source_sets["jiuyangongshe.hot"].node == "hot_events"
+    assert final_expression == {"intersect": ["iwencai.base", "jiuyangongshe.hot"]}
+
+
+def test_collect_main_seal_pool_evaluates_set_expression():
+    named_sets = {
+        "direct": [PoolCandidate("002463", "沪电股份", 0, 0, 0, 0)],
+        "event": [
+            PoolCandidate("600604", "市北高新", 0, 0, 0, 0),
+            PoolCandidate("000001", "平安银行", 0, 0, 0, 0),
+        ],
+        "base": [
+            PoolCandidate("600604", "市北高新", 0, 0, 0, 0),
+            PoolCandidate("600000", "浦发银行", 0, 0, 0, 0),
+        ],
+    }
+
+    result = evaluate_candidate_expression(
+        {"union": ["direct", {"intersect": ["event", "base"]}]},
+        named_sets,
+    )
+
+    assert [(item.code, item.name) for item in result] == [
+        ("002463", "沪电股份"),
+        ("600604", "市北高新"),
+    ]
+
+
+def test_collect_main_seal_pool_extracts_latest_jiuyangongshe_article_date():
+    page = '''
+    <div class="fs13-ash">2026-05-24 07:08:44</div>
+    <a href="/a/abc123" target="_blank"><span>5月24日盘前纪要</span></a>
+    '''
+
+    article_url, article_date = extract_latest_jiuyangongshe_article(page)
+
+    assert article_url == "https://www.jiuyangongshe.com/a/abc123"
+    assert article_date == "2026-05-24"
+
+
+def test_collect_main_seal_pool_extracts_jiuyangongshe_nodes_by_id():
+    text = """
+No.1
+盘前热点事件
+一、昨日热点 量子科技：国盾量子
+No.2
+公告精选 一、日常公告 沪电股份：公告内容 二、停复牌
+No.3
+全球市场
+No.4
+连板梯队和涨停事件 一、连板梯队 三、涨停事件 市北高新：涨停原因
+No.5
+机构席位
+"""
+
+    nodes = extract_jiuyangongshe_node_sections(text)
+
+    assert set(nodes) == {"hot_events", "daily_announcements", "limit_events"}
+    assert "国盾量子" in nodes["hot_events"][1]
+    assert "沪电股份" in nodes["daily_announcements"][1]
+    assert "市北高新" in nodes["limit_events"][1]
+
+
+def test_collect_main_seal_pool_merges_candidates_with_final_filters():
+    candidates = [
+        PoolCandidate("002463", "沪电股份", 0, 0, 0, 0, float_market_value=10),
+        PoolCandidate("002463.SZ", "沪电股份", 0, 0, 0, 0, float_market_value=20),
+        PoolCandidate("300001", "特锐德", 0, 0, 0, 0),
+        PoolCandidate("600000", "*ST测试", 0, 0, 0, 0),
+        PoolCandidate("600604.SH", "市北高新", 0, 0, 0, 0),
+    ]
+
+    merged = merge_candidates(candidates)
+
+    assert [(item.code, item.name) for item in merged] == [
+        ("002463", "沪电股份"),
+        ("600604", "市北高新"),
+    ]
+
+
+def test_collect_main_seal_pool_filters_gated_candidates_by_base():
+    candidates = [
+        PoolCandidate("002463", "沪电股份", 0, 0, 0, 0),
+        PoolCandidate("600604", "市北高新", 0, 0, 0, 0),
+    ]
+
+    filtered = filter_candidates_by_base(candidates, {"600604"})
+
+    assert [(item.code, item.name) for item in filtered] == [("600604", "市北高新")]
+
+
+def test_collect_main_seal_pool_combined_source_merges_final_pool(tmp_path, monkeypatch):
+    output = tmp_path / "pool.csv"
+
+    source_config = tmp_path / "sources.json"
+    source_config.write_text(
+        json.dumps(
+            {
+                "sets": {
+                    "iwencai.base": {"source": "iwencai", "query": "base query"},
+                    "iwencai.direct": {"source": "iwencai", "query": "direct query"},
+                    "jiuyangongshe.hot": {"source": "jiuyangongshe", "node": "hot_events"},
+                },
+                "final": {
+                    "union": [
+                        "iwencai.direct",
+                        {"intersect": ["jiuyangongshe.hot", "iwencai.base"]},
+                    ]
+                },
+                "jiuyangongshe": {"enabled": True, "require_today": True},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_iwencai(**kwargs):
+        if kwargs["query"] == "base query":
+            return [
+                PoolCandidate("600604", "市北高新", 0, 0, 0, 0),
+                PoolCandidate("000001", "平安银行", 0, 0, 0, 0),
+            ]
+        if kwargs["query"] == "direct query":
+            return [
+                PoolCandidate("002463", "沪电股份", 0, 0, 0, 0),
+                PoolCandidate("300001", "特锐德", 0, 0, 0, 0),
+            ]
+        raise AssertionError(kwargs["query"])
+
+    def fake_jiuyangongshe_nodes(**kwargs):
+        return (
+            {
+                "hot_events": [
+                    PoolCandidate("002463.SZ", "沪电股份", 0, 0, 0, 0),
+                    PoolCandidate("600604.SH", "市北高新", 0, 0, 0, 0),
+                    PoolCandidate("000001.SZ", "平安银行", 0, 0, 0, 0),
+                    PoolCandidate("600000.SH", "*ST测试", 0, 0, 0, 0),
+                ]
+            },
+            "https://example.test/a/1",
+            {"hot_events": ("section", "body")},
+        )
+
+    monkeypatch.setattr(pool_module, "collect_from_iwencai", fake_iwencai)
+    monkeypatch.setattr(pool_module, "collect_from_jiuyangongshe_nodes", fake_jiuyangongshe_nodes)
+    monkeypatch.setattr(pool_module, "resolve_iwencai_cookie", lambda value="": "cookie")
+
+    args = pool_module.build_parser().parse_args(
+        [
+            "--source",
+            "combined",
+            "--once",
+            "--no-market-day-check",
+            "--source-config",
+            str(source_config),
+            "--output",
+            str(output),
+            "--amount",
+            "1000",
+            "--no-backup",
+        ]
+    )
+
+    assert collect_once(args) == 3
+    with output.open("r", encoding="utf-8-sig", newline="") as fp:
+        rows = list(csv.reader(fp))
+
+    assert rows == [
+        ["股票代码", "名称", "计划买入金额"],
+        ["002463", "沪电股份", "1000"],
+        ["600604", "市北高新", "1000"],
+        ["000001", "平安银行", "1000"],
+    ]
 
 
 def test_collect_main_seal_pool_extracts_target_article_sections_and_stocks():

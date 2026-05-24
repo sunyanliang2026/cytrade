@@ -152,6 +152,9 @@ class MainSealFollowStrategy(BaseStrategy):
         self._probe_filled_quantity = int(params.get("probe_filled_quantity", 0) or 0)
         self._main_keep_decision_time_ms = int(params.get("main_keep_decision_time_ms", 0) or 0)
         self._last_decision_metrics: Dict[str, object] = dict(params.get("last_decision_metrics", {}) or {})
+        self._entry_trigger_reason = str(params.get("entry_trigger_reason") or "")
+        self._submit_bid1_volume_lot = int(params.get("submit_bid1_volume_lot", 0) or 0)
+        self._submit_front50_depth_lot = int(params.get("submit_front50_depth_lot", 0) or 0)
         self._current_queue: List[int] = list(params.get("current_queue", []) or [])
         self._current_queue_time_ms = int(params.get("current_queue_time_ms", 0) or 0)
         self._current_queue_observed_count = int(params.get("current_queue_observed_count", 0) or 0)
@@ -302,6 +305,9 @@ class MainSealFollowStrategy(BaseStrategy):
         self._probe_filled_quantity = 0
         self._main_keep_decision_time_ms = 0
         self._last_decision_metrics = {}
+        self._entry_trigger_reason = ""
+        self._submit_bid1_volume_lot = 0
+        self._submit_front50_depth_lot = 0
         self._current_queue = []
         self._current_queue_time_ms = 0
         self._current_queue_observed_count = 0
@@ -587,6 +593,9 @@ class MainSealFollowStrategy(BaseStrategy):
         self._probe_filled_quantity = 0
         self._main_keep_decision_time_ms = 0
         self._last_decision_metrics = {}
+        self._entry_trigger_reason = str(trigger_reason or "manual")
+        self._submit_bid1_volume_lot = int(self._current_bid1_volume_lot or 0)
+        self._submit_front50_depth_lot = int(self._current_front50_depth_lot or 0)
         self._log_event(
             "entry_plan_created",
             reason=trigger_reason or "manual",
@@ -598,8 +607,8 @@ class MainSealFollowStrategy(BaseStrategy):
                 "parts": [(item["role"], item["quantity"]) for item in planned_parts],
                 "front_qty_anchor": self._front_qty_anchor,
                 "queue_before_send_count": len(self._queue_before_send),
-                "current_bid1_volume_lot": self._current_bid1_volume_lot,
-                "current_front50_depth_lot": self._current_front50_depth_lot,
+                "current_bid1_volume_lot": self._submit_bid1_volume_lot,
+                "current_front50_depth_lot": self._submit_front50_depth_lot,
             },
         )
 
@@ -806,6 +815,9 @@ class MainSealFollowStrategy(BaseStrategy):
             "_probe_filled_quantity",
             "_main_keep_decision_time_ms",
             "_last_decision_metrics",
+            "_entry_trigger_reason",
+            "_submit_bid1_volume_lot",
+            "_submit_front50_depth_lot",
             "_current_queue",
             "_current_queue_time_ms",
             "_current_queue_observed_count",
@@ -1625,6 +1637,7 @@ class MainSealFollowStrategy(BaseStrategy):
             return False
 
         probe_qty = int(getattr(probe_order, "quantity", 0) or 0)
+        fill_price = float(getattr(probe_order, "price", 0.0) or self._limit_up_price or self._last_price or 0.0)
         traded_shares = self._limit_trade_shares_since(self._probe_submit_time_ms)
         threshold_shares = max(probe_qty, int(self._front_qty_anchor or 0) + probe_qty)
         if traded_shares < threshold_shares:
@@ -1637,6 +1650,20 @@ class MainSealFollowStrategy(BaseStrategy):
         self._probe_fill_time_ms = self._now_ms()
         self._probe_filled_quantity = probe_qty
         self._entry_state = self.STATE_PROBE_FILLED_DECISION
+        fill_metrics = {
+            "fill_price": fill_price,
+            "fill_qty": probe_qty,
+            "fill_amount": round(fill_price * probe_qty, 3),
+            "trigger_reason": self._entry_trigger_reason or "manual",
+            "traded_shares_after_submit": traded_shares,
+            "fill_threshold_shares": threshold_shares,
+            "front_qty_anchor": int(self._front_qty_anchor or 0),
+            "queue_before_send_count": len(self._queue_before_send),
+            "submit_bid1_volume_lot": int(self._submit_bid1_volume_lot or 0),
+            "submit_front50_depth_lot": int(self._submit_front50_depth_lot or 0),
+            "current_bid1_volume_lot": int(self._current_bid1_volume_lot or 0),
+            "current_front50_depth_lot": int(self._current_front50_depth_lot or 0),
+        }
         self._log_event(
             "dry_run_probe_filled",
             reason="simulated_probe_fill",
@@ -1646,6 +1673,24 @@ class MainSealFollowStrategy(BaseStrategy):
                 "threshold_shares": threshold_shares,
                 "probe_qty": probe_qty,
             },
+        )
+        self._log_event(
+            "dry_run_probe_trade_recorded",
+            reason="simulated_probe_fill",
+            source=source or "market",
+            metrics=fill_metrics,
+        )
+        logger.info(
+            "[ORDER] [TRADE] [MOCK] observation filled uuid=%s code=%s name=%s price=%.3f qty=%d trigger=%s reason=%s traded_shares=%d threshold=%d",
+            self._short_uuid(probe_order.order_uuid),
+            self.stock_code,
+            self._stock_name,
+            fill_price,
+            probe_qty,
+            self._entry_trigger_reason or "manual",
+            source or "market",
+            traded_shares,
+            threshold_shares,
         )
         logger.info(
             "MainSealFollow[%s] [DRY_RUN]: simulated probe fill stock=%s name=%s state=%s source=%s traded_shares=%d threshold_shares=%d",

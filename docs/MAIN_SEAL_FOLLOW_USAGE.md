@@ -25,12 +25,35 @@ CSV 表头：
 
 ## 股票池自动生成
 
-默认用 `pywencai` 调用 iWenCai 生成股票池，口径与问财查询保持一致：
+默认通过总入口汇总多个来源生成股票池。当前默认 `combined` 来源会按 `base/direct/gated` 类型调用问财，并叠加韭研公社，最后统一去重、主板过滤、非 ST 过滤：
 
 ```powershell
 set IWENCAI_COOKIE=你的问财登录cookie
-python scripts\collect_main_seal_pool.py --schedule-time 08:45 --amount 1000
+python scripts\collect_main_seal_pool.py --source combined --schedule-time 08:45 --amount 1000
 ```
+
+来源参数从统一配置 `config/main_seal_pool_sources.json` 读取，其中包含问财条件和韭研公社参数：
+
+当前配置采用“命名结果集 + 集合表达式”：
+
+- `sets`：每条问财查询、每个韭研公社节点都会生成一个可引用结果集。
+- `final.union`：定义最终股票池的并集组成。
+- `final.intersect`：可以对任意两个或多个结果集取交集。
+
+- `base`：初步筛选池，只做准入门槛。
+- `direct`：一次性结果筛选池，直接进入最终股票池。
+- `gated`：候选筛选池，必须同时命中 `base` 才进入最终股票池。
+
+韭研公社候选也按 `gated` 处理，必须同时命中 `base`。单独调试来源脚本：
+
+韭研公社自动取最新文章时默认要求文章日期等于当天，避免误用旧文章；手工传 `--article-url` 用于历史文章测试时不做这个自动最新日期保护。
+
+```powershell
+python scripts\collect_iwencai_pool.py
+python scripts\collect_jiuyangongshe_pool.py
+```
+
+`combined` 默认容错：韭研公社/QMT 名称转代码不可用时会打印 `WARNING`，并继续用问财结果生成股票池。需要任一来源失败即退出时，加 `--strict-sources`。
 
 也可以把 cookie 放到本机私有配置文件 `config/local_runtime.json`，该文件已被 `.gitignore` 忽略，不能提交：
 

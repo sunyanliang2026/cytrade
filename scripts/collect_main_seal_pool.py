@@ -35,6 +35,8 @@ from core.trading_calendar import is_market_day
 
 DEFAULT_OUTPUT = Path("config/main_seal_follow_pool.csv")
 LOCAL_RUNTIME_CONFIG_PATH = Path("config/local_runtime.json")
+DEFAULT_SOURCE_CONFIG = Path("config/main_seal_pool_sources.json")
+DEFAULT_IWENCAI_QUERY_FILE = Path("config/iwencai_pool_queries.json")
 OUTPUT_HEADERS = ["股票代码", "名称", "计划买入金额"]
 DEFAULT_SECTOR = "沪深A股"
 DEFAULT_IWENCAI_QUERY = "涨停，实际流通市值大于19亿,30日最大振幅小于50%，非st，主板"
@@ -88,6 +90,12 @@ STOP_STOCK_TOKENS = {
     "停牌",
 }
 
+JIUYANGONGSHE_NODE_LABELS = {
+    "hot_events": "No.1 盘前热点事件",
+    "daily_announcements": "No.2 公告精选 -> 一、日常公告",
+    "limit_events": "No.4 连板梯队和涨停事件 -> 三、涨停事件",
+}
+
 
 @dataclass(frozen=True)
 class PoolCandidate:
@@ -99,6 +107,28 @@ class PoolCandidate:
     amount: float
     float_market_value: float = 0.0
     max_amplitude_30d: float = 0.0
+
+
+@dataclass(frozen=True)
+class IwencaiQuery:
+    name: str
+    type: str
+    query: str
+
+
+@dataclass(frozen=True)
+class JiuyangongsheConfig:
+    enabled: bool
+    user_url: str
+    require_today: bool = True
+
+
+@dataclass(frozen=True)
+class SourceSet:
+    name: str
+    source: str
+    query: str = ""
+    node: str = ""
 
 
 def normalize_stock_code(value: str) -> str:
@@ -362,18 +392,14 @@ def collect_from_iwencai(
     if not code_column:
         raise RuntimeError(f"未能从 pywencai 结果识别股票代码列。当前列: {', '.join(columns)}")
 
-    seen: set[str] = set()
     candidates: list[PoolCandidate] = []
     for _, item in df.iterrows():
         code = normalize_stock_code(item.get(code_column))
-        if not code or code in seen or not is_main_board_code(code):
+        if not code:
             continue
         name = str(item.get(name_column, "") or "").strip() if name_column else ""
         if name.lower() == "nan":
             name = ""
-        if not is_non_st_name(name):
-            continue
-        seen.add(code)
         candidates.append(
             PoolCandidate(
                 code=code,
@@ -386,6 +412,167 @@ def collect_from_iwencai(
                 max_amplitude_30d=parse_metric_number(item.get(amplitude_column)) if amplitude_column else 0.0,
             )
         )
+    return candidates
+
+
+def read_iwencai_queries(query_file: Path, fallback_query: str = DEFAULT_IWENCAI_QUERY) -> list[IwencaiQuery]:
+    path = Path(query_file)
+    if not path.exists():
+        return [IwencaiQuery(name="default", type="direct", query=fallback_query)] if fallback_query else []
+
+    if path.suffix.lower() == ".json":
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            value = value.get("queries", [])
+        if not isinstance(value, list):
+            raise RuntimeError(f"问财条件文件格式错误: {path}")
+        queries: list[IwencaiQuery] = []
+        for index, item in enumerate(value, start=1):
+            if isinstance(item, str):
+                query = item.strip()
+                query_type = "direct"
+                name = f"query_{index}"
+            elif isinstance(item, dict) and item.get("enabled", True):
+                query = str(item.get("query", "") or "").strip()
+                query_type = str(item.get("type", "direct") or "direct").strip().lower()
+                name = str(item.get("name", "") or f"query_{index}").strip()
+            else:
+                query = ""
+            if query:
+                if query_type not in ("base", "direct", "gated"):
+                    raise RuntimeError(f"问财条件 type 只能是 base/direct/gated: {path} #{index}")
+                queries.append(IwencaiQuery(name=name, type=query_type, query=query))
+        return queries
+
+    queries = []
+    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        query = line.strip()
+        if not query or query.startswith("#"):
+            continue
+        queries.append(IwencaiQuery(name=f"query_{index}", type="direct", query=query))
+    return queries
+
+
+def load_source_config(config_path: Path) -> dict:
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"股票池来源配置文件格式错误: {path}") from exc
+    return value if isinstance(value, dict) else {}
+
+
+def parse_iwencai_query_items(raw_queries: object, *, source_name: str) -> list[IwencaiQuery]:
+    if not isinstance(raw_queries, list):
+        raise RuntimeError(f"问财条件配置必须是数组: {source_name}")
+    queries: list[IwencaiQuery] = []
+    for index, item in enumerate(raw_queries, start=1):
+        if isinstance(item, str):
+            query = item.strip()
+            query_type = "direct"
+            name = f"query_{index}"
+        elif isinstance(item, dict) and item.get("enabled", True):
+            query = str(item.get("query", "") or "").strip()
+            query_type = str(item.get("type", "direct") or "direct").strip().lower()
+            name = str(item.get("name", "") or f"query_{index}").strip()
+        else:
+            query = ""
+            query_type = "direct"
+            name = f"query_{index}"
+        if not query:
+            continue
+        if query_type not in ("base", "direct", "gated"):
+            raise RuntimeError(f"问财条件 type 只能是 base/direct/gated: {source_name} #{index}")
+        queries.append(IwencaiQuery(name=name, type=query_type, query=query))
+    return queries
+
+
+def read_iwencai_queries_from_source_config(config_path: Path) -> list[IwencaiQuery]:
+    config = load_source_config(config_path)
+    iwencai_config = config.get("iwencai", {})
+    if not isinstance(iwencai_config, dict):
+        raise RuntimeError(f"iwencai 配置必须是对象: {config_path}")
+    raw_queries = iwencai_config.get("queries", [])
+    return parse_iwencai_query_items(raw_queries, source_name=str(config_path))
+
+
+def read_source_sets_from_config(config_path: Path) -> tuple[dict[str, SourceSet], object]:
+    config = load_source_config(config_path)
+    raw_sets = config.get("sets")
+    if not isinstance(raw_sets, dict):
+        return {}, None
+    sets: dict[str, SourceSet] = {}
+    for name, raw in raw_sets.items():
+        if not isinstance(raw, dict) or not raw.get("enabled", True):
+            continue
+        source = str(raw.get("source", "") or "").strip().lower()
+        if source not in ("iwencai", "jiuyangongshe"):
+            raise RuntimeError(f"集合 {name} 的 source 只能是 iwencai/jiuyangongshe")
+        sets[str(name)] = SourceSet(
+            name=str(name),
+            source=source,
+            query=str(raw.get("query", "") or "").strip(),
+            node=str(raw.get("node", "") or "").strip(),
+        )
+    return sets, config.get("final")
+
+
+def resolve_iwencai_queries(args) -> list[IwencaiQuery]:
+    if getattr(args, "iwencai_query", ""):
+        return [IwencaiQuery(name="cli", type="direct", query=str(args.iwencai_query))]
+    query_file = str(getattr(args, "iwencai_query_file", "") or "")
+    if query_file:
+        return read_iwencai_queries(Path(query_file))
+    source_config = Path(str(getattr(args, "source_config", DEFAULT_SOURCE_CONFIG) or DEFAULT_SOURCE_CONFIG))
+    queries = read_iwencai_queries_from_source_config(source_config)
+    if queries:
+        return queries
+    source_sets, _ = read_source_sets_from_config(source_config)
+    set_queries = [
+        IwencaiQuery(name=name, type="direct", query=item.query)
+        for name, item in source_sets.items()
+        if item.source == "iwencai" and item.query
+    ]
+    if set_queries:
+        return set_queries
+    return read_iwencai_queries(DEFAULT_IWENCAI_QUERY_FILE)
+
+
+def resolve_jiuyangongshe_config(args) -> JiuyangongsheConfig:
+    source_config = Path(str(getattr(args, "source_config", DEFAULT_SOURCE_CONFIG) or DEFAULT_SOURCE_CONFIG))
+    config = load_source_config(source_config)
+    raw = config.get("jiuyangongshe", {})
+    raw = raw if isinstance(raw, dict) else {}
+    return JiuyangongsheConfig(
+        enabled=bool(raw.get("enabled", True)),
+        user_url=str(getattr(args, "jiuyangongshe_user_url", "") or raw.get("user_url", "") or DEFAULT_JIUYANGONGSHE_USER_URL),
+        require_today=bool(raw.get("require_today", True)),
+    )
+
+
+def collect_from_iwencai_queries(
+    *,
+    queries: list[IwencaiQuery],
+    cookie: str,
+    query_type: str = "stock",
+    loop: bool = True,
+) -> list[PoolCandidate]:
+    candidates: list[PoolCandidate] = []
+    for item in queries:
+        items = collect_from_iwencai(
+            query=item.query,
+            cookie=cookie,
+            query_type=query_type,
+            loop=loop,
+        )
+        print(
+            f"已通过 pywencai 解析股票池: type={item.type} name={item.name!r} "
+            f"query={item.query!r} stocks={len(items)}",
+            flush=True,
+        )
+        candidates.extend(items)
     return candidates
 
 
@@ -406,15 +593,28 @@ def _fetch_text(url: str, timeout: int = 20) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def resolve_latest_jiuyangongshe_article_url(user_url: str) -> str:
+def extract_latest_jiuyangongshe_article(page: str) -> tuple[str, str]:
+    href_match = re.search(r'href="(/a/[0-9A-Za-z]+)"', page)
+    if not href_match:
+        href_match = re.search(r'canonical"\s+href="(https://www\.jiuyangongshe\.com/a/[0-9A-Za-z]+)"', page)
+    if not href_match:
+        return "", ""
+    href = href_match.group(1)
+    before_href = page[max(0, href_match.start() - 2000) : href_match.start()]
+    date_matches = re.findall(r'(\d{4}-\d{2}-\d{2})\s+\d{2}:\d{2}:\d{2}', before_href)
+    article_date = date_matches[-1] if date_matches else ""
+    return (href if href.startswith("http") else f"{JIUYANGONGSHE_HOST}{href}"), article_date
+
+
+def resolve_latest_jiuyangongshe_article_url(user_url: str, *, require_today: bool = True) -> str:
     page = _fetch_text(user_url)
-    match = re.search(r'href="(/a/[0-9A-Za-z]+)"', page)
-    if not match:
-        match = re.search(r'canonical"\s+href="(https://www\.jiuyangongshe\.com/a/[0-9A-Za-z]+)"', page)
-    if not match:
+    article_url, article_date = extract_latest_jiuyangongshe_article(page)
+    if not article_url:
         raise RuntimeError(f"未能从用户页识别最新文章链接: {user_url}")
-    href = match.group(1)
-    return href if href.startswith("http") else f"{JIUYANGONGSHE_HOST}{href}"
+    today = datetime.now().strftime("%Y-%m-%d")
+    if require_today and article_date != today:
+        raise RuntimeError(f"韭研公社最新文章不是当天文章: article_date={article_date or 'unknown'} today={today} url={article_url}")
+    return article_url
 
 
 def extract_jiuyangongshe_article_html(page: str) -> str:
@@ -478,6 +678,19 @@ def extract_target_sections(text: str) -> list[tuple[str, str]]:
     if limit_events:
         sections.append(("No.4 连板梯队和涨停事件/三、涨停事件", limit_events))
     return sections
+
+
+def extract_jiuyangongshe_node_sections(text: str) -> dict[str, tuple[str, str]]:
+    sections = extract_target_sections(text)
+    mapping: dict[str, tuple[str, str]] = {}
+    for index, section in enumerate(sections):
+        if index == 0:
+            mapping["hot_events"] = section
+        elif index == 1:
+            mapping["daily_announcements"] = section
+        elif index == 2:
+            mapping["limit_events"] = section
+    return mapping
 
 
 def _clean_stock_token(value: str) -> str:
@@ -578,8 +791,9 @@ def collect_from_jiuyangongshe(
     article_url: str,
     sector: str,
     resolve_codes: bool = True,
+    require_today: bool = True,
 ) -> tuple[list[PoolCandidate], str, list[tuple[str, str]]]:
-    resolved_url = article_url or resolve_latest_jiuyangongshe_article_url(user_url)
+    resolved_url = article_url or resolve_latest_jiuyangongshe_article_url(user_url, require_today=require_today)
     page = _fetch_text(resolved_url)
     article_html = extract_jiuyangongshe_article_html(page)
     if not article_html:
@@ -605,6 +819,46 @@ def collect_from_jiuyangongshe(
             )
         )
     return candidates, resolved_url, sections
+
+
+def collect_from_jiuyangongshe_nodes(
+    *,
+    user_url: str,
+    article_url: str,
+    sector: str,
+    nodes: Iterable[str],
+    resolve_codes: bool = True,
+    require_today: bool = True,
+) -> tuple[dict[str, list[PoolCandidate]], str, dict[str, tuple[str, str]]]:
+    resolved_url = article_url or resolve_latest_jiuyangongshe_article_url(user_url, require_today=require_today)
+    page = _fetch_text(resolved_url)
+    article_html = extract_jiuyangongshe_article_html(page)
+    if not article_html:
+        raise RuntimeError(f"未能解析文章正文: {resolved_url}")
+    text = normalize_article_plain_text(article_html)
+    sections_by_node = extract_jiuyangongshe_node_sections(text)
+    name_code_map = build_qmt_name_code_map(sector) if resolve_codes else {}
+    known_names = set(name_code_map) if name_code_map else None
+    wanted_nodes = list(nodes)
+    results: dict[str, list[PoolCandidate]] = {}
+    for node in wanted_nodes:
+        section = sections_by_node.get(node)
+        if not section:
+            results[node] = []
+            continue
+        names = extract_stock_names_from_sections([section], known_names=known_names)
+        results[node] = [
+            PoolCandidate(
+                code=(name_code_map.get(name, "") if name_code_map else "") or name,
+                name=name,
+                pct_change=0.0,
+                last_price=0.0,
+                pre_close=0.0,
+                amount=0.0,
+            )
+            for name in names
+        ]
+    return results, resolved_url, sections_by_node
 
 
 def format_plan_amount(plan_amount: float) -> str:
@@ -633,6 +887,79 @@ def resolve_iwencai_cookie(cli_cookie: str = "") -> str:
     return str(value or "")
 
 
+def merge_candidates(candidates: Iterable[PoolCandidate]) -> list[PoolCandidate]:
+    merged: list[PoolCandidate] = []
+    seen: set[str] = set()
+    for item in candidates:
+        code = normalize_stock_code(item.code)
+        if not code or code in seen:
+            continue
+        if not is_main_board_code(code):
+            continue
+        if not is_non_st_name(item.name):
+            continue
+        seen.add(code)
+        merged.append(
+            PoolCandidate(
+                code=code,
+                name=item.name,
+                pct_change=item.pct_change,
+                last_price=item.last_price,
+                pre_close=item.pre_close,
+                amount=item.amount,
+                float_market_value=item.float_market_value,
+                max_amplitude_30d=item.max_amplitude_30d,
+            )
+        )
+    return merged
+
+
+def candidate_code_set(candidates: Iterable[PoolCandidate]) -> set[str]:
+    return {normalize_stock_code(item.code) for item in merge_candidates(candidates)}
+
+
+def filter_candidates_by_base(candidates: Iterable[PoolCandidate], base_codes: set[str]) -> list[PoolCandidate]:
+    if not base_codes:
+        return []
+    return [item for item in candidates if normalize_stock_code(item.code) in base_codes]
+
+
+def union_candidate_sets(candidate_sets: Iterable[Iterable[PoolCandidate]]) -> list[PoolCandidate]:
+    rows: list[PoolCandidate] = []
+    for candidates in candidate_sets:
+        rows.extend(candidates)
+    return merge_candidates(rows)
+
+
+def intersect_candidate_sets(candidate_sets: list[list[PoolCandidate]]) -> list[PoolCandidate]:
+    if not candidate_sets:
+        return []
+    normalized_sets = [merge_candidates(candidates) for candidates in candidate_sets]
+    code_sets = [{normalize_stock_code(item.code) for item in candidates} for candidates in normalized_sets]
+    common_codes = set.intersection(*code_sets) if code_sets else set()
+    return [item for item in normalized_sets[0] if normalize_stock_code(item.code) in common_codes]
+
+
+def evaluate_candidate_expression(expression: object, named_sets: dict[str, list[PoolCandidate]]) -> list[PoolCandidate]:
+    if isinstance(expression, str):
+        return named_sets.get(expression, [])
+    if isinstance(expression, list):
+        return union_candidate_sets(evaluate_candidate_expression(item, named_sets) for item in expression)
+    if not isinstance(expression, dict):
+        raise RuntimeError(f"股票池 final 表达式格式错误: {expression!r}")
+    if "union" in expression:
+        items = expression.get("union")
+        if not isinstance(items, list):
+            raise RuntimeError("股票池 final.union 必须是数组")
+        return union_candidate_sets(evaluate_candidate_expression(item, named_sets) for item in items)
+    if "intersect" in expression:
+        items = expression.get("intersect")
+        if not isinstance(items, list):
+            raise RuntimeError("股票池 final.intersect 必须是数组")
+        return intersect_candidate_sets([evaluate_candidate_expression(item, named_sets) for item in items])
+    raise RuntimeError(f"股票池 final 表达式不支持: {expression!r}")
+
+
 def write_pool(
     candidates: list[PoolCandidate],
     output_path: Path,
@@ -656,39 +983,117 @@ def write_pool(
     temp_path.replace(output_path)
 
 
+def collect_configured_source_sets(args) -> tuple[dict[str, list[PoolCandidate]], object]:
+    source_sets, final_expression = read_source_sets_from_config(Path(args.source_config))
+    if not source_sets:
+        return {}, None
+
+    named_sets: dict[str, list[PoolCandidate]] = {}
+    cookie = resolve_iwencai_cookie(str(args.iwencai_cookie or ""))
+    iwencai_sets = [item for item in source_sets.values() if item.source == "iwencai"]
+    for source_set in iwencai_sets:
+        candidates = collect_from_iwencai(
+            query=source_set.query,
+            cookie=cookie,
+            query_type=str(args.iwencai_query_type),
+            loop=not bool(args.no_iwencai_loop),
+        )
+        named_sets[source_set.name] = candidates
+        print(f"SET {source_set.name} source=iwencai raw={len(candidates)}", flush=True)
+
+    jiuyangongshe_sets = [item for item in source_sets.values() if item.source == "jiuyangongshe"]
+    if jiuyangongshe_sets and not args.no_jiuyangongshe:
+        jiuyangongshe_config = resolve_jiuyangongshe_config(args)
+        if jiuyangongshe_config.enabled:
+            try:
+                if args.no_resolve_codes and not args.allow_name_only_output:
+                    raise RuntimeError(
+                        "jiuyangongshe source requires QMT name-code resolution for a tradable pool. "
+                        "Use --allow-name-only-output only for parser debugging."
+                    )
+                node_names = [item.node for item in jiuyangongshe_sets if item.node]
+                node_results, article_url, _ = collect_from_jiuyangongshe_nodes(
+                    user_url=jiuyangongshe_config.user_url,
+                    article_url=str(args.article_url or ""),
+                    sector=str(args.sector),
+                    nodes=node_names,
+                    resolve_codes=not bool(args.no_resolve_codes),
+                    require_today=jiuyangongshe_config.require_today,
+                )
+                for source_set in jiuyangongshe_sets:
+                    candidates = node_results.get(source_set.node, [])
+                    named_sets[source_set.name] = candidates
+                    print(
+                        f"SET {source_set.name} source=jiuyangongshe node={source_set.node} "
+                        f"raw={len(candidates)} article={article_url}",
+                        flush=True,
+                    )
+            except RuntimeError as exc:
+                if args.strict_sources:
+                    raise
+                for source_set in jiuyangongshe_sets:
+                    named_sets[source_set.name] = []
+                print(f"WARNING 跳过韭研公社集合: {exc}", flush=True)
+    else:
+        for source_set in jiuyangongshe_sets:
+            named_sets[source_set.name] = []
+    return named_sets, final_expression
+
+
 def collect_once(args) -> int:
     now = datetime.now()
     if args.market_day_only and not is_market_day(now):
         print(f"跳过股票池生成：{now:%Y-%m-%d} 不是交易日", flush=True)
         return 0
 
+    if args.source in ("jiuyangongshe", "combined"):
+        candidates = []
     if args.source == "jiuyangongshe":
+        jiuyangongshe_config = resolve_jiuyangongshe_config(args)
         if args.no_resolve_codes and not args.allow_name_only_output:
             raise SystemExit(
                 "jiuyangongshe source requires QMT name-code resolution for a tradable pool. "
                 "Use --allow-name-only-output only for parser debugging."
             )
         candidates, article_url, sections = collect_from_jiuyangongshe(
-            user_url=str(args.jiuyangongshe_user_url),
+            user_url=jiuyangongshe_config.user_url,
             article_url=str(args.article_url or ""),
             sector=str(args.sector),
             resolve_codes=not bool(args.no_resolve_codes),
+            require_today=jiuyangongshe_config.require_today,
         )
         print(
             f"已解析韭研公社文章: {article_url} sections={len(sections)} stocks={len(candidates)}",
             flush=True,
         )
     elif args.source == "iwencai":
-        candidates = collect_from_iwencai(
-            query=str(args.iwencai_query),
+        queries = resolve_iwencai_queries(args)
+        candidates = collect_from_iwencai_queries(
+            queries=queries,
             cookie=resolve_iwencai_cookie(str(args.iwencai_cookie or "")),
             query_type=str(args.iwencai_query_type),
             loop=not bool(args.no_iwencai_loop),
         )
         print(
-            f"已通过 pywencai 解析股票池: query={args.iwencai_query!r} stocks={len(candidates)}",
+            f"已通过 pywencai 汇总股票池: queries={len(queries)} stocks={len(candidates)}",
             flush=True,
         )
+    elif args.source == "combined":
+        named_sets, final_expression = collect_configured_source_sets(args)
+        if named_sets and final_expression is not None:
+            candidates = evaluate_candidate_expression(final_expression, named_sets)
+            for name, rows in named_sets.items():
+                print(f"SET_SUMMARY {name} merged={len(merge_candidates(rows))}", flush=True)
+            print(f"FINAL expression_result={len(candidates)}", flush=True)
+        else:
+            queries = resolve_iwencai_queries(args)
+            candidates = collect_from_iwencai_queries(
+                queries=[item for item in queries if item.type == "direct"],
+                cookie=resolve_iwencai_cookie(str(args.iwencai_cookie or "")),
+                query_type=str(args.iwencai_query_type),
+                loop=not bool(args.no_iwencai_loop),
+            )
+            print(f"已汇总股票池来源: compatibility_direct_queries={len(queries)} raw_stocks={len(candidates)}", flush=True)
     else:
         candidates = collect_from_qmt(
             sector=str(args.sector),
@@ -698,6 +1103,12 @@ def collect_once(args) -> int:
             history_count=int(args.history_count),
             download_history=not bool(args.no_download_history),
         )
+    before_merge_count = len(candidates)
+    candidates = merge_candidates(candidates)
+    if not candidates:
+        raise RuntimeError("股票池为空：所有来源均无有效候选股票")
+    if len(candidates) != before_merge_count:
+        print(f"统一过滤去重: raw={before_merge_count} merged={len(candidates)}", flush=True)
     if args.max_count > 0:
         candidates = candidates[: int(args.max_count)]
     write_pool(
@@ -758,10 +1169,11 @@ def parse_hhmm(value: str) -> tuple[int, int]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="定时生成 MainSealFollow 股票池。")
-    parser.add_argument("--source", choices=("iwencai", "qmt", "jiuyangongshe"), default="iwencai", help="股票池来源，默认 iwencai。")
+    parser.add_argument("--source", choices=("combined", "iwencai", "qmt", "jiuyangongshe"), default="combined", help="股票池来源，默认 combined。")
     parser.add_argument("--once", action="store_true", help="只立即执行一次后退出。")
     parser.add_argument("--schedule-time", default="", help="常驻定时执行时间，格式 HH:MM。")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help=f"输出路径，默认 {DEFAULT_OUTPUT}")
+    parser.add_argument("--source-config", default=str(DEFAULT_SOURCE_CONFIG), help=f"股票池来源配置文件，默认 {DEFAULT_SOURCE_CONFIG}。")
     parser.add_argument("--amount", type=float, default=1000.0, help="每只股票计划买入金额，默认 1000。")
     parser.add_argument("--pct-min", type=float, default=6.0, help=argparse.SUPPRESS)
     parser.add_argument("--pct-max", type=float, default=7.0, help=argparse.SUPPRESS)
@@ -773,7 +1185,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-amplitude-30d", type=float, default=50.0, help="QMT 来源 30 日最大振幅上限，默认 50%。")
     parser.add_argument("--history-count", type=int, default=31, help="QMT 来源读取日线数量，默认 31。")
     parser.add_argument("--no-download-history", action="store_true", help="QMT 来源不先增量下载日线，只读取本地已有数据。")
-    parser.add_argument("--iwencai-query", default=DEFAULT_IWENCAI_QUERY, help=f"iWenCai 查询语句，默认 {DEFAULT_IWENCAI_QUERY}。")
+    parser.add_argument("--iwencai-query", default="", help="iWenCai 查询语句；传入后覆盖 --iwencai-query-file。")
+    parser.add_argument("--iwencai-query-file", default="", help=f"iWenCai 查询条件文件；不传则读取 --source-config。兼容旧文件 {DEFAULT_IWENCAI_QUERY_FILE}。")
     parser.add_argument(
         "--iwencai-cookie",
         default="",
@@ -781,8 +1194,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--iwencai-query-type", default="stock", help="pywencai query_type，默认 stock。")
     parser.add_argument("--no-iwencai-loop", action="store_true", help="pywencai 不自动翻页。")
-    parser.add_argument("--jiuyangongshe-user-url", default=DEFAULT_JIUYANGONGSHE_USER_URL, help="韭研公社用户页 URL。")
+    parser.add_argument("--jiuyangongshe-user-url", default="", help="韭研公社用户页 URL；不传则读取 --source-config。")
     parser.add_argument("--article-url", default="", help="指定韭研公社文章 URL；为空时自动取用户页最新文章。")
+    parser.add_argument("--no-jiuyangongshe", action="store_true", help="combined 来源下不叠加韭研公社。")
+    parser.add_argument("--strict-sources", action="store_true", help="combined 来源下任一来源失败就退出；默认记录 warning 并继续汇总其他来源。")
     parser.add_argument("--no-resolve-codes", action="store_true", help="不通过 QMT 证券名解析代码，仅用于解析调试。")
     parser.add_argument("--allow-name-only-output", action="store_true", help="允许输出名称作为代码，仅用于调试，不能给策略实盘使用。")
     parser.add_argument("--no-backup", action="store_true", help="覆盖输出前不备份旧股票池。")
