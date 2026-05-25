@@ -1,0 +1,22 @@
+name: main_seal_follow_guardrails
+phase: dry_run_monitoring
+hard_rules:
+  - never_enable_real_trading_automatically
+  - never_disable_CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN
+  - never_modify_env_or_local_runtime_secrets
+  - never_place_real_orders_from_agent_generated_changes
+  - strategy_threshold_changes_require_human_approval
+allowed_first_loop_changes:
+  - observability
+  - log_parsing
+  - dry_run_replay
+  - focused_tests
+  - operational_documentation
+blocked_without_human_approval:
+  - account_configuration
+  - qmt_path_configuration
+  - webhook_secret_configuration
+  - order_execution_behavior
+  - position_sizing
+  - risk_thresholds
+  - live_trading_enablement

@@ -1,0 +1,23 @@
+# Append recurring runtime or review failures here after human review.
+failures:
+  - id: market_data_not_connected_after_activation
+    first_seen: "2026-05-25"
+    workflow: "MainSealFollow"
+    phase: "morning_dry_run"
+    severity: "high"
+    signature:
+      - "strategies > 0 after 09:30"
+      - "connected=False on all heartbeats"
+      - "tick_subscriptions=0 on all heartbeats"
+      - "latest_data_time empty on all heartbeats"
+      - "no MSF_EVENT trigger chain"
+    evidence:
+      report: "agent/memory/runs/2026-05-25_morning.md"
+      summary_json: "agent/memory/runs/2026-05-25_morning_summary.json"
+      system_log: "logs/system.11652.log"
+      trade_log: "logs/trade.11652.log"
+    effect: "The runtime framework started and 52 strategies were created, but the session was not a valid market-monitor run because usable tick/Level2 data never arrived."
+    operator_action:
+      - "Do not interpret the run as a strategy false negative."
+      - "Classify the session as invalid monitoring."
+      - "Prioritize market-data connectivity validation before strategy tuning."

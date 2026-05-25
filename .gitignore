@@ -16,6 +16,7 @@ data/db/*.sqlite3
 .tmp_pytest*/
 docs/_zip_inspect/
 config/main_seal_follow_pool.backup_*.csv
+config/main_seal_follow_pool.csv
 dist/
 build/
 *.egg-info/
@@ -59,6 +60,7 @@ data/db/*.sqlite3
 .tmp_pytest*/
 docs/_zip_inspect/
 config/main_seal_follow_pool.backup_*.csv
+config/main_seal_follow_pool.csv
 dist/
 build/
 *.egg-info/

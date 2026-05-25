@@ -1,0 +1,28 @@
+default_risk: low
+allowed_paths:
+  observability:
+    - agent/
+    - docs/
+    - tests/
+    - scripts/run_main_seal_follow_monitor_session.py
+    - scripts/run_main_seal_follow_market_only.py
+    - strategy/main_seal_follow_strategy.py
+  replay:
+    - agent/
+    - tests/
+    - docs/
+  documentation:
+    - AGENTS.md
+    - agent/memory/
+    - docs/
+forbidden_paths:
+  - .env
+  - .env.*
+  - config/local_runtime.json
+  - data/db/
+  - saved_states/
+requires_human_approval:
+  - config/settings.py
+  - trading/
+  - strategy/main_seal_follow_strategy.py
+  - run_main_seal_follow.py
