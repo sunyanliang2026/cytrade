@@ -1174,7 +1174,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--schedule-time", default="", help="常驻定时执行时间，格式 HH:MM。")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help=f"输出路径，默认 {DEFAULT_OUTPUT}")
     parser.add_argument("--source-config", default=str(DEFAULT_SOURCE_CONFIG), help=f"股票池来源配置文件，默认 {DEFAULT_SOURCE_CONFIG}。")
-    parser.add_argument("--amount", type=float, default=1000.0, help="每只股票计划买入金额，默认 1000。")
+    parser.add_argument("--amount", type=float, default=50000.0, help="每只股票计划买入金额，默认 50000。")
     parser.add_argument("--pct-min", type=float, default=6.0, help=argparse.SUPPRESS)
     parser.add_argument("--pct-max", type=float, default=7.0, help=argparse.SUPPRESS)
     parser.add_argument("--include-bounds", action="store_true", help=argparse.SUPPRESS)

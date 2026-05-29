@@ -31,3 +31,15 @@ Operational rule:
 - Do not treat this pattern as "the strategy saw the market and found no opportunity".
 - Treat it as "market data never became usable".
 - Future morning review logic should emit an explicit invalid-monitor reason when this signature appears.
+- When this signature repeats in a real workstation session, prioritize checking local account / market-data login state before doing any strategy-side debugging.
+
+## 2026-05-25 next-day follow-up
+
+After the next trading-day morning review, continue immediately with the logging and observability cleanup instead of reopening strategy logic first.
+
+Priority order:
+
+- reduce console/file noise for 50-stock monitoring runs, especially high-frequency `MSF_EVENT` categories such as `entry_signal_blocked`, `order_update`, and repeated lifecycle text
+- keep heartbeat readable and secondary to real strategy events
+- do a pre-open connectivity checklist for the dry-run session entrypoint: correct Python, QMT / xtdata connectivity, and log file creation
+- keep the monitoring session in dry-run mode only

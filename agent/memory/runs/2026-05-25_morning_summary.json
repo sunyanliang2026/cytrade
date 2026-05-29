@@ -1,0 +1,65 @@
+{
+  "blocked_reasons": {},
+  "checks": {
+    "dry_run_probe_trade_seen": false,
+    "entry_signal_seen": false,
+    "heartbeat_seen": true,
+    "invalid_monitor_session": true,
+    "l2_detail_seen": true,
+    "market_data_active": false,
+    "minimum_acceptance": false,
+    "monitor_started": true,
+    "no_real_order_suspected": true,
+    "pool_generated": true,
+    "session_stopped": true,
+    "strategies_after_activation": true
+  },
+  "event_counts": {
+    "monitor_session": 6,
+    "runtime_heartbeat": 375
+  },
+  "generated_at": "2026-05-25T16:45:22",
+  "heartbeat_count": 375,
+  "invalid_monitor_reason": "market_data_not_connected",
+  "latest_heartbeat": {
+    "_logged_at": "2026-05-25T11:59:43",
+    "connected": false,
+    "data_delay_ms": 0.0,
+    "dry_run": true,
+    "l2_kinds": 52,
+    "l2_stocks": 52,
+    "mode": "market-only-monitor",
+    "process_ms": 0.0,
+    "strategies": 52,
+    "tick_subscriptions": 0
+  },
+  "log_patterns": [
+    "logs/system.*.log",
+    "logs/trade.*.log",
+    "logs/system.log",
+    "logs/trade.log"
+  ],
+  "max_l2_kinds": 52,
+  "max_l2_stocks": 52,
+  "max_strategies": 52,
+  "max_tick_subscriptions": 0,
+  "mock_trade_count": 0,
+  "msf_events": {},
+  "pool_total": 52,
+  "possible_real_order_count": 0,
+  "real_order_suspected": false,
+  "review_verdict": "invalid_monitor_session",
+  "reviewed_at": "2026-05-25T16:45:22",
+  "reviewed_sources": [
+    "C:\\Users\\ysun\\workspace\\cytrade\\logs\\system.11652.log"
+  ],
+  "run_id": "2026-05-25",
+  "session_events": {
+    "monitor_start": 1,
+    "pool_collect_start": 1,
+    "pool_generated": 1,
+    "session_start": 1,
+    "session_stop": 1,
+    "stopped": 1
+  }
+}

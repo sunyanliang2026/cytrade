@@ -1,5 +1,9 @@
 from config.enums import OrderStatus
-from main import _validate_live_trading_preflight
+from main import (
+    _connect_account_for_runtime,
+    _sync_account_after_connection_recovered,
+    _validate_live_trading_preflight,
+)
 from trading.executor import TradeExecutor
 from trading.order_manager import OrderManager
 
@@ -7,6 +11,9 @@ from trading.order_manager import OrderManager
 class _FakeSettings:
     def __init__(self, dry_run=True):
         self.CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN = dry_run
+        self.ACCOUNT_ID = "test-account"
+        self.ACCOUNT_TYPE = "STOCK"
+        self.RUNTIME_HEARTBEAT_INTERVAL_SEC = 30
 
 
 class _FakeAccount:
@@ -61,6 +68,36 @@ class _FakeConnection:
         return self._asset
 
 
+class _FakeStartupConnection:
+    def __init__(self, connect_result=False):
+        self.connect_result = connect_result
+        self.connect_calls = 0
+        self._last_error = {
+            "stage": "account_subscribe",
+            "return_code": -1,
+            "account_id": "test-account",
+            "account_type": "STOCK",
+            "qmt_path": r"C:\QMT\userdata_mini",
+        }
+
+    def get_startup_config(self):
+        return {
+            "qmt_path": r"C:\QMT\userdata_mini",
+            "account_id": "test-account",
+            "account_type": "STOCK",
+        }
+
+    def connect(self):
+        self.connect_calls += 1
+        return self.connect_result
+
+    def get_last_error(self):
+        return dict(self._last_error)
+
+    def is_trading_ready(self):
+        return False
+
+
 class _FakePreflightExecutor:
     def __init__(self, status, snapshot=None):
         self._status = status
@@ -71,6 +108,15 @@ class _FakePreflightExecutor:
 
     def get_live_account_snapshot(self):
         return dict(self._snapshot)
+
+
+class _FakeRecoveryRunner:
+    def __init__(self):
+        self.sync_reasons = []
+
+    def sync_orders_and_trades_once(self, reason="manual"):
+        self.sync_reasons.append(reason)
+        return {"trades_synced": 1, "orders_synced": 2, "state_recovered": 1}
 
 
 def test_trade_executor_dry_run_keeps_mock_order_path(monkeypatch):
@@ -204,6 +250,47 @@ def test_live_trading_preflight_blocks_live_when_guard_not_ready():
     }
 
     assert _validate_live_trading_preflight(ctx, mode="unit") is False
+
+
+def test_runtime_account_startup_allows_dry_run_to_continue_and_retry(monkeypatch):
+    retry_calls = []
+    conn = _FakeStartupConnection(connect_result=False)
+    ctx = {
+        "settings": _FakeSettings(dry_run=True),
+        "conn_mgr": conn,
+    }
+
+    def _fake_retry(retry_ctx, stop_event, mode):
+        retry_calls.append((retry_ctx, stop_event, mode))
+
+    monkeypatch.setattr("main._start_account_connection_retry", _fake_retry)
+
+    assert _connect_account_for_runtime(ctx, mode="unit", stop_event=object()) is True
+    assert conn.connect_calls == 1
+    assert len(retry_calls) == 1
+    assert retry_calls[0][2] == "unit"
+
+
+def test_runtime_account_startup_blocks_live_when_account_unavailable(monkeypatch):
+    retry_calls = []
+    conn = _FakeStartupConnection(connect_result=False)
+    ctx = {
+        "settings": _FakeSettings(dry_run=False),
+        "conn_mgr": conn,
+    }
+    monkeypatch.setattr("main._start_account_connection_retry", lambda *args, **kwargs: retry_calls.append(args))
+
+    assert _connect_account_for_runtime(ctx, mode="unit", stop_event=object()) is False
+    assert conn.connect_calls == 1
+    assert retry_calls == []
+
+
+def test_account_recovery_runs_one_order_trade_sync():
+    runner = _FakeRecoveryRunner()
+
+    _sync_account_after_connection_recovered({"runner": runner}, mode="unit")
+
+    assert runner.sync_reasons == ["account_recovered"]
 
 
 def test_live_trading_preflight_allows_live_when_guard_and_asset_ready():

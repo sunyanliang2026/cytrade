@@ -199,31 +199,31 @@ data/iwencai_pool_candidates.csv
 总入口立即生成一次：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source combined --once --amount 1000
+python scripts\collect_main_seal_pool.py --source combined --once --amount 50000
 ```
 
 定时生成，例如每天 08:45：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source combined --schedule-time 08:45 --amount 1000
+python scripts\collect_main_seal_pool.py --source combined --schedule-time 08:45 --amount 50000
 ```
 
 只使用问财，不叠加其他来源：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source iwencai --once --amount 1000
+python scripts\collect_main_seal_pool.py --source iwencai --once --amount 50000
 ```
 
 使用 `combined` 但临时不叠加韭研公社：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source combined --no-jiuyangongshe --once --amount 1000
+python scripts\collect_main_seal_pool.py --source combined --no-jiuyangongshe --once --amount 50000
 ```
 
 严格模式，任一来源失败就退出：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source combined --strict-sources --once --amount 1000
+python scripts\collect_main_seal_pool.py --source combined --strict-sources --once --amount 50000
 ```
 
 覆盖正式股票池前默认会备份旧文件：
@@ -237,7 +237,7 @@ config/main_seal_follow_pool.backup_YYYYMMDD_HHMMSS.csv
 命令：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source qmt --once --amount 1000
+python scripts\collect_main_seal_pool.py --source qmt --once --amount 50000
 ```
 
 QMT 来源使用本地日线和证券资料筛选：
@@ -269,7 +269,7 @@ data/jiuyangongshe_pool_candidates.csv
 只使用韭研公社写正式股票池：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source jiuyangongshe --once --amount 1000
+python scripts\collect_main_seal_pool.py --source jiuyangongshe --once --amount 50000
 ```
 
 用途：
@@ -300,7 +300,7 @@ python scripts\collect_main_seal_pool.py --source jiuyangongshe --once --amount 
 - 主板代码过滤：`000/001/002/003/600/601/603/605`。
 - 非 ST 名称过滤。
 - 按首次出现顺序去重。
-- 写入统一计划买入金额，默认 `1000`。
+- 写入统一计划买入金额，默认 `50000`。
 
 这个阶段是最终裁决阶段。来源脚本可以尽量保留原始候选，避免各来源重复实现同一套过滤逻辑。
 

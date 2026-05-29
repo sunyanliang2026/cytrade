@@ -139,11 +139,11 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
     if summary.get("invalid_monitor_reason") == "market_data_not_connected":
         tasks.append(
             _task(
-                "flag-invalid-market-data-session",
-                title="Flag invalid monitor session when market data never connects",
+                "capture-account-login-diagnostics",
+                title="Capture account and market-login diagnostics for invalid sessions",
                 risk="low",
-                task_type="observability",
-                reason="Strategies were created, but heartbeats never showed usable market data; make this failure explicit before any strategy tuning.",
+                task_type="diagnostics",
+                reason="The session is already flagged as invalid; the next low-risk step is to expose whether local account / market-data login state was missing before touching any strategy logic.",
                 allowed_files=[
                     "agent/sensors/parse_monitor_logs.py",
                     "agent/loops/post_morning_review.py",

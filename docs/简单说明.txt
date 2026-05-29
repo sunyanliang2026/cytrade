@@ -1,0 +1,26 @@
+  自动选股 + 完整运行时：
+
+  - workspace/cytrade/scripts/run_main_seal_follow_managed_session.py
+  - workspace/cytrade/scripts/start_main_seal_follow_managed_session.bat
+
+  监测入口也同步支持拆时间：
+
+  - workspace/cytrade/scripts/run_main_seal_follow_monitor_session.py
+
+  手工池的 managed 入口也接到这套新逻辑了：
+
+  - workspace/cytrade/scripts/start_main_seal_follow_manual_managed.bat
+
+  你现在可以这样用。
+
+  自动股票池，08:50 选股，09:15 启动：
+
+  scripts\start_main_seal_follow_managed_session.bat --pool-time 08:50 --strategy-start-time 09:15 --stop-time 10:00
+
+  手工股票池，跳过自动选股，09:15 启动：
+
+  scripts\start_main_seal_follow_manual_managed.bat --strategy-start-time 09:15 --stop-time 10:00
+
+  如果只是 dry-run 监测，不接真实账户：
+
+  scripts\start_main_seal_follow_monitor.bat --pool-time 08:50 --strategy-start-time 09:15 --stop-time 10:00

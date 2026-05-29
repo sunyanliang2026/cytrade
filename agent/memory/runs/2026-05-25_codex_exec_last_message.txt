@@ -1,0 +1,12 @@
+I couldn’t implement the task in this turn because the local execution environment is failing before any command starts. Every attempt to read the repo files returned `CreateProcessAsUserW failed: 5`, so I could not inspect `agent/sensors/parse_monitor_logs.py`, update tests, or run the required validation commands.
+
+Because of that, I did not make any code changes, did not touch trading behavior, and did not change any safety boundary. If you can restore local command execution, I’ll make the requested low-risk observability patch only in the allowed files and run:
+
+- `python -m pytest tests/test_agent_monitor_review.py -q`
+- `python -m agent.gates.quality_gate --pytest tests/test_agent_monitor_review.py`
+
+Intended scope once unblocked:
+- Make monitor-session parsing explicitly flag a session as invalid when market data never connects.
+- Surface that in the morning review output.
+- Add/update focused coverage in `tests/test_agent_monitor_review.py`.
+- Optionally document the new invalid-session condition in `docs/SELF_IMPROVING_AGENT_SYSTEM.md` if the existing docs cover monitor review outcomes.

@@ -1,0 +1,19 @@
+Implemented the low-risk observability task to explicitly flag invalid monitor sessions when market data never becomes usable.
+
+Changed files:
+- [agent/sensors/parse_monitor_logs.py](C:/Users/ysun/workspace/cytrade/agent/sensors/parse_monitor_logs.py:365) adds a top-level `review_verdict` (`accepted`, `needs_review`, `invalid_monitor_session`) and surfaces that verdict at the top of the markdown report, including an explicit invalid-session line and guidance to fix market-data connectivity before any strategy tuning.
+- [tests/test_agent_monitor_review.py](C:/Users/ysun/workspace/cytrade/tests/test_agent_monitor_review.py:48) adds focused assertions for the new verdict/report output in both valid and invalid monitor-session cases, and aligns one existing fixture to expect `needs_review`.
+- [docs/SELF_IMPROVING_AGENT_SYSTEM.md](C:/Users/ysun/workspace/cytrade/docs/SELF_IMPROVING_AGENT_SYSTEM.md:28) documents that morning-review artifacts now carry `review_verdict`.
+
+Runtime symptom addressed:
+- Sessions could create strategies but never connect to usable market data, yet still looked like ordinary failed acceptance runs. The report and JSON summary now mark those sessions explicitly as `invalid_monitor_session`.
+
+Tests run:
+- `C:\Users\ysun\miniconda3\envs\cytrade311\python.exe -m pytest tests/test_agent_monitor_review.py -q`
+- `C:\Users\ysun\miniconda3\envs\cytrade311\python.exe -m agent.gates.quality_gate --pytest tests/test_agent_monitor_review.py`
+
+Safety impact:
+- This touches only dry-run observability/reporting.
+- No trading execution logic changed.
+- No safety boundary changed.
+- `CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN` was not modified, and no credentials, routing, sizing, thresholds, or live-trading paths were touched.

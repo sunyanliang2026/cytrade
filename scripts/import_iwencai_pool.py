@@ -2,7 +2,7 @@
 
 Usage:
     python scripts/import_iwencai_pool.py input.csv
-    python scripts/import_iwencai_pool.py input.xlsx --amount 20000
+    python scripts/import_iwencai_pool.py input.xlsx --amount 50000
 """
 from __future__ import annotations
 
@@ -124,8 +124,8 @@ def main() -> None:
     parser.add_argument(
         "--amount",
         type=float,
-        default=10_000.0,
-        help="每只股票计划买入金额，默认 10000",
+        default=50_000.0,
+        help="每只股票计划买入金额，默认 50000",
     )
     args = parser.parse_args()
 

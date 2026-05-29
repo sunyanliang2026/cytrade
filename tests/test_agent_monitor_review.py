@@ -230,8 +230,8 @@ def test_generate_tasks_prioritizes_invalid_market_data_session():
 
     tasks = generate_tasks(summary)
 
-    assert tasks[0]["id"] == "flag-invalid-market-data-session"
-    assert tasks[0]["type"] == "observability"
+    assert tasks[0]["id"] == "capture-account-login-diagnostics"
+    assert tasks[0]["type"] == "diagnostics"
 
 
 def test_quality_gate_safety_scan_blocks_dry_run_disablement():

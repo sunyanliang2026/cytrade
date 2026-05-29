@@ -291,6 +291,109 @@ def _log_connection_failure(conn_mgr: ConnectionManager, mode: str) -> None:
     )
 
 
+def _is_dry_run(settings: Settings) -> bool:
+    return bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True))
+
+
+def _sync_account_after_connection_recovered(ctx: dict, mode: str) -> None:
+    """Run account-dependent sync once after delayed account login succeeds."""
+    logger = get_logger("system")
+    runner = ctx.get("runner")
+    if not runner or not hasattr(runner, "sync_orders_and_trades_once"):
+        return
+
+    try:
+        summary = runner.sync_orders_and_trades_once(reason="account_recovered")
+        logger.info("Runtime account recovery sync mode=%s summary=%s", mode, summary)
+    except Exception as exc:
+        logger.error("Runtime account recovery sync failed mode=%s error=%s", mode, exc, exc_info=True)
+
+
+def _start_account_connection_retry(ctx: dict, stop_event: threading.Event, mode: str) -> threading.Thread:
+    """Retry account connection in the background for dry-run monitoring sessions."""
+    logger = get_logger("system")
+    settings = ctx["settings"]
+    conn_mgr = ctx["conn_mgr"]
+    retry_interval = max(15, int(getattr(settings, "RUNTIME_HEARTBEAT_INTERVAL_SEC", 30) or 30))
+
+    def _loop() -> None:
+        attempt = 0
+        while not stop_event.wait(retry_interval):
+            if conn_mgr.is_trading_ready():
+                logger.info(
+                    "Runtime account retry stopped mode=%s reason=already_ready account_id=%s",
+                    mode,
+                    getattr(settings, "ACCOUNT_ID", ""),
+                )
+                return
+
+            attempt += 1
+            last_error = conn_mgr.get_last_error() if hasattr(conn_mgr, "get_last_error") else {}
+            logger.warning(
+                (
+                    "Runtime account retry attempt mode=%s attempt=%d dry_run=%s "
+                    "account_id=%s account_type=%s stage=%s return_code=%s error=%s"
+                ),
+                mode,
+                attempt,
+                _is_dry_run(settings),
+                getattr(settings, "ACCOUNT_ID", ""),
+                getattr(settings, "ACCOUNT_TYPE", ""),
+                last_error.get("stage", ""),
+                last_error.get("return_code", ""),
+                last_error.get("error", ""),
+            )
+
+            if conn_mgr.connect():
+                logger.info(
+                    "Runtime account recovered mode=%s attempt=%d account_id=%s account_type=%s trading_ready=%s",
+                    mode,
+                    attempt,
+                    getattr(settings, "ACCOUNT_ID", ""),
+                    getattr(settings, "ACCOUNT_TYPE", ""),
+                    conn_mgr.is_trading_ready(),
+                )
+                _sync_account_after_connection_recovered(ctx, mode=mode)
+                return
+
+            _log_connection_failure(conn_mgr, mode=mode)
+
+    thread = threading.Thread(target=_loop, daemon=True, name=f"account-retry-{mode}")
+    thread.start()
+    return thread
+
+
+def _connect_account_for_runtime(ctx: dict, mode: str, stop_event: threading.Event | None = None) -> bool:
+    """Connect the trading account; dry-run can continue and retry if unavailable."""
+    logger = get_logger("system")
+    settings = ctx["settings"]
+    conn_mgr = ctx["conn_mgr"]
+    dry_run = _is_dry_run(settings)
+
+    _log_runtime_startup_config(settings, conn_mgr, mode=mode)
+    if conn_mgr.connect():
+        return _validate_live_trading_preflight(ctx, mode=mode)
+
+    _log_connection_failure(conn_mgr, mode=mode)
+    if not dry_run:
+        logger.error("Unable to connect QMT; live trading is disabled and runtime exits")
+        return False
+
+    logger.warning(
+        (
+            "Runtime account unavailable at startup mode=%s dry_run=%s action=continue_market_monitor_and_retry "
+            "account_id=%s account_type=%s"
+        ),
+        mode,
+        dry_run,
+        getattr(settings, "ACCOUNT_ID", ""),
+        getattr(settings, "ACCOUNT_TYPE", ""),
+    )
+    if stop_event is not None:
+        _start_account_connection_retry(ctx, stop_event, mode=mode)
+    return True
+
+
 def _validate_live_trading_preflight(ctx: dict, mode: str) -> bool:
     """Block live runtime unless the final trading guard is fully ready."""
     logger = get_logger("system")
@@ -368,23 +471,61 @@ def _start_runtime_heartbeat(ctx: dict, stop_event: threading.Event, mode: str) 
     data_sub = ctx["data_sub"]
     conn_mgr = ctx.get("conn_mgr")
     interval = max(5, int(getattr(settings, "RUNTIME_HEARTBEAT_INTERVAL_SEC", 30) or 30))
+    stable_repeat = 4
 
     def _loop() -> None:
+        last_signature = None
+        unchanged_count = 0
         while not stop_event.wait(interval):
             try:
                 l2_map = data_sub.get_l2_subscription_map()
                 data_status = data_sub.get_latest_data_status()
                 runner_status = runner.get_runtime_status() if hasattr(runner, "get_runtime_status") else {}
+                conn_last_error = conn_mgr.get_last_error() if conn_mgr and hasattr(conn_mgr, "get_last_error") else {}
+                trading_ready = bool(conn_mgr.is_trading_ready()) if conn_mgr and hasattr(conn_mgr, "is_trading_ready") else False
+                signature = (
+                    bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True)),
+                    bool(conn_mgr.is_connected()) if conn_mgr else False,
+                    trading_ready,
+                    conn_last_error.get("stage", ""),
+                    conn_last_error.get("return_code", ""),
+                    runner_status.get("strategy_count", ""),
+                    len(data_sub.get_subscription_list()),
+                    len(l2_map),
+                    sum(len(kinds) for kinds in l2_map.values()),
+                    _format_dt(data_status.get("latest_data_time")),
+                    _format_dt(data_status.get("last_recv_time")),
+                    round(float(data_status.get("data_delay_ms", 0.0) or 0.0), 0),
+                    runner_status.get("last_strategy_event", ""),
+                    _format_dt(runner_status.get("last_strategy_event_time")),
+                )
+                changed = signature != last_signature
+                if changed:
+                    unchanged_count = 0
+                else:
+                    unchanged_count += 1
+
+                if not changed and unchanged_count < stable_repeat:
+                    continue
+
+                heartbeat_reason = "changed" if changed else "stable"
+                stable_for_sec = 0 if changed else unchanged_count * interval
                 logger.info(
                     (
-                        "Runtime heartbeat mode=%s dry_run=%s connected=%s strategies=%s "
+                        "Runtime heartbeat mode=%s reason=%s stable_for_sec=%d dry_run=%s connected=%s "
+                        "trading_ready=%s account_stage=%s account_return_code=%s strategies=%s "
                         "tick_subscriptions=%d l2_stocks=%d l2_kinds=%d latest_data_time=%s "
                         "last_recv_time=%s data_delay_ms=%.0f last_strategy_event=%s "
                         "last_strategy_event_time=%s process_ms=%.1f"
                     ),
                     mode,
+                    heartbeat_reason,
+                    stable_for_sec,
                     bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True)),
                     bool(conn_mgr.is_connected()) if conn_mgr else False,
+                    trading_ready,
+                    conn_last_error.get("stage", ""),
+                    conn_last_error.get("return_code", ""),
                     runner_status.get("strategy_count", ""),
                     len(data_sub.get_subscription_list()),
                     len(l2_map),
@@ -396,6 +537,9 @@ def _start_runtime_heartbeat(ctx: dict, stop_event: threading.Event, mode: str) 
                     _format_dt(runner_status.get("last_strategy_event_time")),
                     float(runner_status.get("last_round_total_process_ms", 0.0) or 0.0),
                 )
+                last_signature = signature
+                if not changed:
+                    unchanged_count = 0
             except Exception as exc:
                 logger.warning("Runtime heartbeat failed mode=%s error=%s", mode, exc)
 
@@ -456,12 +600,7 @@ def run(strategy_classes=None, settings: Settings = None):
     signal.signal(signal.SIGTERM, _signal_handler)
 
     # ---- 连接 QMT ----
-    _log_runtime_startup_config(settings, conn_mgr, mode="live")
-    if not conn_mgr.connect():
-        _log_connection_failure(conn_mgr, mode="live")
-        logger.error("Unable to connect QMT; live trading is disabled and runtime exits")
-        return
-    if not _validate_live_trading_preflight(ctx, mode="live"):
+    if not _connect_account_for_runtime(ctx, mode="live", stop_event=_stop_event):
         conn_mgr.disconnect()
         return
 
@@ -649,13 +788,7 @@ def _run_managed_session(strategy_classes=None, settings: Settings = None,
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    _log_runtime_startup_config(settings, conn_mgr, mode="managed")
-    if not conn_mgr.connect():
-        _log_connection_failure(conn_mgr, mode="managed")
-        logger.error("Unable to connect QMT; live trading is disabled and runtime exits")
-        _shutdown("交易连接建立失败")
-        return
-    if not _validate_live_trading_preflight(ctx, mode="managed"):
+    if not _connect_account_for_runtime(ctx, mode="managed", stop_event=stop_event):
         _shutdown("live 交易启动前置校验失败")
         return
 

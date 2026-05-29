@@ -7,6 +7,8 @@ from scripts.run_main_seal_follow_monitor_session import (
     build_pool_args,
     build_session_time,
     parse_hhmm,
+    resolve_runtime_start_time,
+    should_collect_pool,
 )
 
 
@@ -14,9 +16,9 @@ def test_monitor_session_parse_hhmm_and_build_session_time():
     assert parse_hhmm("08:50") == (8, 50)
 
     anchor = datetime(2026, 5, 25, 7, 30, 12)
-    target = build_session_time(anchor, "12:00")
+    target = build_session_time(anchor, "10:00")
 
-    assert target == datetime(2026, 5, 25, 12, 0, 0)
+    assert target == datetime(2026, 5, 25, 10, 0, 0)
 
 
 def test_monitor_session_build_monitor_settings_forces_dry_run(tmp_path: Path):
@@ -25,7 +27,7 @@ def test_monitor_session_build_monitor_settings_forces_dry_run(tmp_path: Path):
             "--pool-output",
             str(tmp_path / "pool.csv"),
             "--stop-time",
-            "12:00",
+            "10:00",
             "--heartbeat-interval-sec",
             "15",
         ]
@@ -36,8 +38,9 @@ def test_monitor_session_build_monitor_settings_forces_dry_run(tmp_path: Path):
     assert settings.CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN is True
     assert settings.CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH == str((tmp_path / "pool.csv").resolve())
     assert settings.LOG_SUMMARY_MODE is True
+    assert settings.SESSION_START_TIME == "08:50"
     assert settings.RUNTIME_HEARTBEAT_INTERVAL_SEC == 15
-    assert settings.SESSION_EXIT_TIME == "12:00"
+    assert settings.SESSION_EXIT_TIME == "10:00"
 
 
 def test_monitor_session_build_pool_args_uses_wrapper_options(tmp_path: Path):
@@ -71,3 +74,27 @@ def test_monitor_session_build_pool_args_uses_wrapper_options(tmp_path: Path):
     assert pool_args.strict_sources is True
     assert pool_args.no_backup is True
     assert pool_args.market_day_only is False
+
+
+def test_monitor_session_can_skip_pool_collection(tmp_path: Path):
+    args = build_parser().parse_args(
+        [
+            "--pool-output",
+            str(tmp_path / "manual_pool.csv"),
+            "--skip-pool-collect",
+        ]
+    )
+
+    assert should_collect_pool(args) is False
+
+
+def test_monitor_session_runtime_start_time_defaults_to_pool_time():
+    args = build_parser().parse_args(["--pool-time", "08:50"])
+
+    assert resolve_runtime_start_time(args) == "08:50"
+
+
+def test_monitor_session_runtime_start_time_can_be_overridden():
+    args = build_parser().parse_args(["--pool-time", "08:50", "--strategy-start-time", "09:15"])
+
+    assert resolve_runtime_start_time(args) == "09:15"

@@ -1,11 +1,10 @@
-"""Run the next-trading-day MainSealFollow monitoring session.
+"""Run a managed MainSealFollow session with separated pool and runtime times.
 
-This wrapper is for dry-run monitoring only:
+This wrapper is for full managed runtime orchestration:
 1. Wait until the configured pool generation time.
 2. Generate the stock pool CSV, or reuse an existing CSV when requested.
-3. Wait until the configured strategy start time.
-4. Start the market-only runtime.
-5. Stop automatically at the configured session end time.
+3. Hand off to the managed runtime with an independent strategy start time.
+4. Stop automatically at the configured session end time.
 """
 
 from __future__ import annotations
@@ -13,7 +12,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -26,61 +24,21 @@ if str(ROOT) not in sys.path:
 
 from config.settings import Settings
 from core.trading_calendar import is_market_day
+from main import run_daily_session
 from monitor.logger import get_log_file_path, get_logger
-from scripts.collect_main_seal_pool import DEFAULT_OUTPUT, DEFAULT_SOURCE_CONFIG, build_parser as build_pool_parser, collect_once
-from scripts.run_main_seal_follow_market_only import run_market_only
-
-SESSION_EVENT_PREFIX = "MONITOR_SESSION"
-
-
-def parse_hhmm(value: str) -> tuple[int, int]:
-    text = str(value or "").strip()
-    try:
-        hour_text, minute_text = text.split(":", 1)
-        hour = int(hour_text)
-        minute = int(minute_text)
-    except Exception as exc:
-        raise argparse.ArgumentTypeError(f"invalid time format: {value!r}, expected HH:MM") from exc
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise argparse.ArgumentTypeError(f"invalid time range: {value!r}")
-    return hour, minute
+from scripts.run_main_seal_follow_monitor_session import (
+    SESSION_EVENT_PREFIX,
+    build_pool_args,
+    build_session_time,
+    resolve_runtime_start_time,
+    should_collect_pool,
+    wait_until,
+)
+from scripts.collect_main_seal_pool import DEFAULT_OUTPUT, DEFAULT_SOURCE_CONFIG, collect_once
+from strategy.main_seal_follow_strategy import MainSealFollowStrategy
 
 
-def build_session_time(anchor: datetime, hhmm: str) -> datetime:
-    hour, minute = parse_hhmm(hhmm)
-    return anchor.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-
-def wait_until(target: datetime, logger, label: str) -> None:
-    while True:
-        now = datetime.now()
-        if now >= target:
-            return
-        remaining = max(0.0, (target - now).total_seconds())
-        logger.info(
-            "%s waiting phase=%s target_time=%s remaining_sec=%.0f",
-            SESSION_EVENT_PREFIX,
-            label,
-            target.strftime("%H:%M"),
-            remaining,
-        )
-        time.sleep(min(30.0, max(1.0, remaining)))
-
-
-def build_pool_args(args: argparse.Namespace) -> argparse.Namespace:
-    pool_args = build_pool_parser().parse_args(["--once"])
-    pool_args.source = str(args.pool_source)
-    pool_args.output = str(Path(args.pool_output))
-    pool_args.source_config = str(Path(args.pool_source_config))
-    pool_args.amount = float(args.amount)
-    pool_args.max_count = int(args.max_count)
-    pool_args.no_backup = bool(args.no_backup)
-    pool_args.strict_sources = bool(args.strict_sources)
-    pool_args.market_day_only = bool(args.market_day_only)
-    return pool_args
-
-
-def build_monitor_settings(args: argparse.Namespace) -> Settings:
+def build_managed_settings(args: argparse.Namespace) -> Settings:
     overrides = {
         "CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH": str(Path(args.pool_output).resolve()),
         "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN": True,
@@ -93,15 +51,7 @@ def build_monitor_settings(args: argparse.Namespace) -> Settings:
     return Settings(**overrides)
 
 
-def should_collect_pool(args: argparse.Namespace) -> bool:
-    return not bool(getattr(args, "skip_pool_collect", False))
-
-
-def resolve_runtime_start_time(args: argparse.Namespace) -> str:
-    return str(getattr(args, "strategy_start_time", "") or getattr(args, "pool_time", "") or "").strip()
-
-
-def run_monitor_session(args: argparse.Namespace) -> str:
+def run_managed_session(args: argparse.Namespace) -> str:
     logger = get_logger("system")
     now = datetime.now()
     if args.market_day_only and not is_market_day(now):
@@ -148,38 +98,34 @@ def run_monitor_session(args: argparse.Namespace) -> str:
             args.amount,
         )
 
-    runtime_start_time = resolve_runtime_start_time(args)
-    runtime_at = build_session_time(datetime.now(), runtime_start_time)
-    if datetime.now() < runtime_at:
-        wait_until(runtime_at, logger, label="runtime_wait")
-
-    runtime_settings = build_monitor_settings(args)
+    runtime_settings = build_managed_settings(args)
     logger.info(
-        "%s monitor_start csv=%s strategy_start_time=%s stop_time=%s dry_run=%s summary_mode=%s system_log=%s trade_log=%s",
+        "%s managed_start csv=%s strategy_start_time=%s stop_time=%s dry_run=%s summary_mode=%s system_log=%s trade_log=%s",
         SESSION_EVENT_PREFIX,
         runtime_settings.CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH,
-        runtime_start_time,
-        args.stop_time,
+        runtime_settings.SESSION_START_TIME,
+        runtime_settings.SESSION_EXIT_TIME,
         runtime_settings.CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN,
         runtime_settings.LOG_SUMMARY_MODE,
         get_log_file_path("system"),
         get_log_file_path("trade"),
     )
-    run_market_only(
-        settings=runtime_settings,
-        stop_at=stop_at,
-        mode="market-only-monitor",
-        session_event_prefix=SESSION_EVENT_PREFIX,
-        stop_reason="scheduled_stop",
+    result = run_daily_session(strategy_classes=[MainSealFollowStrategy], settings=runtime_settings)
+    logger.info(
+        "%s managed_stopped result=%s csv=%s dry_run=%s",
+        SESSION_EVENT_PREFIX,
+        result,
+        runtime_settings.CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH,
+        runtime_settings.CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN,
     )
-    return "completed"
+    return str(result)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run MainSealFollow dry-run monitoring session.")
+    parser = argparse.ArgumentParser(description="Run MainSealFollow managed session with separated pool/runtime times.")
     parser.add_argument("--pool-time", default="08:50", help="Stock-pool generation time in HH:MM.")
-    parser.add_argument("--strategy-start-time", default="", help="Strategy runtime start time in HH:MM. Defaults to pool-time.")
-    parser.add_argument("--stop-time", default="10:00", help="Session stop time in HH:MM.")
+    parser.add_argument("--strategy-start-time", default="09:15", help="Strategy runtime start time in HH:MM.")
+    parser.add_argument("--stop-time", default="23:00", help="Session stop time in HH:MM.")
     parser.add_argument("--pool-source", choices=("combined", "iwencai", "qmt", "jiuyangongshe"), default="combined")
     parser.add_argument("--pool-output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--pool-source-config", default=str(DEFAULT_SOURCE_CONFIG))
@@ -197,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    run_monitor_session(args)
+    run_managed_session(args)
 
 
 if __name__ == "__main__":

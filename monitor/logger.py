@@ -67,6 +67,10 @@ class LogManager:
                  level: str = "INFO", summary_mode: bool = False):
         """初始化日志系统配置。"""
         if self._initialized:
+            self._log_dir = log_dir
+            self._max_days = max_days
+            self.set_log_level(level)
+            self.set_summary_mode(summary_mode)
             return
         self._initialized = True
         self._log_dir = log_dir

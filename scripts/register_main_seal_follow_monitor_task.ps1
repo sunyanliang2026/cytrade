@@ -1,6 +1,8 @@
 param(
     [string]$TaskName = "Cytrade MainSealFollow Monitor",
     [string]$StartTime = "08:50",
+    [string]$StrategyStartTime = "09:15",
+    [string]$StopTime = "10:00",
     [string]$RepoRoot = "",
     [string]$BatchPath = ""
 )
@@ -27,8 +29,20 @@ if (-not (Test-Path -LiteralPath $BatchPath)) {
 }
 
 $StartTime = Resolve-HhMm -Value $StartTime
+$StrategyStartTime = Resolve-HhMm -Value $StrategyStartTime
+$StopTime = Resolve-HhMm -Value $StopTime
 $triggerTime = [datetime]::ParseExact($StartTime, "HH:mm", $null)
-$action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$BatchPath`""
+$batchArgs = @(
+    "/c"
+    "`"$BatchPath`""
+    "--pool-time"
+    $StartTime
+    "--strategy-start-time"
+    $StrategyStartTime
+    "--stop-time"
+    $StopTime
+) -join " "
+$action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $batchArgs
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At $triggerTime
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
@@ -41,9 +55,11 @@ Register-ScheduledTask `
     -Action $action `
     -Trigger $trigger `
     -Settings $settings `
-    -Description "Start cytrade MainSealFollow dry-run monitoring session on trading mornings." `
+    -Description "Start cytrade MainSealFollow dry-run monitoring session on trading mornings with separated pool/runtime times." `
     -Force | Out-Null
 
 Write-Host "Registered scheduled task: $TaskName"
-Write-Host "Start time: $StartTime"
+Write-Host "Pool time / trigger time: $StartTime"
+Write-Host "Strategy start time: $StrategyStartTime"
+Write-Host "Stop time: $StopTime"
 Write-Host "Batch path: $BatchPath"

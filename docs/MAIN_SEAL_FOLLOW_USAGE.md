@@ -10,18 +10,32 @@
 config/main_seal_follow_pool.csv
 ```
 
+手工测试股票池文件：
+
+```text
+config/main_seal_follow_manual_pool.csv
+```
+
 CSV 表头：
 
 ```csv
 股票代码,名称,计划买入金额
-001259,利仁科技,10000
-600604,市北高新,10000
+001259,利仁科技,50000
+600604,市北高新,50000
 ```
 
 - 股票代码：支持 `001259`、`001259.SZ`、`600604`、`600604.SH`，策略内部会归一成 6 位代码。
 - 名称：只用于日志和诊断，不参与交易判断。
 - 计划买入金额：每只股票本次计划买入的总金额，支持纯数字，也支持 `2万` 这种写法。
 - 金额小于等于 0 的行会被跳过，可用于保留样例但不启用。
+- 手工测试时可以只保留 1 只股票，也可以追加多只；系统会按 CSV 每一行创建对应策略实例。
+
+手工池示例：
+
+```csv
+code,name,plan_amount
+600162,香江控股,50000
+```
 
 ## 股票池自动生成
 
@@ -29,7 +43,7 @@ CSV 表头：
 
 ```powershell
 set IWENCAI_COOKIE=你的问财登录cookie
-python scripts\collect_main_seal_pool.py --source combined --schedule-time 08:45 --amount 1000
+python scripts\collect_main_seal_pool.py --source combined --schedule-time 08:45 --amount 50000
 ```
 
 来源参数从统一配置 `config/main_seal_pool_sources.json` 读取，其中包含问财条件和韭研公社参数：
@@ -75,7 +89,7 @@ python scripts\collect_jiuyangongshe_pool.py
 单次立即生成：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --once --amount 1000
+python scripts\collect_main_seal_pool.py --once --amount 50000
 ```
 
 常用参数：
@@ -95,7 +109,7 @@ python scripts\collect_main_seal_pool.py --once --amount 1000
 也可以用 QMT 本地日线和证券资料生成近似股票池：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source qmt --once --amount 1000
+python scripts\collect_main_seal_pool.py --source qmt --once --amount 50000
 ```
 
 QMT 来源筛选条件：
@@ -128,13 +142,13 @@ config/main_seal_follow_pool.backup_YYYYMMDD_HHMMSS.csv
 也可以从韭研公社用户页的最新文章生成股票池，用于每天盘前把热点事件、公告和涨停事件涉及的股票写入同一个 CSV：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source jiuyangongshe --schedule-time 08:45 --amount 1000
+python scripts\collect_main_seal_pool.py --source jiuyangongshe --schedule-time 08:45 --amount 50000
 ```
 
 单次调试指定文章：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source jiuyangongshe --once --article-url https://www.jiuyangongshe.com/a/205ec428s8y --amount 1000
+python scripts\collect_main_seal_pool.py --source jiuyangongshe --once --article-url https://www.jiuyangongshe.com/a/205ec428s8y --amount 50000
 ```
 
 当前只解析这些节点：
@@ -181,6 +195,68 @@ run_scheduler_service(strategy_classes=[MainSealFollowStrategy])
 ```
 
 启动后，系统会在选股阶段读取股票池，每一行有效股票生成一个独立策略实例。
+
+如果想把“选股时间”和“策略启动时间”拆开，例如 `08:50` 先生成股票池，
+`09:15` 再启动策略运行，可以使用专用会话入口：
+
+```powershell
+scripts\start_main_seal_follow_managed_session.bat --pool-time 08:50 --strategy-start-time 09:15 --stop-time 23:00
+```
+
+这个入口会：
+
+- 先在 `pool-time` 执行股票池生成
+- 再把完整运行时的 `SESSION_START_TIME` 设为 `strategy-start-time`
+- 到达策略启动时间后再真正连接并启动 `MainSealFollow`
+- 仍然使用同一份生成好的股票池 CSV
+
+如果只想复用一份现成的手工股票池，不走盘前自动生成，可以直接运行：
+
+```powershell
+scripts\start_main_seal_follow_manual_monitor.bat
+```
+
+这个入口默认：
+
+- 使用 `config/main_seal_follow_manual_pool.csv`
+- 跳过自动股票池生成
+- 继续走 dry-run market-only 监测链路
+- 支持 1 只或多只股票，按 CSV 内容创建策略实例
+
+如果账户里已经真实有委托或持仓，想让系统接管并继续检测同一份手工池，可以运行：
+
+```powershell
+scripts\start_main_seal_follow_manual_managed.bat
+```
+
+这个入口默认：
+
+- 使用 `config/main_seal_follow_manual_pool.csv`
+- 走完整运行时，会连接交易账户和行情
+- 允许启动前账户校验、委托同步、持仓恢复生效
+- 策略只加载手工池里列出的股票
+- 支持继续追加 `--strategy-start-time 09:15 --stop-time 10:00` 这类时序参数
+
+适用场景：
+
+- 账户里已经有 `600162` 的真实买单，想看系统是否把它接管到 `WAIT_PROBE_FILL`
+- 账户里已经有 `600162` 的真实持仓，想看系统是否把它接管到 `HAS_POSITION`
+
+接管判断要点：
+
+- `market-only` 入口不会连接交易账户，不能识别真实已有委托/持仓
+- `manual managed` 入口才会连接账户，并执行启动前账户/委托/持仓同步
+- 如果策略实例存在活动买单，会进入 `WAIT_PROBE_FILL`
+- 如果策略实例存在真实持仓，会进入 `HAS_POSITION`
+
+建议：
+
+- 如果只是“接管检测”，不希望系统再发新单，保持 `CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN=true`
+- 真要让系统继续真实下单，再单独确认 `dry_run=false`
+
+检查清单见：
+
+- `docs/MANUAL_MANAGED_CHECKLIST.md`
 
 Level2 订阅采用两层模式：
 
@@ -233,7 +309,10 @@ This script has a normal `if __name__ == "__main__"` guard and is intended for
 market data / Level2 / signal validation only. It does not connect the trading
 account.
 
-Every runtime writes a `Runtime heartbeat` line every 30 seconds by default.
+Every runtime checks heartbeat state every 30 seconds by default.
+If the key runtime state changes, it logs immediately; if the state stays the
+same, it emits a lower-frequency stable heartbeat summary instead of repeating
+the same line every interval.
 The heartbeat includes current mode, dry-run flag, connection status, strategy
 count, tick/L2 subscription counts, latest market-data time, latest receive
 time, latest strategy event, and last strategy processing cost.
