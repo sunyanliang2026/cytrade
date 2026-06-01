@@ -821,7 +821,7 @@ $env:TWINE_PASSWORD="<your-pypi-token>"
 python -m twine upload dist/*
 ```
 
-本地示例配置见 `.pypirc.example`，但不要提交真实 `.pypirc`。
+本地示例配置见 `docs/archive/.pypirc.example`，但不要提交真实 `.pypirc`。
 
 ---
 
@@ -851,10 +851,10 @@ python -m twine upload dist/*
 
 ## 相关文档
 
-- `CONTRIBUTING.md`：贡献约定
-- `SECURITY.md`：安全说明
-- `RELEASE_CHECKLIST.md`：发布前检查清单
-- `CHANGELOG.md`：版本变更记录
+- `docs/project/CONTRIBUTING.md`：贡献约定
+- `docs/project/SECURITY.md`：安全说明
+- `docs/project/RELEASE_CHECKLIST.md`：发布前检查清单
+- `docs/project/CHANGELOG.md`：版本变更记录
 - `private/`：内部设计、审查与整改资料
 
 ---
