@@ -1,8 +1,8 @@
 """Import an iWenCai export file into MainSealFollow stock-pool CSV.
 
 Usage:
-    python scripts/import_iwencai_pool.py input.csv
-    python scripts/import_iwencai_pool.py input.xlsx --amount 50000
+    python scripts/pool/import_iwencai_pool.py input.csv
+    python scripts/pool/import_iwencai_pool.py input.xlsx --amount 50000
 """
 from __future__ import annotations
 

@@ -2,7 +2,7 @@ import csv
 
 import pandas as pd
 
-from scripts.import_iwencai_pool import import_pool
+from scripts.pool.import_iwencai_pool import import_pool
 
 
 def test_import_iwencai_pool_writes_main_seal_pool_csv(tmp_path):

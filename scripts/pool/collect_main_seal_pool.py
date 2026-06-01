@@ -6,8 +6,8 @@ greater than 1.9 billion yuan, 30-day max amplitude below 50%, non-ST,
 main-board stocks.
 
 Examples:
-    python scripts/collect_main_seal_pool.py --once
-    python scripts/collect_main_seal_pool.py --schedule-time 09:26
+    python scripts/pool/collect_main_seal_pool.py --once
+    python scripts/pool/collect_main_seal_pool.py --schedule-time 09:26
 """
 from __future__ import annotations
 

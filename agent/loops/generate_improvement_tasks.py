@@ -66,8 +66,8 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 task_type="observability",
                 reason="The morning run did not show a successful MONITOR_SESSION pool_generated event with total > 0.",
                 allowed_files=[
-                    "scripts/collect_main_seal_pool.py",
-                    "scripts/run_main_seal_follow_monitor_session.py",
+                    "scripts/pool/collect_main_seal_pool.py",
+                    "scripts/run/run_main_seal_follow_monitor_session.py",
                     "tests/test_collect_main_seal_pool.py",
                     "tests/test_run_main_seal_follow_monitor_session.py",
                     "docs/NEXT_TRADING_DAY_OBSERVATION_CHECKLIST.md",
@@ -88,8 +88,8 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 task_type="observability",
                 reason="The morning run did not show monitor_start or session_start markers.",
                 allowed_files=[
-                    "scripts/run_main_seal_follow_monitor_session.py",
-                    "scripts/run_main_seal_follow_market_only.py",
+                    "scripts/run/run_main_seal_follow_monitor_session.py",
+                    "scripts/run/run_main_seal_follow_market_only.py",
                     "tests/test_run_main_seal_follow_monitor_session.py",
                 ],
                 validation=[
@@ -107,9 +107,9 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 risk="low",
                 task_type="observability",
                 reason="No Runtime heartbeat lines were found, so quiet markets cannot be distinguished from hangs.",
-                allowed_files=["main.py", "scripts/run_main_seal_follow_market_only.py", "tests/"],
+                allowed_files=["main.py", "scripts/run/run_main_seal_follow_market_only.py", "tests/"],
                 validation=[
-                    "python -m py_compile main.py scripts/run_main_seal_follow_market_only.py",
+                    "python -m py_compile main.py scripts/run/run_main_seal_follow_market_only.py",
                     "python -m agent.gates.quality_gate",
                 ],
             )
@@ -125,7 +125,7 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 reason="Heartbeats were present, but max strategy count stayed at 0.",
                 allowed_files=[
                     "strategy/runner.py",
-                    "scripts/run_main_seal_follow_market_only.py",
+                    "scripts/run/run_main_seal_follow_market_only.py",
                     "docs/NEXT_TRADING_DAY_OBSERVATION_CHECKLIST.md",
                     "tests/",
                 ],

@@ -19,7 +19,7 @@ function Resolve-HhMm {
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
-    $RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir ".."))
+    $RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir "..\.."))
 }
 if ([string]::IsNullOrWhiteSpace($BatchPath)) {
     $BatchPath = Join-Path $scriptDir "start_main_seal_follow_monitor.bat"

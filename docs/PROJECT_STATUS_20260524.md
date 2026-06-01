@@ -34,9 +34,9 @@ Current git working tree:
 
 Implemented files:
 
-- `scripts/collect_main_seal_pool.py`
-- `scripts/collect_iwencai_pool.py`
-- `scripts/collect_jiuyangongshe_pool.py`
+- `scripts/pool/collect_main_seal_pool.py`
+- `scripts/pool/collect_iwencai_pool.py`
+- `scripts/pool/collect_jiuyangongshe_pool.py`
 - `config/main_seal_pool_sources.json`
 
 Current design:
@@ -57,10 +57,10 @@ Current default final pool logic:
 
 Implemented files:
 
-- `scripts/run_main_seal_follow_market_only.py`
-- `scripts/run_main_seal_follow_monitor_session.py`
-- `scripts/start_main_seal_follow_monitor.bat`
-- `scripts/register_main_seal_follow_monitor_task.ps1`
+- `scripts/run/run_main_seal_follow_market_only.py`
+- `scripts/run/run_main_seal_follow_monitor_session.py`
+- `scripts/ops/start_main_seal_follow_monitor.bat`
+- `scripts/ops/register_main_seal_follow_monitor_task.ps1`
 
 Current behavior:
 
@@ -74,7 +74,7 @@ Windows scheduled task status:
 
 - Task name: `Cytrade MainSealFollow Monitor`
 - Trigger: weekdays at `08:50`
-- Action: run `scripts/start_main_seal_follow_monitor.bat`
+- Action: run `scripts/ops/start_main_seal_follow_monitor.bat`
 
 ### 3. Strategy event logging
 

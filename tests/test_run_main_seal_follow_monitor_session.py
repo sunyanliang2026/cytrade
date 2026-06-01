@@ -1,7 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 
-from scripts.run_main_seal_follow_monitor_session import (
+from scripts.run.run_main_seal_follow_monitor_session import (
     build_monitor_settings,
     build_parser,
     build_pool_args,
@@ -41,6 +41,7 @@ def test_monitor_session_build_monitor_settings_forces_dry_run(tmp_path: Path):
     assert settings.SESSION_START_TIME == "08:50"
     assert settings.RUNTIME_HEARTBEAT_INTERVAL_SEC == 15
     assert settings.SESSION_EXIT_TIME == "10:00"
+    assert settings.LOAD_PREVIOUS_STATE_ON_START is False
 
 
 def test_monitor_session_build_pool_args_uses_wrapper_options(tmp_path: Path):

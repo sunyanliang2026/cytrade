@@ -4,13 +4,13 @@ Use the dedicated wrapper when you want a dry-run monitoring session for the
 next trading day:
 
 ```bash
-python scripts\run_main_seal_follow_monitor_session.py
+python scripts\run\run_main_seal_follow_monitor_session.py
 ```
 
 You can also use the local launcher:
 
 ```bash
-scripts\start_main_seal_follow_monitor.bat
+scripts\ops\start_main_seal_follow_monitor.bat
 ```
 
 Default behavior:
@@ -34,7 +34,7 @@ Useful switches:
 Windows scheduled task helper:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\register_main_seal_follow_monitor_task.ps1
+powershell -ExecutionPolicy Bypass -File scripts\ops\register_main_seal_follow_monitor_task.ps1
 ```
 
 Defaults:
@@ -43,7 +43,7 @@ Defaults:
 - Trigger time / pool time: `08:50`
 - Strategy start time: `09:15`
 - Stop time: `10:00`
-- Action: run `scripts\start_main_seal_follow_monitor.bat --pool-time 08:50 --strategy-start-time 09:15 --stop-time 10:00`
+- Action: run `scripts\ops\start_main_seal_follow_monitor.bat --pool-time 08:50 --strategy-start-time 09:15 --stop-time 10:00`
 
 Optional overrides:
 
@@ -56,7 +56,7 @@ To separate stock selection and monitoring runtime, for example `08:50`
 selection plus `09:15` strategy start:
 
 ```powershell
-python scripts\run_main_seal_follow_monitor_session.py --pool-time 08:50 --strategy-start-time 09:15 --stop-time 10:00
+python scripts\run\run_main_seal_follow_monitor_session.py --pool-time 08:50 --strategy-start-time 09:15 --stop-time 10:00
 ```
 
 Key replay markers in logs:

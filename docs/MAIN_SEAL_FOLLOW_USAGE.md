@@ -43,7 +43,7 @@ code,name,plan_amount
 
 ```powershell
 set IWENCAI_COOKIE=你的问财登录cookie
-python scripts\collect_main_seal_pool.py --source combined --schedule-time 08:45 --amount 50000
+python scripts\pool\collect_main_seal_pool.py --source combined --schedule-time 08:45 --amount 50000
 ```
 
 来源参数从统一配置 `config/main_seal_pool_sources.json` 读取，其中包含问财条件和韭研公社参数：
@@ -63,8 +63,8 @@ python scripts\collect_main_seal_pool.py --source combined --schedule-time 08:45
 韭研公社自动取最新文章时默认要求文章日期等于当天，避免误用旧文章；手工传 `--article-url` 用于历史文章测试时不做这个自动最新日期保护。
 
 ```powershell
-python scripts\collect_iwencai_pool.py
-python scripts\collect_jiuyangongshe_pool.py
+python scripts\pool\collect_iwencai_pool.py
+python scripts\pool\collect_jiuyangongshe_pool.py
 ```
 
 `combined` 默认容错：韭研公社/QMT 名称转代码不可用时会打印 `WARNING`，并继续用问财结果生成股票池。需要任一来源失败即退出时，加 `--strict-sources`。
@@ -89,7 +89,7 @@ python scripts\collect_jiuyangongshe_pool.py
 单次立即生成：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --once --amount 50000
+python scripts\pool\collect_main_seal_pool.py --once --amount 50000
 ```
 
 常用参数：
@@ -109,7 +109,7 @@ python scripts\collect_main_seal_pool.py --once --amount 50000
 也可以用 QMT 本地日线和证券资料生成近似股票池：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source qmt --once --amount 50000
+python scripts\pool\collect_main_seal_pool.py --source qmt --once --amount 50000
 ```
 
 QMT 来源筛选条件：
@@ -142,13 +142,13 @@ config/main_seal_follow_pool.backup_YYYYMMDD_HHMMSS.csv
 也可以从韭研公社用户页的最新文章生成股票池，用于每天盘前把热点事件、公告和涨停事件涉及的股票写入同一个 CSV：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source jiuyangongshe --schedule-time 08:45 --amount 50000
+python scripts\pool\collect_main_seal_pool.py --source jiuyangongshe --schedule-time 08:45 --amount 50000
 ```
 
 单次调试指定文章：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source jiuyangongshe --once --article-url https://www.jiuyangongshe.com/a/205ec428s8y --amount 50000
+python scripts\pool\collect_main_seal_pool.py --source jiuyangongshe --once --article-url https://www.jiuyangongshe.com/a/205ec428s8y --amount 50000
 ```
 
 当前只解析这些节点：
@@ -160,7 +160,7 @@ python scripts\collect_main_seal_pool.py --source jiuyangongshe --once --article
 正式输出会通过 QMT `沪深A股` 名称表把股票名称解析成 6 位代码，并且只保留主板代码：`000/001/002/003/600/601/603/605`。所以需要本地 QMT/xtdata 服务可用。未解析代码时不能直接给策略实盘使用；如只想调试网页解析，可显式加：
 
 ```powershell
-python scripts\collect_main_seal_pool.py --source jiuyangongshe --once --article-url https://www.jiuyangongshe.com/a/205ec428s8y --no-resolve-codes --allow-name-only-output --output data\tmp_jiuyangongshe_pool.csv --no-market-day-check
+python scripts\pool\collect_main_seal_pool.py --source jiuyangongshe --once --article-url https://www.jiuyangongshe.com/a/205ec428s8y --no-resolve-codes --allow-name-only-output --output data\tmp_jiuyangongshe_pool.csv --no-market-day-check
 ```
 
 调试模式会输出名称作为代码，可能包含非股票短语，只用于检查文章结构和解析范围。
@@ -200,7 +200,7 @@ run_scheduler_service(strategy_classes=[MainSealFollowStrategy])
 `09:15` 再启动策略运行，可以使用专用会话入口：
 
 ```powershell
-scripts\start_main_seal_follow_managed_session.bat --pool-time 08:50 --strategy-start-time 09:15 --stop-time 23:00
+scripts\ops\start_main_seal_follow_managed_session.bat --pool-time 08:50 --strategy-start-time 09:15 --stop-time 23:00
 ```
 
 这个入口会：
@@ -213,7 +213,7 @@ scripts\start_main_seal_follow_managed_session.bat --pool-time 08:50 --strategy-
 如果只想复用一份现成的手工股票池，不走盘前自动生成，可以直接运行：
 
 ```powershell
-scripts\start_main_seal_follow_manual_monitor.bat
+scripts\ops\start_main_seal_follow_manual_monitor.bat
 ```
 
 这个入口默认：
@@ -226,7 +226,7 @@ scripts\start_main_seal_follow_manual_monitor.bat
 如果账户里已经真实有委托或持仓，想让系统接管并继续检测同一份手工池，可以运行：
 
 ```powershell
-scripts\start_main_seal_follow_manual_managed.bat
+scripts\ops\start_main_seal_follow_manual_managed.bat
 ```
 
 这个入口默认：
@@ -302,7 +302,7 @@ allowed to continue.
 Market-only dry-run should be started with:
 
 ```powershell
-python scripts\run_main_seal_follow_market_only.py
+python scripts\run\run_main_seal_follow_market_only.py
 ```
 
 This script has a normal `if __name__ == "__main__"` guard and is intended for

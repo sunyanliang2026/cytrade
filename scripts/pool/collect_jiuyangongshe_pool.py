@@ -1,7 +1,7 @@
 """Collect raw Jiuyangongshe article stock-pool candidates.
 
 The article parsing rules are intentionally fixed. The final tradable pool is
-still produced by ``scripts/collect_main_seal_pool.py``.
+still produced by ``scripts/pool/collect_main_seal_pool.py``.
 """
 from __future__ import annotations
 
@@ -10,11 +10,11 @@ import csv
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.collect_main_seal_pool import (
+from scripts.pool.collect_main_seal_pool import (
     DEFAULT_SOURCE_CONFIG,
     DEFAULT_SECTOR,
     PoolCandidate,

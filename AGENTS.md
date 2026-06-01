@@ -36,7 +36,7 @@ The first self-improving loop should improve the system around the strategy, not
 Run focused checks first:
 
 ```bash
-python -m py_compile scripts/run_main_seal_follow_monitor_session.py scripts/run_main_seal_follow_market_only.py strategy/main_seal_follow_strategy.py
+python -m py_compile scripts/run/run_main_seal_follow_monitor_session.py scripts/run/run_main_seal_follow_market_only.py strategy/main_seal_follow_strategy.py
 python -m py_compile agent/sensors/parse_monitor_logs.py agent/loops/post_morning_review.py agent/loops/generate_improvement_tasks.py agent/gates/quality_gate.py agent/tools/codex_cli_runner.py
 python -m pytest tests/test_agent_monitor_review.py
 python -m pytest tests/test_collect_main_seal_pool.py tests/test_import_iwencai_pool.py tests/test_run_main_seal_follow_monitor_session.py tests/test_main_seal_follow_strategy.py

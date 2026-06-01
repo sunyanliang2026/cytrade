@@ -5,8 +5,8 @@ import types
 
 import pandas as pd
 
-import scripts.collect_main_seal_pool as pool_module
-from scripts.collect_main_seal_pool import (
+import scripts.pool.collect_main_seal_pool as pool_module
+from scripts.pool.collect_main_seal_pool import (
     PoolCandidate,
     collect_once,
     collect_from_iwencai,

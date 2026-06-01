@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from scripts.run_main_seal_follow_managed_session import build_managed_settings, build_parser
+from scripts.run.run_main_seal_follow_managed_session import build_managed_settings, build_parser
 
 
 def test_managed_session_build_settings_uses_separate_strategy_start_time(tmp_path: Path):
@@ -24,3 +24,4 @@ def test_managed_session_build_settings_uses_separate_strategy_start_time(tmp_pa
     assert settings.SESSION_START_TIME == "09:15"
     assert settings.SESSION_EXIT_TIME == "10:00"
     assert settings.RUNTIME_HEARTBEAT_INTERVAL_SEC == 20
+    assert settings.LOAD_PREVIOUS_STATE_ON_START is False

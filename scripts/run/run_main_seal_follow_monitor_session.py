@@ -20,15 +20,15 @@ from pathlib import Path
 os.environ.setdefault("PYTHONUTF8", "1")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import Settings
 from core.trading_calendar import is_market_day
 from monitor.logger import get_log_file_path, get_logger
-from scripts.collect_main_seal_pool import DEFAULT_OUTPUT, DEFAULT_SOURCE_CONFIG, build_parser as build_pool_parser, collect_once
-from scripts.run_main_seal_follow_market_only import run_market_only
+from scripts.pool.collect_main_seal_pool import DEFAULT_OUTPUT, DEFAULT_SOURCE_CONFIG, build_parser as build_pool_parser, collect_once
+from scripts.run.run_main_seal_follow_market_only import run_market_only
 
 SESSION_EVENT_PREFIX = "MONITOR_SESSION"
 
@@ -87,6 +87,7 @@ def build_monitor_settings(args: argparse.Namespace) -> Settings:
         "LOG_SUMMARY_MODE": not bool(args.full_console),
         "SESSION_START_TIME": resolve_runtime_start_time(args),
         "SESSION_EXIT_TIME": str(args.stop_time),
+        "LOAD_PREVIOUS_STATE_ON_START": False,
     }
     if int(args.heartbeat_interval_sec) > 0:
         overrides["RUNTIME_HEARTBEAT_INTERVAL_SEC"] = int(args.heartbeat_interval_sec)

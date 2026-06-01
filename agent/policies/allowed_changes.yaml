@@ -4,8 +4,8 @@ allowed_paths:
     - agent/
     - docs/
     - tests/
-    - scripts/run_main_seal_follow_monitor_session.py
-    - scripts/run_main_seal_follow_market_only.py
+    - scripts/run/run_main_seal_follow_monitor_session.py
+    - scripts/run/run_main_seal_follow_market_only.py
     - strategy/main_seal_follow_strategy.py
   replay:
     - agent/

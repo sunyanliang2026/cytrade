@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from main import _log_runtime_startup_config, _start_runtime_heartbeat, build_app
+from config.settings import Settings
 from monitor.logger import get_log_file_path, get_logger
 from strategy.main_seal_follow_strategy import MainSealFollowStrategy
 
@@ -48,6 +49,11 @@ def run_market_only(
     session_event_prefix: str = "",
     stop_reason: str = "scheduled_stop",
 ) -> None:
+    if settings is None:
+        settings = Settings(LOAD_PREVIOUS_STATE_ON_START=False)
+    else:
+        settings.LOAD_PREVIOUS_STATE_ON_START = False
+
     if settings is not None:
         _apply_runtime_settings(settings)
 
