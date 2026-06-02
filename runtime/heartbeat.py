@@ -22,7 +22,7 @@ def start_runtime_heartbeat(ctx: dict, stop_event: threading.Event, mode: str) -
     data_sub = ctx["data_sub"]
     conn_mgr = ctx.get("conn_mgr")
     interval = max(5, int(getattr(settings, "RUNTIME_HEARTBEAT_INTERVAL_SEC", 30) or 30))
-    stable_repeat = 4
+    stable_repeat = max(1, int(getattr(settings, "RUNTIME_HEARTBEAT_STABLE_REPEAT", 4) or 4))
 
     def _loop() -> None:
         last_signature = None

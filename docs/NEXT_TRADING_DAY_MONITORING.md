@@ -31,6 +31,9 @@ Useful switches:
 - `--full-console`: disable summary mode and print all console logs.
 - `--strict-sources`: fail the run if any configured stock-pool source fails.
 - `--no-post-review`: skip automatic post-session review generation.
+- `--heartbeat-interval-sec 30`: heartbeat check interval.
+- `--heartbeat-stable-repeat 10`: only repeat unchanged heartbeat every 10 checks,
+  about 5 minutes with the default interval.
 
 Windows scheduled task helper:
 
@@ -81,6 +84,13 @@ Key replay markers in logs:
 - `MSF_EVENT {"event":"dry_run_probe_trade_recorded", ...}`
 - `[ORDER] [TRADE] [MOCK] observation filled ...`
 - `MONITOR_SESSION session_stop ...`
+
+Runtime log noise policy:
+
+- State changes still emit heartbeat immediately.
+- Stable heartbeat defaults to about once every 5 minutes in the monitoring
+  wrapper.
+- `MSF_EVENT`, `[ORDER]`, and `[TRADE]` remain the primary replay markers.
 
 For the first real trading-day run, see
 `docs/NEXT_TRADING_DAY_OBSERVATION_CHECKLIST.md`.

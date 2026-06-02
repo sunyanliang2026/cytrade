@@ -41,6 +41,7 @@ def test_monitor_session_build_monitor_settings_forces_dry_run(tmp_path: Path):
     assert settings.LOG_SUMMARY_MODE is True
     assert settings.SESSION_START_TIME == "09:15"
     assert settings.RUNTIME_HEARTBEAT_INTERVAL_SEC == 15
+    assert settings.RUNTIME_HEARTBEAT_STABLE_REPEAT == 10
     assert settings.SESSION_EXIT_TIME == "10:00"
     assert settings.LOAD_PREVIOUS_STATE_ON_START is False
 
@@ -51,7 +52,23 @@ def test_monitor_session_defaults_to_separated_times():
     assert args.pool_time == "08:50"
     assert args.strategy_start_time == "09:15"
     assert args.stop_time == "11:00"
+    assert args.heartbeat_stable_repeat == 10
     assert args.no_post_review is False
+
+
+def test_monitor_session_can_override_heartbeat_stable_repeat(tmp_path: Path):
+    args = build_parser().parse_args(
+        [
+            "--pool-output",
+            str(tmp_path / "pool.csv"),
+            "--heartbeat-stable-repeat",
+            "3",
+        ]
+    )
+
+    settings = build_monitor_settings(args)
+
+    assert settings.RUNTIME_HEARTBEAT_STABLE_REPEAT == 3
 
 
 def test_monitor_session_build_pool_args_uses_wrapper_options(tmp_path: Path):

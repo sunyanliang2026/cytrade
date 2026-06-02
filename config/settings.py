@@ -214,6 +214,7 @@ class Settings:
     LOG_LEVEL: str = _env_str("LOG_LEVEL", "INFO")                    # INFO / DEBUG
     LOG_SUMMARY_MODE: bool = _env_bool("LOG_SUMMARY_MODE", False)             # True=仅打印成交与下单摘要
     RUNTIME_HEARTBEAT_INTERVAL_SEC: int = _setting_int("RUNTIME_HEARTBEAT_INTERVAL_SEC", 30)
+    RUNTIME_HEARTBEAT_STABLE_REPEAT: int = _setting_int("RUNTIME_HEARTBEAT_STABLE_REPEAT", 4)
 
     # ---- 持仓管理 ----
     COST_METHOD: str = _env_str("COST_METHOD", "moving_average")        # moving_average / fifo

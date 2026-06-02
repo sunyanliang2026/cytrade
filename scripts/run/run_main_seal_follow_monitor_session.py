@@ -92,6 +92,8 @@ def build_monitor_settings(args: argparse.Namespace) -> Settings:
     }
     if int(args.heartbeat_interval_sec) > 0:
         overrides["RUNTIME_HEARTBEAT_INTERVAL_SEC"] = int(args.heartbeat_interval_sec)
+    if int(args.heartbeat_stable_repeat) > 0:
+        overrides["RUNTIME_HEARTBEAT_STABLE_REPEAT"] = int(args.heartbeat_stable_repeat)
     return Settings(**overrides)
 
 
@@ -218,6 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amount", type=float, default=50000.0, help="Planned amount per stock in the output CSV.")
     parser.add_argument("--max-count", type=int, default=0, help="Maximum stock count, 0 means unlimited.")
     parser.add_argument("--heartbeat-interval-sec", type=int, default=30)
+    parser.add_argument("--heartbeat-stable-repeat", type=int, default=10, help="Stable heartbeat repeat count. Default 10 means about 5 minutes when interval is 30s.")
     parser.add_argument("--strict-sources", action="store_true")
     parser.add_argument("--no-backup", action="store_true")
     parser.add_argument("--skip-pool-collect", action="store_true", help="Skip auto collection and reuse the existing pool CSV.")
