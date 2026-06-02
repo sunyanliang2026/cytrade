@@ -53,5 +53,5 @@ py-modules = ["main", "date", "conftest"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent*", "config*", "core*", "data*", "monitor*", "position*", "strategy*", "trading*", "web*"]
+include = ["agent*", "config*", "core*", "data*", "monitor*", "position*", "runtime*", "strategy*", "trading*", "web*"]
 exclude = ["tests*"]

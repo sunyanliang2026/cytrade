@@ -1,43 +1,41 @@
-"""cytrade 主程序入口。
+﻿"""cytrade 涓荤▼搴忓叆鍙ｃ€?
 
-本文件不负责承载具体交易策略逻辑，而是负责把系统按“可运行”的方式组装起来。
-当前主程序采用“两层运行模型”：
+鏈枃浠朵笉璐熻矗鎵胯浇鍏蜂綋浜ゆ槗绛栫暐閫昏緫锛岃€屾槸璐熻矗鎶婄郴缁熸寜鈥滃彲杩愯鈥濈殑鏂瑰紡缁勮璧锋潵銆?
+褰撳墠涓荤▼搴忛噰鐢ㄢ€滀袱灞傝繍琛屾ā鍨嬧€濓細
 
-1. 父进程：
-    - 常驻运行。
-    - 使用 `BlockingScheduler` 维护日级计划任务。
-    - 到达设定时刻后，通过 `ProcessPoolExecutor` 启动独立子进程。
+1. 鐖惰繘绋嬶細
+    - 甯搁┗杩愯銆?
+    - 浣跨敤 `BlockingScheduler` 缁存姢鏃ョ骇璁″垝浠诲姟銆?
+    - 鍒拌揪璁惧畾鏃跺埢鍚庯紝閫氳繃 `ProcessPoolExecutor` 鍚姩鐙珛瀛愯繘绋嬨€?
 
-2. 子进程：
-    - 承担一次完整的交易日会话。
-    - 在该进程内完成 QMT 连接、行情订阅、策略恢复与运行、Web 服务、看门狗等全部工作。
-    - 收盘后保存状态并主动退出，从而释放进程资源。
+2. 瀛愯繘绋嬶細
+    - 鎵挎媴涓€娆″畬鏁寸殑浜ゆ槗鏃ヤ細璇濄€?
+    - 鍦ㄨ杩涚▼鍐呭畬鎴?QMT 杩炴帴銆佽鎯呰闃呫€佺瓥鐣ユ仮澶嶄笌杩愯銆乄eb 鏈嶅姟銆佺湅闂ㄧ嫍绛夊叏閮ㄥ伐浣溿€?
+    - 鏀剁洏鍚庝繚瀛樼姸鎬佸苟涓诲姩閫€鍑猴紝浠庤€岄噴鏀捐繘绋嬭祫婧愩€?
 
-之所以使用这种结构，是为了把“长期常驻调度”与“日内交易会话”解耦：
+涔嬫墍浠ヤ娇鐢ㄨ繖绉嶇粨鏋勶紝鏄负浜嗘妸鈥滈暱鏈熷父椹昏皟搴︹€濅笌鈥滄棩鍐呬氦鏄撲細璇濃€濊В鑰︼細
 
-- 父进程只做轻量调度，不持有交易连接和行情资源。
-- 子进程只负责单次交易日会话，结束后整体退出，避免残留线程、连接或内存状态跨天累积。
-- 若子进程因异常退出，不会直接污染父进程调度器，可在下一次计划任务时重新拉起。
+- 鐖惰繘绋嬪彧鍋氳交閲忚皟搴︼紝涓嶆寔鏈変氦鏄撹繛鎺ュ拰琛屾儏璧勬簮銆?
+- 瀛愯繘绋嬪彧璐熻矗鍗曟浜ゆ槗鏃ヤ細璇濓紝缁撴潫鍚庢暣浣撻€€鍑猴紝閬垮厤娈嬬暀绾跨▼銆佽繛鎺ユ垨鍐呭瓨鐘舵€佽法澶╃疮绉€?
+- 鑻ュ瓙杩涚▼鍥犲紓甯搁€€鍑猴紝涓嶄細鐩存帴姹℃煋鐖惰繘绋嬭皟搴﹀櫒锛屽彲鍦ㄤ笅涓€娆¤鍒掍换鍔℃椂閲嶆柊鎷夎捣銆?
 
-阅读本文件时，建议按如下顺序理解：
+闃呰鏈枃浠舵椂锛屽缓璁寜濡備笅椤哄簭鐞嗚В锛?
 
-1. `build_app()`：理解子进程内部有哪些模块、如何装配。
-2. `_run_managed_session()`：理解单次交易日会话在子进程中如何完整运行。
-3. `run_daily_session()`：理解一次会话的日历与时间控制。
-4. `_launch_session_in_process()`：理解父进程如何为单次会话创建独立子进程。
-5. `run_scheduler_service()`：理解父进程如何长期调度整个系统。
+1. `build_app()`锛氱悊瑙ｅ瓙杩涚▼鍐呴儴鏈夊摢浜涙ā鍧椼€佸浣曡閰嶃€?
+2. `_run_managed_session()`锛氱悊瑙ｅ崟娆′氦鏄撴棩浼氳瘽鍦ㄥ瓙杩涚▼涓浣曞畬鏁磋繍琛屻€?
+3. `run_daily_session()`锛氱悊瑙ｄ竴娆′細璇濈殑鏃ュ巻涓庢椂闂存帶鍒躲€?
+4. `_launch_session_in_process()`锛氱悊瑙ｇ埗杩涚▼濡備綍涓哄崟娆′細璇濆垱寤虹嫭绔嬪瓙杩涚▼銆?
+5. `run_scheduler_service()`锛氱悊瑙ｇ埗杩涚▼濡備綍闀挎湡璋冨害鏁翠釜绯荤粺銆?
 """
 import sys
-import importlib
 import os
 import signal
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
-from typing import Iterable
 
-# 确保项目根目录在 sys.path
+# 纭繚椤圭洰鏍圭洰褰曞湪 sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config.xtquant_bootstrap import bootstrap_xtquant_sys_path
@@ -57,70 +55,60 @@ from trading.executor import TradeExecutor
 from position.manager import PositionManager
 from strategy.runner import StrategyRunner
 from monitor.watchdog import Watchdog
+from runtime.heartbeat import format_dt as _format_dt
+from runtime.heartbeat import start_runtime_heartbeat as _start_runtime_heartbeat
+from runtime import accounts as _runtime_accounts
+from runtime import session as _runtime_session
+from runtime import strategies as _runtime_strategies
 
 
 def _to_strategy_spec(strategy_class_or_spec) -> str:
-    """把策略类或文本描述统一转换为可跨进程传输的导入路径。"""
-    if isinstance(strategy_class_or_spec, str):
-        return strategy_class_or_spec
-
-    module_name = getattr(strategy_class_or_spec, "__module__", "")
-    qualname = getattr(strategy_class_or_spec, "__name__", "")
-    if not module_name or not qualname:
-        raise ValueError(f"无法序列化策略定义: {strategy_class_or_spec!r}")
-    return f"{module_name}:{qualname}"
+    return _runtime_strategies.to_strategy_spec(strategy_class_or_spec)
 
 
 def _normalize_strategy_specs(strategy_classes=None) -> list[str]:
-    """把策略定义列表标准化成 ``module:Class`` 形式。"""
-    return [_to_strategy_spec(item) for item in (strategy_classes or [])]
+    return _runtime_strategies.normalize_strategy_specs(strategy_classes)
 
 
-def _resolve_strategy_specs(strategy_specs: Iterable[str]) -> list[type]:
-    """把 ``module:Class`` 文本描述解析成真实策略类对象。"""
-    resolved = []
-    for spec in strategy_specs:
-        module_name, class_name = str(spec).split(":", 1)
-        module = importlib.import_module(module_name)
-        resolved.append(getattr(module, class_name))
-    return resolved
+def _resolve_strategy_specs(strategy_specs) -> list[type]:
+    return _runtime_strategies.resolve_strategy_specs(strategy_specs)
 
 
 def build_app(strategy_classes=None, settings: Settings = None):
-    """构建并连接所有核心模块。
+    """鏋勫缓骞惰繛鎺ユ墍鏈夋牳蹇冩ā鍧椼€?
 
-    这是整个程序的“装配函数”，只负责依赖注入和对象连接，
-    不负责真正进入运行循环。
+    杩欐槸鏁翠釜绋嬪簭鐨勨€滆閰嶅嚱鏁扳€濓紝鍙礋璐ｄ緷璧栨敞鍏ュ拰瀵硅薄杩炴帴锛?
+    涓嶈礋璐ｇ湡姝ｈ繘鍏ヨ繍琛屽惊鐜€?
 
     Args:
-        strategy_classes: 需要托管的策略类列表。
-        settings: 可选配置对象；不传时使用默认配置。
+        strategy_classes: 闇€瑕佹墭绠＄殑绛栫暐绫诲垪琛ㄣ€?
+        settings: 鍙€夐厤缃璞★紱涓嶄紶鏃朵娇鐢ㄩ粯璁ら厤缃€?
 
     Returns:
-        一个包含所有核心模块实例的字典，便于测试和主程序复用。
+        涓€涓寘鍚墍鏈夋牳蹇冩ā鍧楀疄渚嬬殑瀛楀吀锛屼究浜庢祴璇曞拰涓荤▼搴忓鐢ㄣ€?
 
-    运行说明：
-        这个函数可以理解为“交易子进程内部的容器装配阶段”。它会依次完成：
+    杩愯璇存槑锛?
+        杩欎釜鍑芥暟鍙互鐞嗚В涓衡€滀氦鏄撳瓙杩涚▼鍐呴儴鐨勫鍣ㄨ閰嶉樁娈碘€濄€傚畠浼氫緷娆″畬鎴愶細
 
-        1. 初始化日志系统，确保后续运行日志有稳定输出。
-        2. 初始化数据管理器，准备 SQLite、状态快照目录和可选远程同步能力。
-        3. 初始化费率配置，统一交易费用计算规则。
-        4. 初始化连接管理器，为后续 QMT 连接和重连提供统一入口。
-        5. 初始化订单管理器、持仓管理器、交易执行器。
-        6. 建立回调链路：柜台回报 -> 订单 -> 持仓/策略。
-        7. 初始化行情订阅管理器。
-        8. 初始化策略运行器，并注入状态恢复、账户预检查和延迟监控能力。
-        9. 初始化看门狗，并把心跳与告警回调挂到策略运行器上。
+        1. 鍒濆鍖栨棩蹇楃郴缁燂紝纭繚鍚庣画杩愯鏃ュ織鏈夌ǔ瀹氳緭鍑恒€?
+        2. 鍒濆鍖栨暟鎹鐞嗗櫒锛屽噯澶?SQLite銆佺姸鎬佸揩鐓х洰褰曞拰鍙€夎繙绋嬪悓姝ヨ兘鍔涖€?
+        3. 鍒濆鍖栬垂鐜囬厤缃紝缁熶竴浜ゆ槗璐圭敤璁＄畻瑙勫垯銆?
+        4. 鍒濆鍖栬繛鎺ョ鐞嗗櫒锛屼负鍚庣画 QMT 杩炴帴鍜岄噸杩炴彁渚涚粺涓€鍏ュ彛銆?
+        5. 鍒濆鍖栬鍗曠鐞嗗櫒銆佹寔浠撶鐞嗗櫒銆佷氦鏄撴墽琛屽櫒銆?
+        6. 寤虹珛鍥炶皟閾捐矾锛氭煖鍙板洖鎶?-> 璁㈠崟 -> 鎸佷粨/绛栫暐銆?
+        7. 鍒濆鍖栬鎯呰闃呯鐞嗗櫒銆?
+        8. 鍒濆鍖栫瓥鐣ヨ繍琛屽櫒锛屽苟娉ㄥ叆鐘舵€佹仮澶嶃€佽处鎴烽妫€鏌ュ拰寤惰繜鐩戞帶鑳藉姏銆?
+        9. 鍒濆鍖栫湅闂ㄧ嫍锛屽苟鎶婂績璺充笌鍛婅鍥炶皟鎸傚埌绛栫暐杩愯鍣ㄤ笂銆?
 
-        注意：
-        - 这里只完成“对象装配”，不会真正连接 QMT，也不会启动订阅和策略运行。
-        - 真正的启动动作发生在 `_run_managed_session()` 中。
+        娉ㄦ剰锛?
+        - 杩欓噷鍙畬鎴愨€滃璞¤閰嶁€濓紝涓嶄細鐪熸杩炴帴 QMT锛屼篃涓嶄細鍚姩璁㈤槄鍜岀瓥鐣ヨ繍琛屻€?
+        - 鐪熸鐨勫惎鍔ㄥ姩浣滃彂鐢熷湪 `_run_managed_session()` 涓€?
     """
     settings = settings or Settings()
-    # 先准备运行目录，避免后续日志、数据库、状态文件写入失败。
+    # 鍏堝噯澶囪繍琛岀洰褰曪紝閬垮厤鍚庣画鏃ュ織銆佹暟鎹簱銆佺姸鎬佹枃浠跺啓鍏ュけ璐ャ€?
     settings.ensure_dirs()
 
-    # ---- 日志 ----
+    # ---- 鏃ュ織 ----
     log_mgr = LogManager(
         log_dir=settings.LOG_DIR,
         max_days=settings.LOG_MAX_DAYS,
@@ -129,11 +117,11 @@ def build_app(strategy_classes=None, settings: Settings = None):
     )
     logger = get_logger("system")
     logger.info("=" * 50)
-    logger.info("cytrade 启动")
+    logger.info("cytrade 鍚姩")
     if XTQUANT_BOOTSTRAP_ROOT:
         logger.info("cytrade: xtquant root=%s", XTQUANT_BOOTSTRAP_ROOT)
 
-    # ---- 数据管理 ----
+    # ---- 鏁版嵁绠＄悊 ----
     data_mgr = DataManager(
         db_path=settings.SQLITE_DB_PATH,
         state_dir=settings.STATE_SAVE_DIR,
@@ -142,7 +130,7 @@ def build_app(strategy_classes=None, settings: Settings = None):
     if settings.ENABLE_REMOTE_DB:
         data_mgr.set_remote_enabled(True)
 
-    # ``fee_schedule`` 统一封装买卖佣金、印花税和 T+0 属性判断。
+    # ``fee_schedule`` 缁熶竴灏佽涔板崠浣ｉ噾銆佸嵃鑺辩◣鍜?T+0 灞炴€у垽鏂€?
     fee_schedule = FeeSchedule(
         file_path=settings.FEE_TABLE_PATH,
         default_buy_fee_rate=settings.DEFAULT_BUY_FEE_RATE,
@@ -150,7 +138,7 @@ def build_app(strategy_classes=None, settings: Settings = None):
         default_stamp_tax_rate=settings.DEFAULT_STAMP_TAX_RATE,
     )
 
-    # ---- 交易连接 ----
+    # ---- 浜ゆ槗杩炴帴 ----
     conn_mgr = ConnectionManager(
         qmt_path=settings.QMT_PATH,
         account_id=settings.ACCOUNT_ID,
@@ -161,20 +149,20 @@ def build_app(strategy_classes=None, settings: Settings = None):
                      if settings.RECONNECT_MAX_RETRIES > 0 else None),
     )
 
-    # ---- 订单管理 ----
+    # ---- 璁㈠崟绠＄悊 ----
     order_mgr = OrderManager(data_manager=data_mgr, fee_schedule=fee_schedule)
 
-    # ---- 持仓管理 ----
+    # ---- 鎸佷粨绠＄悊 ----
     pos_mgr = PositionManager(
         cost_method=settings.COST_METHOD,
         data_manager=data_mgr,
         fee_schedule=fee_schedule,
     )
 
-    # ---- 注册回调链：成交 → 持仓 ----
+    # ---- 娉ㄥ唽鍥炶皟閾撅細鎴愪氦 鈫?鎸佷粨 ----
     order_mgr.set_position_callback(pos_mgr.on_trade_callback)
 
-    # ---- 交易执行器 ----
+    # ---- 浜ゆ槗鎵ц鍣?----
     trade_exec = TradeExecutor(
         conn_mgr,
         order_mgr,
@@ -182,21 +170,21 @@ def build_app(strategy_classes=None, settings: Settings = None):
         live_trading_enabled=not bool(settings.CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN),
     )
 
-    # ---- XtQuant 回调 ----
+    # ---- XtQuant 鍥炶皟 ----
     callback = MyXtQuantTraderCallback(
         order_manager=order_mgr,
         connection_manager=conn_mgr,
     )
     conn_mgr.register_callback(callback)
 
-    # ---- 数据订阅 ----
-    # 行情订阅模块与交易连接模块解耦，便于重连后独立恢复订阅。
+    # ---- 鏁版嵁璁㈤槄 ----
+    # 琛屾儏璁㈤槄妯″潡涓庝氦鏄撹繛鎺ユā鍧楄В鑰︼紝渚夸簬閲嶈繛鍚庣嫭绔嬫仮澶嶈闃呫€?
     data_sub = DataSubscriptionManager(
         latency_threshold_sec=settings.DATA_LATENCY_THRESHOLD_SEC,
         default_period=settings.SUBSCRIPTION_PERIOD,
     )
 
-    # ---- 策略运行 ----
+    # ---- 绛栫暐杩愯 ----
     runner = StrategyRunner(
         data_subscription=data_sub,
         trade_executor=trade_exec,
@@ -210,15 +198,15 @@ def build_app(strategy_classes=None, settings: Settings = None):
         process_threshold_ms=settings.STRATEGY_PROCESS_THRESHOLD_MS,
     )
 
-    # 注册“订单状态变化 -> 策略对象”的回调。
-    # 这样策略才能在成交、撤单、废单后及时更新自己的内部状态。
+    # 娉ㄥ唽鈥滆鍗曠姸鎬佸彉鍖?-> 绛栫暐瀵硅薄鈥濈殑鍥炶皟銆?
+    # 杩欐牱绛栫暐鎵嶈兘鍦ㄦ垚浜ゃ€佹挙鍗曘€佸簾鍗曞悗鍙婃椂鏇存柊鑷繁鐨勫唴閮ㄧ姸鎬併€?
     order_mgr.set_strategy_callback(runner.dispatch_order_update)
 
-    # 网络断开后，连接模块会负责重连；
-    # 这里再把“重连成功后的补偿动作”挂进去，自动恢复行情订阅。
+    # 缃戠粶鏂紑鍚庯紝杩炴帴妯″潡浼氳礋璐ｉ噸杩烇紱
+    # 杩欓噷鍐嶆妸鈥滈噸杩炴垚鍔熷悗鐨勮ˉ鍋垮姩浣溾€濇寕杩涘幓锛岃嚜鍔ㄦ仮澶嶈鎯呰闃呫€?
     conn_mgr.register_reconnect_callback(data_sub.resubscribe_all)
 
-    # ---- 看门狗 ----
+    # ---- 鐪嬮棬鐙?----
     watchdog = Watchdog(
         interval_sec=settings.WATCHDOG_INTERVAL_SEC,
         dingtalk_webhook=settings.DINGTALK_WEBHOOK_URL,
@@ -231,13 +219,13 @@ def build_app(strategy_classes=None, settings: Settings = None):
         data_subscription=data_sub,
     )
 
-    # 行情到达时刷新看门狗心跳
+    # 琛屾儏鍒拌揪鏃跺埛鏂扮湅闂ㄧ嫍蹇冭烦
     runner.set_heartbeat_callback(watchdog.register_heartbeat)
     runner.set_alert_callback(watchdog.send_dingtalk_alert)
 
-    # 返回装配好的上下文，方便：
-    # 1. `run()` 直接复用。
-    # 2. 测试代码精确断言模块装配关系。
+    # 杩斿洖瑁呴厤濂界殑涓婁笅鏂囷紝鏂逛究锛?
+    # 1. `run()` 鐩存帴澶嶇敤銆?
+    # 2. 娴嬭瘯浠ｇ爜绮剧‘鏂█妯″潡瑁呴厤鍏崇郴銆?
     return {
         "settings": settings,
         "log_mgr": log_mgr,
@@ -254,763 +242,117 @@ def build_app(strategy_classes=None, settings: Settings = None):
     }
 
 
-def _format_dt(value) -> str:
-    if not value:
-        return ""
-    formatter = getattr(value, "strftime", None)
-    if callable(formatter):
-        return value.strftime("%Y-%m-%d %H:%M:%S")
-    return str(value)
 
 
 def _log_runtime_startup_config(settings: Settings, conn_mgr: ConnectionManager, mode: str) -> None:
-    logger = get_logger("system")
-    conn_cfg = conn_mgr.get_startup_config() if hasattr(conn_mgr, "get_startup_config") else {}
-    logger.info(
-        "Runtime startup mode=%s dry_run=%s qmt_path=%s account_id=%s account_type=%s",
-        mode,
-        bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True)),
-        conn_cfg.get("qmt_path", getattr(settings, "QMT_PATH", "")),
-        conn_cfg.get("account_id", getattr(settings, "ACCOUNT_ID", "")),
-        conn_cfg.get("account_type", getattr(settings, "ACCOUNT_TYPE", "")),
-    )
+    return _runtime_accounts.log_runtime_startup_config(settings, conn_mgr, mode)
 
 
 def _log_connection_failure(conn_mgr: ConnectionManager, mode: str) -> None:
-    logger = get_logger("system")
-    last_error = conn_mgr.get_last_error() if hasattr(conn_mgr, "get_last_error") else {}
-    logger.error(
-        "Runtime startup blocked mode=%s live_trading_allowed=false stage=%s account_id=%s account_type=%s qmt_path=%s return_code=%s error=%s",
-        mode,
-        last_error.get("stage", "connect"),
-        last_error.get("account_id", ""),
-        last_error.get("account_type", ""),
-        last_error.get("qmt_path", ""),
-        last_error.get("return_code", ""),
-        last_error.get("error", ""),
-    )
+    return _runtime_accounts.log_connection_failure(conn_mgr, mode)
 
 
 def _is_dry_run(settings: Settings) -> bool:
-    return bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True))
+    return _runtime_accounts.is_dry_run(settings)
 
 
 def _sync_account_after_connection_recovered(ctx: dict, mode: str) -> None:
-    """Run account-dependent sync once after delayed account login succeeds."""
-    logger = get_logger("system")
-    runner = ctx.get("runner")
-    if not runner or not hasattr(runner, "sync_orders_and_trades_once"):
-        return
-
-    try:
-        summary = runner.sync_orders_and_trades_once(reason="account_recovered")
-        logger.info("Runtime account recovery sync mode=%s summary=%s", mode, summary)
-    except Exception as exc:
-        logger.error("Runtime account recovery sync failed mode=%s error=%s", mode, exc, exc_info=True)
+    return _runtime_accounts.sync_account_after_connection_recovered(ctx, mode)
 
 
 def _start_account_connection_retry(ctx: dict, stop_event: threading.Event, mode: str) -> threading.Thread:
-    """Retry account connection in the background for dry-run monitoring sessions."""
-    logger = get_logger("system")
-    settings = ctx["settings"]
-    conn_mgr = ctx["conn_mgr"]
-    retry_interval = max(15, int(getattr(settings, "RUNTIME_HEARTBEAT_INTERVAL_SEC", 30) or 30))
-
-    def _loop() -> None:
-        attempt = 0
-        while not stop_event.wait(retry_interval):
-            if conn_mgr.is_trading_ready():
-                logger.info(
-                    "Runtime account retry stopped mode=%s reason=already_ready account_id=%s",
-                    mode,
-                    getattr(settings, "ACCOUNT_ID", ""),
-                )
-                return
-
-            attempt += 1
-            last_error = conn_mgr.get_last_error() if hasattr(conn_mgr, "get_last_error") else {}
-            logger.warning(
-                (
-                    "Runtime account retry attempt mode=%s attempt=%d dry_run=%s "
-                    "account_id=%s account_type=%s stage=%s return_code=%s error=%s"
-                ),
-                mode,
-                attempt,
-                _is_dry_run(settings),
-                getattr(settings, "ACCOUNT_ID", ""),
-                getattr(settings, "ACCOUNT_TYPE", ""),
-                last_error.get("stage", ""),
-                last_error.get("return_code", ""),
-                last_error.get("error", ""),
-            )
-
-            if conn_mgr.connect():
-                logger.info(
-                    "Runtime account recovered mode=%s attempt=%d account_id=%s account_type=%s trading_ready=%s",
-                    mode,
-                    attempt,
-                    getattr(settings, "ACCOUNT_ID", ""),
-                    getattr(settings, "ACCOUNT_TYPE", ""),
-                    conn_mgr.is_trading_ready(),
-                )
-                _sync_account_after_connection_recovered(ctx, mode=mode)
-                return
-
-            _log_connection_failure(conn_mgr, mode=mode)
-
-    thread = threading.Thread(target=_loop, daemon=True, name=f"account-retry-{mode}")
-    thread.start()
-    return thread
-
-
-def _connect_account_for_runtime(ctx: dict, mode: str, stop_event: threading.Event | None = None) -> bool:
-    """Connect the trading account; dry-run can continue and retry if unavailable."""
-    logger = get_logger("system")
-    settings = ctx["settings"]
-    conn_mgr = ctx["conn_mgr"]
-    dry_run = _is_dry_run(settings)
-
-    _log_runtime_startup_config(settings, conn_mgr, mode=mode)
-    if conn_mgr.connect():
-        return _validate_live_trading_preflight(ctx, mode=mode)
-
-    _log_connection_failure(conn_mgr, mode=mode)
-    if not dry_run:
-        logger.error("Unable to connect QMT; live trading is disabled and runtime exits")
-        return False
-
-    logger.warning(
-        (
-            "Runtime account unavailable at startup mode=%s dry_run=%s action=continue_market_monitor_and_retry "
-            "account_id=%s account_type=%s"
-        ),
+    return _runtime_accounts.start_account_connection_retry(
+        ctx,
+        stop_event,
         mode,
-        dry_run,
-        getattr(settings, "ACCOUNT_ID", ""),
-        getattr(settings, "ACCOUNT_TYPE", ""),
+        sync_fn=_sync_account_after_connection_recovered,
+        log_failure_fn=_log_connection_failure,
     )
-    if stop_event is not None:
-        _start_account_connection_retry(ctx, stop_event, mode=mode)
-    return True
 
 
 def _validate_live_trading_preflight(ctx: dict, mode: str) -> bool:
-    """Block live runtime unless the final trading guard is fully ready."""
-    logger = get_logger("system")
-    settings = ctx["settings"]
-    dry_run = bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True))
-    trade_exec = ctx.get("trade_exec")
-    status = (
-        trade_exec.get_live_guard_status()
-        if trade_exec and hasattr(trade_exec, "get_live_guard_status")
-        else {}
-    )
-    last_error = status.get("last_error") or {}
-    logger.info(
-        (
-            "Live trading preflight mode=%s dry_run=%s live_enabled=%s "
-            "xtquant_available=%s has_trader=%s has_account=%s trading_ready=%s "
-            "stage=%s return_code=%s error=%s"
-        ),
+    return _runtime_accounts.validate_live_trading_preflight(ctx, mode)
+
+
+def _connect_account_for_runtime(ctx: dict, mode: str, stop_event: threading.Event | None = None) -> bool:
+    return _runtime_accounts.connect_account_for_runtime(
+        ctx,
         mode,
-        dry_run,
-        status.get("live_trading_enabled", False),
-        status.get("xtquant_available", False),
-        status.get("has_trader", False),
-        status.get("has_account", False),
-        status.get("trading_ready", False),
-        last_error.get("stage", ""),
-        last_error.get("return_code", ""),
-        last_error.get("error", ""),
+        stop_event,
+        start_retry_fn=_start_account_connection_retry,
+        validate_fn=_validate_live_trading_preflight,
+        log_startup_fn=_log_runtime_startup_config,
+        log_failure_fn=_log_connection_failure,
     )
-    if dry_run:
-        return True
-
-    required = (
-        status.get("live_trading_enabled") is True
-        and status.get("xtquant_available") is True
-        and status.get("has_trader") is True
-        and status.get("has_account") is True
-        and status.get("trading_ready") is True
-    )
-    if not required:
-        logger.error(
-            "Runtime startup blocked mode=%s reason=live_trading_preflight_failed status=%s",
-            mode,
-            status,
-        )
-        return False
-
-    snapshot = (
-        trade_exec.get_live_account_snapshot()
-        if trade_exec and hasattr(trade_exec, "get_live_account_snapshot")
-        else {"asset_available": False}
-    )
-    logger.info(
-        "Live account preflight mode=%s asset_available=%s available_cash=%s total_asset=%s",
-        mode,
-        snapshot.get("asset_available", False),
-        snapshot.get("available_cash", None),
-        snapshot.get("total_asset", None),
-    )
-    if not snapshot.get("asset_available") or snapshot.get("available_cash") is None:
-        logger.error(
-            "Runtime startup blocked mode=%s reason=live_account_asset_unavailable snapshot=%s",
-            mode,
-            snapshot,
-        )
-        return False
-    return True
-
-
-def _start_runtime_heartbeat(ctx: dict, stop_event: threading.Event, mode: str) -> threading.Thread:
-    """Log an operational heartbeat so quiet markets are distinguishable from hangs."""
-    logger = get_logger("system")
-    settings = ctx["settings"]
-    runner = ctx["runner"]
-    data_sub = ctx["data_sub"]
-    conn_mgr = ctx.get("conn_mgr")
-    interval = max(5, int(getattr(settings, "RUNTIME_HEARTBEAT_INTERVAL_SEC", 30) or 30))
-    stable_repeat = 4
-
-    def _loop() -> None:
-        last_signature = None
-        unchanged_count = 0
-        while not stop_event.wait(interval):
-            try:
-                l2_map = data_sub.get_l2_subscription_map()
-                data_status = data_sub.get_latest_data_status()
-                runner_status = runner.get_runtime_status() if hasattr(runner, "get_runtime_status") else {}
-                conn_last_error = conn_mgr.get_last_error() if conn_mgr and hasattr(conn_mgr, "get_last_error") else {}
-                trading_ready = bool(conn_mgr.is_trading_ready()) if conn_mgr and hasattr(conn_mgr, "is_trading_ready") else False
-                signature = (
-                    bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True)),
-                    bool(conn_mgr.is_connected()) if conn_mgr else False,
-                    trading_ready,
-                    conn_last_error.get("stage", ""),
-                    conn_last_error.get("return_code", ""),
-                    runner_status.get("strategy_count", ""),
-                    len(data_sub.get_subscription_list()),
-                    len(l2_map),
-                    sum(len(kinds) for kinds in l2_map.values()),
-                    _format_dt(data_status.get("latest_data_time")),
-                    _format_dt(data_status.get("last_recv_time")),
-                    round(float(data_status.get("data_delay_ms", 0.0) or 0.0), 0),
-                    runner_status.get("last_strategy_event", ""),
-                    _format_dt(runner_status.get("last_strategy_event_time")),
-                )
-                changed = signature != last_signature
-                if changed:
-                    unchanged_count = 0
-                else:
-                    unchanged_count += 1
-
-                if not changed and unchanged_count < stable_repeat:
-                    continue
-
-                heartbeat_reason = "changed" if changed else "stable"
-                stable_for_sec = 0 if changed else unchanged_count * interval
-                logger.info(
-                    (
-                        "Runtime heartbeat mode=%s reason=%s stable_for_sec=%d dry_run=%s connected=%s "
-                        "trading_ready=%s account_stage=%s account_return_code=%s strategies=%s "
-                        "tick_subscriptions=%d l2_stocks=%d l2_kinds=%d latest_data_time=%s "
-                        "last_recv_time=%s data_delay_ms=%.0f last_strategy_event=%s "
-                        "last_strategy_event_time=%s process_ms=%.1f"
-                    ),
-                    mode,
-                    heartbeat_reason,
-                    stable_for_sec,
-                    bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True)),
-                    bool(conn_mgr.is_connected()) if conn_mgr else False,
-                    trading_ready,
-                    conn_last_error.get("stage", ""),
-                    conn_last_error.get("return_code", ""),
-                    runner_status.get("strategy_count", ""),
-                    len(data_sub.get_subscription_list()),
-                    len(l2_map),
-                    sum(len(kinds) for kinds in l2_map.values()),
-                    _format_dt(data_status.get("latest_data_time")),
-                    _format_dt(data_status.get("last_recv_time")),
-                    float(data_status.get("data_delay_ms", 0.0) or 0.0),
-                    runner_status.get("last_strategy_event", ""),
-                    _format_dt(runner_status.get("last_strategy_event_time")),
-                    float(runner_status.get("last_round_total_process_ms", 0.0) or 0.0),
-                )
-                last_signature = signature
-                if not changed:
-                    unchanged_count = 0
-            except Exception as exc:
-                logger.warning("Runtime heartbeat failed mode=%s error=%s", mode, exc)
-
-    thread = threading.Thread(target=_loop, daemon=True, name=f"runtime-heartbeat-{mode}")
-    thread.start()
-    return thread
-
-
-def run(strategy_classes=None, settings: Settings = None):
-    """启动主程序。
-
-    这个函数负责真正运行系统，包括：
-    - 建立 QMT 连接
-    - 启动 Web 服务
-    - 启动看门狗
-    - 启动策略运行器
-    - 启动行情订阅线程
-    - 监听退出信号
-
-    运行说明：
-        这是项目早期的“直接运行模式”。调用它后，当前进程会直接承担所有交易职责。
-        也就是说：
-
-        - 当前进程自己连接 QMT。
-        - 当前进程自己启动行情订阅。
-        - 当前进程自己运行策略和 Web 服务。
-
-        这种模式适合：
-        - 本地快速调试。
-        - 单次手工启动验证。
-
-        但对于长期稳定运行，当前项目更推荐 `run_scheduler_service()`：
-        让父进程只负责调度，把完整交易会话放到独立子进程中执行。
-    """
-    ctx = build_app(strategy_classes, settings)
-    logger = get_logger("system")
-    # 这里把常用模块从上下文字典中取出，
-    # 让后续启动逻辑更直观，也避免频繁写 `ctx[...]`。
-    settings = ctx["settings"]
-    conn_mgr = ctx["conn_mgr"]
-    runner = ctx["runner"]
-    watchdog = ctx["watchdog"]
-    data_sub = ctx["data_sub"]
-
-    # ---- 优雅退出 ----
-    _stop_event = threading.Event()
-
-    def _signal_handler(sig, frame):
-        """统一处理 Ctrl+C / 终止信号，尽量优雅退出。"""
-        logger.info("收到退出信号 (%s)，正在关闭...", sig)
-        runner.stop()
-        watchdog.stop()
-        data_sub.stop()
-        conn_mgr.disconnect()
-        _stop_event.set()
-
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
-
-    # ---- 连接 QMT ----
-    if not _connect_account_for_runtime(ctx, mode="live", stop_event=_stop_event):
-        conn_mgr.disconnect()
-        return
-
-    # ---- Web 服务 ----
-    # Web 层是可选能力，因此这里采用 `try` 包裹，
-    # 避免缺少 FastAPI/uvicorn 时影响核心交易链路启动。
-    try:
-        from web.backend.main import init_app_context, run_server
-        from web.backend import routes as web_routes
-        # 把核心对象注入 Web 层，供 API 路由直接访问。
-        init_app_context(
-            strategy_runner=runner,
-            position_manager=ctx["pos_mgr"],
-            order_manager=ctx["order_mgr"],
-            data_manager=ctx["data_mgr"],
-            connection_manager=conn_mgr,
-            trade_executor=ctx["trade_exec"],
-        )
-        run_server(host=settings.WEB_HOST, port=settings.WEB_PORT)
-        if getattr(web_routes, "_ws_manager", None):
-            # 成交发生后，主动推送给前端，减少轮询压力。
-            ctx["order_mgr"].set_trade_callback(web_routes._ws_manager.notify_trade_update)
-    except Exception as e:
-        logger.warning("Web 服务未启动（可能缺少 fastapi/uvicorn）: %s", e)
-
-    # ---- 看门狗 ----
-    watchdog.start()
-
-    # ---- 策略启动 ----
-    runner.start()
-    watchdog.register_heartbeat("strategy_runner")
-
-    # ``xtdata.run()`` 是阻塞式调用，所以放到子线程里运行。
-    # 主线程只负责等待退出信号，避免主程序被卡死在行情循环里。
-    data_thread = threading.Thread(
-        target=data_sub.start, daemon=True, name="data-sub"
-    )
-    data_thread.start()
-    _start_runtime_heartbeat(ctx, _stop_event, mode="live")
-
-    logger.info("cytrade 运行中。按 Ctrl+C 退出。")
-    _stop_event.wait()
-    logger.info("cytrade 已退出")
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
-    """把 ``HH:MM`` 字符串解析为小时和分钟。"""
-    text = str(value or "").strip()
-    try:
-        hour_str, minute_str = text.split(":", 1)
-        hour = int(hour_str)
-        minute = int(minute_str)
-    except Exception as exc:
-        raise ValueError(f"非法时间格式: {value!r}，必须是 HH:MM") from exc
-
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ValueError(f"非法时间范围: {value!r}")
-    return hour, minute
+    return _runtime_session.parse_hhmm(value)
 
 
 def _build_session_time(anchor: datetime, hhmm: str) -> datetime:
-    """基于指定日期构造会话时间点。"""
-    hour, minute = _parse_hhmm(hhmm)
-    return anchor.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return _runtime_session.build_session_time(anchor, hhmm)
 
 
-def _wait_until_session_start(settings: Settings,
-                              stop_event: threading.Event,
-                              now_provider=None,
-                              sleep_fn=None) -> bool:
-    """等待直到日内会话启动时间。
-
-    Returns:
-        bool: 成功等到启动时刻返回 `True`；若等待过程中收到停止信号则返回 `False`。
-
-    运行说明：
-        这个函数主要用于“手工执行一次日会话”时的时间对齐。
-        如果当前时刻还早于 `SESSION_START_TIME`，函数不会立刻启动交易系统，
-        而是按固定轮询间隔休眠等待，直到满足启动条件。
-
-        这样做可以避免：
-        - 人工在过早时间启动程序后，系统立刻建立不必要的交易连接。
-        - 盘前长时间占用行情/交易资源。
-    """
-    now_provider = now_provider or datetime.now
-    sleep_fn = sleep_fn or time.sleep
-
-    while not stop_event.is_set():
-        now = now_provider()
-        start_at = _build_session_time(now, settings.SESSION_START_TIME)
-        if now >= start_at:
-            return True
-
-        remaining = max(0.0, (start_at - now).total_seconds())
-        wait_seconds = min(max(int(settings.SESSION_POLL_INTERVAL_SEC), 1), remaining)
-        logger = get_logger("system")
-        logger.info("距离会话启动还有 %.0f 秒，继续等待", remaining)
-        sleep_fn(wait_seconds)
-
-    return False
+def _wait_until_session_start(settings: Settings, stop_event: threading.Event, now_provider=None, sleep_fn=None) -> bool:
+    return _runtime_session.wait_until_session_start(settings, stop_event, now_provider, sleep_fn)
 
 
-def _run_managed_session(strategy_classes=None, settings: Settings = None,
-                         now_provider=None, sleep_fn=None):
-    """运行一个完整的交易日会话，并在收盘后自动退出。
-
-    运行说明：
-        这是整个主程序最核心的“子进程交易会话”入口。
-        一旦进入这里，说明当前进程已经被确定为“本次交易日的执行进程”。
-
-        该函数内部会按顺序完成以下步骤：
-
-        1. 调用 `build_app()` 装配所有运行模块。
-        2. 注册进程级退出信号处理器，保证 Ctrl+C / kill 时尽量优雅关闭。
-        3. 建立 QMT 连接；若连接失败则直接结束本次会话。
-        4. 尝试启动 Web 服务，并把核心对象注入 Web 路由层。
-        5. 启动看门狗，使其监控心跳、连接状态和数据接收情况。
-        6. 启动策略运行器：自动恢复状态、执行预检查、订阅策略相关标的。
-        7. 启动行情订阅线程，让 `xtdata.run()` 在后台持续接收行情。
-        8. 启动收盘守护线程，达到 `SESSION_EXIT_TIME` 后统一关闭系统。
-        9. 主线程阻塞等待 `stop_event`，直到收到退出信号或收盘退出条件。
-
-        关闭阶段会统一执行：
-        - `runner.stop()`：保存状态并停止策略。
-        - `watchdog.stop()`：停止后台监控。
-        - `data_sub.stop()`：停止行情订阅循环。
-        - `conn_mgr.disconnect()`：断开 QMT 连接。
-        - `data_mgr.close()`：关闭数据管理器持有的外部资源。
-
-        这样能够确保“一个交易日会话结束 = 一个独立进程彻底结束”，
-        从而减少跨天资源残留问题。
-    """
-    ctx = build_app(strategy_classes, settings)
-    logger = get_logger("system")
-    settings = ctx["settings"]
-    conn_mgr = ctx["conn_mgr"]
-    runner = ctx["runner"]
-    watchdog = ctx["watchdog"]
-    data_sub = ctx["data_sub"]
-    data_mgr = ctx["data_mgr"]
-    now_provider = now_provider or datetime.now
-    sleep_fn = sleep_fn or time.sleep
-
-    stop_event = threading.Event()
-    shutdown_lock = threading.Lock()
-    data_thread = None
-
-    def _shutdown(reason: str) -> None:
-        """统一执行一次幂等关闭，确保资源尽量被释放。"""
-        with shutdown_lock:
-            if stop_event.is_set():
-                return
-            logger.info("cytrade 正在关闭：%s", reason)
-            stop_event.set()
-
-        try:
-            runner.stop()
-        except Exception as exc:
-            logger.error("关闭策略运行器失败: %s", exc, exc_info=True)
-
-        try:
-            watchdog.stop()
-        except Exception as exc:
-            logger.error("关闭看门狗失败: %s", exc, exc_info=True)
-
-        try:
-            data_sub.stop()
-        except Exception as exc:
-            logger.error("停止行情订阅失败: %s", exc, exc_info=True)
-
-        try:
-            conn_mgr.disconnect()
-        except Exception as exc:
-            logger.error("断开交易连接失败: %s", exc, exc_info=True)
-
-        try:
-            data_mgr.close()
-        except Exception as exc:
-            logger.error("关闭数据管理器失败: %s", exc, exc_info=True)
-
-    def _signal_handler(sig, frame):
-        """统一处理 Ctrl+C / 终止信号。"""
-        _shutdown(f"收到退出信号 {sig}")
-
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
-
-    if not _connect_account_for_runtime(ctx, mode="managed", stop_event=stop_event):
-        _shutdown("live 交易启动前置校验失败")
-        return
-
-    try:
-        from web.backend.main import init_app_context, run_server
-        from web.backend import routes as web_routes
-        init_app_context(
-            strategy_runner=runner,
-            position_manager=ctx["pos_mgr"],
-            order_manager=ctx["order_mgr"],
-            data_manager=data_mgr,
-            connection_manager=conn_mgr,
-            trade_executor=ctx["trade_exec"],
-        )
-        run_server(host=settings.WEB_HOST, port=settings.WEB_PORT)
-        if getattr(web_routes, "_ws_manager", None):
-            ctx["order_mgr"].set_trade_callback(web_routes._ws_manager.notify_trade_update)
-    except Exception as e:
-        logger.warning("Web 服务未启动（可能缺少 fastapi/uvicorn）: %s", e)
-
-    watchdog.start()
-    runner.start()
-    watchdog.register_heartbeat("strategy_runner")
-
-    data_thread = threading.Thread(target=data_sub.start, daemon=True, name="data-sub")
-    data_thread.start()
-    _start_runtime_heartbeat(ctx, stop_event, mode="managed")
-
-    def _session_guard() -> None:
-        """监控是否已到收盘退出时间。"""
-        while not stop_event.is_set():
-            now = now_provider()
-            exit_at = _build_session_time(now, settings.SESSION_EXIT_TIME)
-            if now >= exit_at:
-                _shutdown(f"已到收盘退出时间 {settings.SESSION_EXIT_TIME}")
-                return
-            remaining = max(0.0, (exit_at - now).total_seconds())
-            sleep_fn(min(max(int(settings.SESSION_POLL_INTERVAL_SEC), 1), remaining))
-
-    threading.Thread(target=_session_guard, daemon=True, name="session-guard").start()
-
-    logger.info("cytrade 运行中，将在 %s 自动退出。", settings.SESSION_EXIT_TIME)
-    stop_event.wait()
-
-    if data_thread and data_thread.is_alive():
-        data_thread.join(timeout=2)
-
-    logger.info("cytrade 已退出")
+def run(strategy_classes=None, settings: Settings = None):
+    return _runtime_session.run_live(
+        build_app_fn=build_app,
+        connect_account_fn=_connect_account_for_runtime,
+        start_heartbeat_fn=_start_runtime_heartbeat,
+        strategy_classes=strategy_classes,
+        settings=settings,
+    )
 
 
-def run_daily_session(strategy_classes=None, settings: Settings = None,
-                      now_provider=None, sleep_fn=None):
-    """运行一个“交易日会话”。
-
-    该模式面向“每天启动一次，收盘自动退出”的运行方式：
-
-    1. 若当前是非交易日，则直接退出。
-    2. 若当前早于 `SESSION_START_TIME`，则等待到启动时刻。
-    3. 启动后优先恢复当日状态；若没有当日状态，则回退加载上一交易日状态。
-    4. 到达 `SESSION_EXIT_TIME` 后自动保存状态并退出进程。
-
-    运行说明：
-        `run_daily_session()` 可以理解为“单次交易日会话的总控入口”。
-        它不关心自己是在父进程里被手工调用，还是在 `ProcessPoolExecutor`
-        创建的子进程中被调用；它只负责判断“今天是否应该运行、何时开始、何时结束”。
-
-        它的职责主要是：
-
-        - 先做交易日判断，非交易日不启动任何交易资源。
-        - 若已经晚于收盘退出时间，则直接跳过。
-        - 若还没到启动时刻，则等待到指定时间。
-        - 时机成熟后，把控制权交给 `_run_managed_session()` 执行完整会话。
-    """
-    settings = settings or Settings()
-    now_provider = now_provider or datetime.now
-    sleep_fn = sleep_fn or time.sleep
-    logger = get_logger("system")
-    now = now_provider()
-
-    if not is_market_day(now):
-        logger.info("今日非交易日，跳过会话启动并直接退出")
-        return "skipped_non_trading_day"
-
-    exit_at = _build_session_time(now, settings.SESSION_EXIT_TIME)
-    if now >= exit_at:
-        logger.info("当前时间已超过收盘退出时间 %s，跳过本次会话", settings.SESSION_EXIT_TIME)
-        return "skipped_after_close"
-
-    stop_event = threading.Event()
-    if not _wait_until_session_start(settings, stop_event, now_provider, sleep_fn):
-        logger.info("会话尚未启动即收到停止信号")
-        return "stopped_before_start"
-
-    _run_managed_session(
+def _run_managed_session(strategy_classes=None, settings: Settings = None, now_provider=None, sleep_fn=None):
+    return _runtime_session.run_managed_session(
+        build_app_fn=build_app,
+        connect_account_fn=_connect_account_for_runtime,
+        start_heartbeat_fn=_start_runtime_heartbeat,
         strategy_classes=strategy_classes,
         settings=settings,
         now_provider=now_provider,
         sleep_fn=sleep_fn,
     )
-    return "completed"
+
+
+def run_daily_session(strategy_classes=None, settings: Settings = None, now_provider=None, sleep_fn=None):
+    return _runtime_session.run_daily_session(
+        run_managed_session_fn=_run_managed_session,
+        strategy_classes=strategy_classes,
+        settings=settings,
+        now_provider=now_provider,
+        sleep_fn=sleep_fn,
+    )
 
 
 def _run_daily_session_in_subprocess(strategy_specs: list[str], settings: Settings) -> str:
-    """子进程入口：在独立进程中运行完整的交易日会话。
-
-    运行说明：
-        `ProcessPoolExecutor` 提交到子进程的参数必须可序列化，直接传递策略类对象
-        在不同平台上并不总是可靠。因此父进程会先把策略类转换成 `module:Class`
-        字符串，子进程拿到后再通过导入路径恢复为真实策略类。
-
-        这样可以保证：
-        - 父进程与子进程之间只传递简单可序列化参数。
-        - 子进程启动后仍能准确恢复策略定义。
-    """
-    strategy_classes = _resolve_strategy_specs(strategy_specs)
-    return run_daily_session(strategy_classes=strategy_classes, settings=settings)
+    return _runtime_session.run_daily_session_in_subprocess(
+        strategy_specs,
+        settings,
+        run_daily_session_fn=run_daily_session,
+    )
 
 
 def _launch_session_in_process(strategy_classes=None, settings: Settings = None) -> str:
-    """为单次交易会话创建独立进程，并在任务结束后回收进程资源。
-
-    运行说明：
-        这个函数由父进程调度器触发，但真正的交易工作不会在父进程里执行。
-        它只负责：
-
-        1. 把策略类转换为可跨进程传输的文本描述。
-        2. 临时创建一个 `ProcessPoolExecutor(max_workers=1)`。
-        3. 向该执行器提交一次“交易日会话任务”。
-        4. 等待子进程返回结果。
-        5. 随着 `with ProcessPoolExecutor(...)` 退出，回收子进程资源。
-
-        这样设计的关键意义在于：
-        - 每个交易日任务都有自己独立的进程空间。
-        - QMT 连接、行情订阅、线程、网络端口、内存状态不会长期留在父进程中。
-        - 任务结束后，系统会自然回到一个轻量的“纯调度”状态。
-    """
-    settings = settings or Settings()
-    strategy_specs = _normalize_strategy_specs(strategy_classes)
-    logger = get_logger("system")
-    logger.info("父进程准备启动子进程交易会话")
-
-    # 每次任务都临时创建独立的进程池，只提交一个任务。
-    # 这样任务结束后，子进程会随着执行器退出而被回收，不会长期残留。
-    with ProcessPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_run_daily_session_in_subprocess, strategy_specs, settings)
-        result = future.result()
-
-    logger.info("子进程交易会话结束: %s", result)
-    return result
-
-
-def run_scheduler_service(strategy_classes=None, settings: Settings = None,
-                          scheduler_cls=None) -> None:
-    """启动父进程调度服务。
-
-    父进程只负责：
-    1. 使用 `BlockingScheduler` 维护计划任务。
-    2. 在触发时通过 `ProcessPoolExecutor` 拉起独立子进程。
-
-    真正的交易连接、行情订阅、策略运行、Web 服务、看门狗等，全部都在子进程中完成。
-
-    运行说明：
-        这是当前项目推荐的生产运行入口。
-        当执行 `python main.py` 时，默认就是进入这个函数。
-
-        该函数创建的是“父进程调度服务”，特点是：
-
-        - 父进程本身不连接 QMT。
-        - 父进程本身不启动行情订阅。
-        - 父进程本身不运行策略。
-        - 父进程只负责按照计划时间触发交易任务。
-
-        这样一来，整个系统的长期运行职责被拆成了两层：
-
-        - 父进程：长期稳定、轻量、负责调度。
-        - 子进程：短生命周期、重资源、负责完整交易会话。
-
-        如果你要理解“程序到底是怎么每天自动运行、收盘退出并回收资源的”，
-        重点就看这里：
-
-        - `scheduler.add_job(...)` 决定何时启动当日任务。
-        - `_launch_session_in_process()` 决定如何创建独立子进程。
-        - `_run_managed_session()` 决定子进程内部如何完整执行一次交易日会话。
-    """
-    from apscheduler.schedulers.blocking import BlockingScheduler
-
-    settings = settings or Settings()
-    logger = get_logger("system")
-    scheduler_cls = scheduler_cls or BlockingScheduler
-    scheduler = scheduler_cls()
-    start_hour, start_minute = _parse_hhmm(settings.SESSION_START_TIME)
-    strategy_specs = _normalize_strategy_specs(strategy_classes)
-
-    scheduler.add_job(
-        _launch_session_in_process,
-        trigger="cron",
-        day_of_week="mon-fri",
-        hour=start_hour,
-        minute=start_minute,
-        id="daily_trading_session",
-        args=[strategy_specs, settings],
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=max(int(settings.SESSION_POLL_INTERVAL_SEC), 60),
+    return _runtime_session.launch_session_in_process(
+        run_daily_session_in_subprocess_fn=_run_daily_session_in_subprocess,
+        strategy_classes=strategy_classes,
+        settings=settings,
     )
 
-    def _signal_handler(sig, frame):
-        """响应父进程退出信号，停止调度器。"""
-        logger.info("父进程收到退出信号 (%s)，正在停止调度器", sig)
-        try:
-            scheduler.shutdown(wait=False)
-        except Exception:
-            pass
 
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
-
-    logger.info(
-        "父进程调度器已启动：交易任务将在每个工作日 %s 触发，并在独立进程中运行",
-        settings.SESSION_START_TIME,
+def run_scheduler_service(strategy_classes=None, settings: Settings = None, scheduler_cls=None) -> None:
+    return _runtime_session.run_scheduler_service(
+        launch_session_fn=_launch_session_in_process,
+        strategy_classes=strategy_classes,
+        settings=settings,
+        scheduler_cls=scheduler_cls,
     )
-    scheduler.start()
 
 
 if __name__ == "__main__":
