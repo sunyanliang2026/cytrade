@@ -53,6 +53,15 @@ _INT_FIELDS = {
 }
 _FLOAT_FIELDS = {"amount", "data_delay_ms", "process_ms", "price"}
 _BOOL_FIELDS = {"dry_run", "connected", "account_connected", "real_order_sent"}
+MSF_CHAIN_EVENTS = {
+    "entry_signal_accepted",
+    "entry_signal_blocked",
+    "main_keep_decision",
+    "main_cancel_decision",
+    "dry_run_probe_trade_recorded",
+}
+MARKDOWN_STOCK_CHAIN_DETAIL_LIMIT = 20
+MARKDOWN_STOCK_EVENT_DETAIL_LIMIT = 8
 
 
 @dataclass(slots=True)
@@ -289,6 +298,131 @@ def _has_non_empty_value(value: Any) -> bool:
     return bool(text)
 
 
+def _event_logged_at(event: ParsedLogEvent) -> str:
+    return str(event.fields.get("_logged_at") or "").strip()
+
+
+def _msf_stock_name(event: ParsedLogEvent) -> tuple[str, str]:
+    stock = ""
+    name = ""
+    if isinstance(event.payload, dict):
+        stock = str(event.payload.get("stock") or "").strip()
+        name = str(event.payload.get("name") or "").strip()
+    if not stock:
+        stock = str(event.fields.get("stock") or "").strip()
+    if not name:
+        name = str(event.fields.get("name") or "").strip()
+    return stock, name
+
+
+def _compact_event_payload(event: ParsedLogEvent) -> dict[str, Any]:
+    metrics = event.payload.get("metrics") if isinstance(event.payload, dict) else {}
+    return {
+        "time": _event_logged_at(event),
+        "event": event.event,
+        "state": str(event.payload.get("state") or "").strip() if isinstance(event.payload, dict) else "",
+        "reason": str(event.payload.get("reason") or "").strip() if isinstance(event.payload, dict) else "",
+        "source": str(event.payload.get("source") or "").strip() if isinstance(event.payload, dict) else "",
+        "dry_run": bool(event.payload.get("dry_run")) if isinstance(event.payload, dict) else False,
+        "metrics": metrics if isinstance(metrics, dict) else {},
+    }
+
+
+def _summarize_msf_chains(events: list[ParsedLogEvent]) -> list[dict[str, Any]]:
+    chains: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    for event in events:
+        if event.type != "msf_event":
+            continue
+        stock, name = _msf_stock_name(event)
+        if not stock:
+            continue
+        chain = chains.get(stock)
+        if chain is None:
+            chain = {
+                "stock": stock,
+                "name": name,
+                "first_seen": _event_logged_at(event),
+                "last_seen": _event_logged_at(event),
+                "latest_state": str(event.payload.get("state") or "").strip() if isinstance(event.payload, dict) else "",
+                "latest_reason": str(event.payload.get("reason") or "").strip() if isinstance(event.payload, dict) else "",
+                "event_count": 0,
+                "event_counts": Counter(),
+                "reason_counts": Counter(),
+                "source_counts": Counter(),
+                "events": [],
+                "entry_signal_accepted_count": 0,
+                "entry_signal_blocked_count": 0,
+                "main_keep_count": 0,
+                "main_cancel_count": 0,
+                "dry_run_probe_trade_count": 0,
+            }
+            chains[stock] = chain
+            order.append(stock)
+        if not chain["name"] and name:
+            chain["name"] = name
+        logged_at = _event_logged_at(event)
+        if not chain["first_seen"] and logged_at:
+            chain["first_seen"] = logged_at
+        if logged_at:
+            chain["last_seen"] = logged_at
+        state = str(event.payload.get("state") or "").strip() if isinstance(event.payload, dict) else ""
+        reason = str(event.payload.get("reason") or "").strip() if isinstance(event.payload, dict) else ""
+        source = str(event.payload.get("source") or "").strip() if isinstance(event.payload, dict) else ""
+        chain["latest_state"] = state or chain["latest_state"]
+        chain["latest_reason"] = reason or chain["latest_reason"]
+        chain["event_count"] += 1
+        chain["event_counts"][event.event] += 1
+        if reason:
+            chain["reason_counts"][reason] += 1
+        if source:
+            chain["source_counts"][source] += 1
+        chain["events"].append(_compact_event_payload(event))
+        if event.event == "entry_signal_accepted":
+            chain["entry_signal_accepted_count"] += 1
+        elif event.event == "entry_signal_blocked":
+            chain["entry_signal_blocked_count"] += 1
+        elif event.event == "main_keep_decision":
+            chain["main_keep_count"] += 1
+        elif event.event == "main_cancel_decision":
+            chain["main_cancel_count"] += 1
+        elif event.event == "dry_run_probe_trade_recorded":
+            chain["dry_run_probe_trade_count"] += 1
+
+    ordered_chains = [chains[stock] for stock in order]
+    for chain in ordered_chains:
+        chain["event_counts"] = dict(sorted(chain["event_counts"].items()))
+        chain["reason_counts"] = dict(chain["reason_counts"].most_common())
+        chain["source_counts"] = dict(chain["source_counts"].most_common())
+    return ordered_chains
+
+
+def _format_chain_summary_rows(chains: list[dict[str, Any]]) -> list[str]:
+    if not chains:
+        return ["- No stock-level `MSF_EVENT` chains found."]
+    lines = [
+        "| stock | name | events | accepted | blocked | keep | cancel | probe fill | latest state | latest reason |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+    ]
+    for chain in chains:
+        lines.append(
+            "| {stock} | {name} | {event_count} | {accepted} | {blocked} | {keep} | {cancel} | {probe} | {state} | {reason} |".format(
+                stock=chain.get("stock", ""),
+                name=chain.get("name", ""),
+                event_count=chain.get("event_count", 0),
+                accepted=chain.get("entry_signal_accepted_count", 0),
+                blocked=chain.get("entry_signal_blocked_count", 0),
+                keep=chain.get("main_keep_count", 0),
+                cancel=chain.get("main_cancel_count", 0),
+                probe=chain.get("dry_run_probe_trade_count", 0),
+                state=chain.get("latest_state", ""),
+                reason=chain.get("latest_reason", ""),
+            )
+        )
+    return lines
+
+
 def summarize_events(events: Iterable[ParsedLogEvent]) -> dict[str, Any]:
     """Build a deterministic morning-run summary from parsed events."""
 
@@ -326,6 +460,13 @@ def summarize_events(events: Iterable[ParsedLogEvent]) -> dict[str, Any]:
     pool_total = 0
     if pool_generated:
         pool_total = _max_int(event.fields.get("total") for event in pool_generated)
+
+    stock_chains = _summarize_msf_chains(event_list)
+    stock_chain_counts = Counter(
+        chain["event_count"]
+        for chain in stock_chains
+        if int(chain.get("event_count", 0) or 0) > 0
+    )
 
     invalid_monitor_reason = ""
     if (
@@ -376,6 +517,10 @@ def summarize_events(events: Iterable[ParsedLogEvent]) -> dict[str, Any]:
         "session_events": dict(sorted(session_events.items())),
         "msf_events": dict(sorted(msf_events.items())),
         "blocked_reasons": dict(blocked_reasons.most_common()),
+        "stock_chains": stock_chains,
+        "stock_chain_count": len(stock_chains),
+        "stocks_with_msf_events": len(stock_chains),
+        "stock_chain_event_counts": dict(sorted(stock_chain_counts.items())),
         "pool_total": pool_total,
         "heartbeat_count": len(heartbeats),
         "max_strategies": max_strategies,
@@ -455,6 +600,52 @@ def format_markdown(summary: dict[str, Any], *, title: str = "MainSealFollow mor
             lines.append(f"- `{key}`: {value}")
     else:
         lines.append("- No blocked reasons found.")
+
+    stock_chains = summary.get("stock_chains", [])
+    lines.extend(["", "## Stock event chains", ""])
+    lines.extend(_format_chain_summary_rows(stock_chains))
+
+    if stock_chains:
+        detail_limit = MARKDOWN_STOCK_CHAIN_DETAIL_LIMIT
+        event_limit = MARKDOWN_STOCK_EVENT_DETAIL_LIMIT
+        lines.extend(
+            [
+                "",
+                "### Stock chain details",
+                "",
+                f"- Detail limit: first `{min(len(stock_chains), detail_limit)}` stocks, first `{event_limit}` events per stock. Full chain is in summary JSON.",
+            ]
+        )
+        for chain in stock_chains[:detail_limit]:
+            lines.append("")
+            lines.append(f"- `{chain.get('stock', '')}` {chain.get('name', '')} events={chain.get('event_count', 0)}")
+            lines.append(
+                f"  - latest_state=`{chain.get('latest_state', '')}` latest_reason=`{chain.get('latest_reason', '')}` first_seen=`{chain.get('first_seen', '')}` last_seen=`{chain.get('last_seen', '')}`"
+            )
+            if chain.get("reason_counts"):
+                reasons = ", ".join(f"{key}={value}" for key, value in chain["reason_counts"].items())
+                lines.append(f"  - reasons: {reasons}")
+            events = list(chain.get("events", []) or [])
+            for item in events[:event_limit]:
+                metrics = item.get("metrics", {})
+                metric_keys = ", ".join(sorted(metrics)) if isinstance(metrics, dict) and metrics else ""
+                lines.append(
+                    "  - {time} `{event}` state=`{state}` reason=`{reason}` source=`{source}` metrics_keys=`{metrics_keys}`".format(
+                        time=item.get("time", ""),
+                        event=item.get("event", ""),
+                        state=item.get("state", ""),
+                        reason=item.get("reason", ""),
+                        source=item.get("source", ""),
+                        metrics_keys=metric_keys or "none",
+                    )
+                )
+            omitted_events = len(events) - event_limit
+            if omitted_events > 0:
+                lines.append(f"  - ... omitted `{omitted_events}` more events for this stock; see summary JSON.")
+        omitted_chains = len(stock_chains) - detail_limit
+        if omitted_chains > 0:
+            lines.append("")
+            lines.append(f"- ... omitted `{omitted_chains}` more stock chains; see summary JSON.")
 
     latest_heartbeat = summary.get("latest_heartbeat", {})
     lines.extend(["", "## Latest heartbeat snapshot", ""])

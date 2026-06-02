@@ -40,6 +40,10 @@ def test_parse_monitor_logs_builds_morning_acceptance_summary():
     assert summary["max_tick_subscriptions"] == 52
     assert summary["max_l2_stocks"] == 3
     assert summary["mock_trade_count"] == 1
+    assert summary["stocks_with_msf_events"] == 1
+    assert summary["stock_chains"][0]["stock"] == "000001.SZ"
+    assert summary["stock_chains"][0]["entry_signal_accepted_count"] == 1
+    assert summary["stock_chains"][0]["dry_run_probe_trade_count"] == 1
     assert summary["checks"]["minimum_acceptance"] is True
     assert summary["checks"]["market_data_active"] is True
     assert summary["checks"]["dry_run_probe_trade_seen"] is True
@@ -52,6 +56,8 @@ def test_parse_monitor_logs_builds_morning_acceptance_summary():
     assert "Verdict: `accepted`" in report
     assert "Minimum acceptance" in report
     assert "Entry signal accepted" in report
+    assert "Stock event chains" in report
+    assert "| 000001.SZ |" in report
     assert "Invalid monitor reason: `none`" in report
 
 
@@ -111,6 +117,37 @@ def test_parse_monitor_logs_flags_invalid_market_data_session():
     assert "Verdict: `invalid_monitor_session`" in report
     assert "Invalid monitor session: `PASS` reason=`market_data_not_connected`" in report
     assert "Invalid monitor reason: `market_data_not_connected`" in report
+
+
+def test_stock_chain_markdown_limits_details_but_keeps_json_complete():
+    events = []
+    for index in range(10):
+        events.append(
+            _event(
+                "MSF_EVENT "
+                + json.dumps(
+                    {
+                        "event": "entry_signal_blocked",
+                        "stock": "000001.SZ",
+                        "name": "平安银行",
+                        "state": "WAIT_SIGNAL",
+                        "reason": f"reason_{index}",
+                        "source": "l2_order_queue",
+                        "dry_run": True,
+                        "metrics": {"front50_depth_lot": index},
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
+
+    summary = summarize_events(events)
+    report = format_markdown(summary)
+
+    assert summary["stock_chains"][0]["event_count"] == 10
+    assert len(summary["stock_chains"][0]["events"]) == 10
+    assert "Detail limit" in report
+    assert "omitted `2` more events for this stock" in report
 
 
 def test_select_run_session_events_keeps_only_latest_stopped_session():
