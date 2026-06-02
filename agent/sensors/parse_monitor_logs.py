@@ -315,16 +315,157 @@ def _msf_stock_name(event: ParsedLogEvent) -> tuple[str, str]:
     return stock, name
 
 
+def _metric_float(metrics: dict[str, Any], key: str, default: float = 0.0) -> float:
+    try:
+        return float(metrics.get(key, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _metric_int(metrics: dict[str, Any], key: str, default: int = 0) -> int:
+    try:
+        return int(float(metrics.get(key, default) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_amount_cn(value: Any) -> str:
+    try:
+        amount = float(value or 0.0)
+    except (TypeError, ValueError):
+        return str(value)
+    if abs(amount) >= 100_000_000:
+        return f"{amount / 100_000_000:.2f}亿"
+    if abs(amount) >= 10_000:
+        return f"{amount / 10_000:.1f}万"
+    return f"{amount:.0f}"
+
+
+def _yes_no(value: Any) -> str:
+    return "是" if bool(value) else "否"
+
+
+_EVENT_CN = {
+    "entry_signal_accepted": "触发排板",
+    "entry_signal_blocked": "排板被阻断",
+    "dry_run_probe_trade_recorded": "dry-run 观察单模拟成交",
+    "main_keep_decision": "观察单成交后保留主单",
+    "main_cancel_decision": "观察单成交后撤主单",
+    "queue_cancel_decision": "排队期间撤单判断",
+}
+
+_REASON_CN = {
+    "limit_price_or_queue_missing": "缺少涨停价或买一队列，无法判断排板位置",
+    "main_seal_not_ok": "主封单条件不足",
+    "state_not_wait_signal": "策略状态已不是等待信号",
+    "cooldown_after_cancel": "刚撤过单，仍在冷却期",
+    "simulated_probe_fill": "按 dry-run 规则模拟观察单成交",
+    "probe_filled_market_ok": "观察单成交后市场指标仍可接受",
+    "market_still_strong_after_probe": "观察单成交后封单仍强",
+    "confirmed_limit_buy_cancel_gt_add": "涨停价买单撤单金额大于新增金额",
+    "position_danger_and_back_big_empty": "排队位置风险高且后排大单承接不足",
+    "queue_timeout_and_back_big_empty": "排队超时且后排大单承接不足",
+    "front_big_weak_and_back_big_empty": "前排大单弱且后排大单承接不足",
+}
+
+
+def _describe_msf_event(event_name: str, reason: str, metrics: dict[str, Any]) -> str:
+    parts: list[str] = []
+    event_cn = _EVENT_CN.get(event_name, event_name or "策略事件")
+    reason_cn = _REASON_CN.get(reason, reason or "无原因")
+    parts.append(f"{event_cn}：{reason_cn}")
+
+    if event_name in {"entry_signal_accepted", "entry_signal_blocked"}:
+        bid1_lot = _metric_int(metrics, "current_bid1_volume_lot")
+        front50_lot = _metric_int(metrics, "current_front50_depth_lot")
+        queue_count = _metric_int(metrics, "current_queue_count")
+        reported_count = _metric_int(metrics, "current_queue_reported_count")
+        if bid1_lot or front50_lot or queue_count or reported_count:
+            parts.append(
+                "队列：买一封单%s手，前50笔合计%s手，队列条数%s/%s"
+                % (bid1_lot, front50_lot, queue_count, reported_count)
+            )
+        if "detected_main_seal" in metrics:
+            parts.append(f"主封单识别={_yes_no(metrics.get('detected_main_seal'))}")
+        if "recent_big_limit_buy_ok" in metrics:
+            parts.append(
+                "近期涨停价大买单=%s，数量=%s"
+                % (_yes_no(metrics.get("recent_big_limit_buy_ok")), _metric_int(metrics, "recent_big_limit_buy_count"))
+            )
+        if "recent_big_limit_cancel_blocked" in metrics:
+            parts.append(
+                "近期大撤买阻断=%s，数量=%s"
+                % (
+                    _yes_no(metrics.get("recent_big_limit_cancel_blocked")),
+                    _metric_int(metrics, "recent_big_limit_cancel_count"),
+                )
+            )
+        if "existing_limit_observed_ms" in metrics:
+            parts.append(
+                "已封板观察=%sms/阈值%sms"
+                % (_metric_int(metrics, "existing_limit_observed_ms"), _metric_int(metrics, "existing_limit_observe_ms"))
+            )
+
+    if event_name == "dry_run_probe_trade_recorded":
+        parts.append(
+            "成交：价格%s，数量%s股，金额%s"
+            % (
+                metrics.get("fill_price", ""),
+                _metric_int(metrics, "fill_qty"),
+                _format_amount_cn(metrics.get("fill_amount")),
+            )
+        )
+        parts.append(
+            "成交依据：提交后成交%s股，阈值%s股，提交时买一%s手，当前买一%s手"
+            % (
+                _metric_int(metrics, "traded_shares_after_submit"),
+                _metric_int(metrics, "fill_threshold_shares"),
+                _metric_int(metrics, "submit_bid1_volume_lot"),
+                _metric_int(metrics, "current_bid1_volume_lot"),
+            )
+        )
+
+    if event_name in {"main_keep_decision", "main_cancel_decision", "queue_cancel_decision"}:
+        if "limit_buy_add_amount" in metrics or "limit_buy_cancel_amount" in metrics:
+            parts.append(
+                "涨停价买单：新增%s，撤单%s，净额%s，撤单/新增比%s"
+                % (
+                    _format_amount_cn(metrics.get("limit_buy_add_amount")),
+                    _format_amount_cn(metrics.get("limit_buy_cancel_amount")),
+                    _format_amount_cn(metrics.get("limit_buy_net_amount")),
+                    metrics.get("limit_buy_cancel_ratio", ""),
+                )
+            )
+        if "back_big_amount" in metrics or "front_big_amount" in metrics:
+            parts.append(
+                "大单承接：前排大单%s，后排大单%s，后排大单数%s"
+                % (
+                    _format_amount_cn(metrics.get("front_big_amount")),
+                    _format_amount_cn(metrics.get("back_big_amount")),
+                    _metric_int(metrics, "back_big_count"),
+                )
+            )
+        if "probe_fill_ms" in metrics:
+            parts.append(f"观察单成交后已等待={_metric_int(metrics, 'probe_fill_ms')}ms")
+        if "elapsed_ms" in metrics:
+            parts.append(f"排队耗时={_metric_int(metrics, 'elapsed_ms')}ms")
+
+    return "；".join(part for part in parts if part)
+
+
 def _compact_event_payload(event: ParsedLogEvent) -> dict[str, Any]:
     metrics = event.payload.get("metrics") if isinstance(event.payload, dict) else {}
+    metrics = metrics if isinstance(metrics, dict) else {}
+    reason = str(event.payload.get("reason") or "").strip() if isinstance(event.payload, dict) else ""
     return {
         "time": _event_logged_at(event),
         "event": event.event,
         "state": str(event.payload.get("state") or "").strip() if isinstance(event.payload, dict) else "",
-        "reason": str(event.payload.get("reason") or "").strip() if isinstance(event.payload, dict) else "",
+        "reason": reason,
         "source": str(event.payload.get("source") or "").strip() if isinstance(event.payload, dict) else "",
         "dry_run": bool(event.payload.get("dry_run")) if isinstance(event.payload, dict) else False,
-        "metrics": metrics if isinstance(metrics, dict) else {},
+        "summary_cn": _describe_msf_event(event.event, reason, metrics),
+        "metrics": metrics,
     }
 
 
@@ -698,6 +839,9 @@ def format_markdown(summary: dict[str, Any], *, title: str = "MainSealFollow mor
                         metrics_keys=metric_keys or "none",
                     )
                 )
+                summary_cn = str(item.get("summary_cn") or "").strip()
+                if summary_cn:
+                    lines.append(f"    中文摘要：{summary_cn}")
             omitted_events = len(events) - event_limit
             if omitted_events > 0:
                 lines.append(f"  - ... omitted `{omitted_events}` more events for this stock; see summary JSON.")

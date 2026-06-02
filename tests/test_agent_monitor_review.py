@@ -20,6 +20,15 @@ def test_parse_monitor_logs_builds_morning_acceptance_summary():
         "stock": "000001.SZ",
         "dry_run": True,
         "reason": "limit_up_follow",
+        "metrics": {
+            "detected_main_seal": True,
+            "current_bid1_volume_lot": 12000,
+            "current_front50_depth_lot": 8000,
+            "current_queue_count": 50,
+            "current_queue_reported_count": 50,
+            "recent_big_limit_buy_ok": True,
+            "recent_big_limit_buy_count": 1,
+        },
     }
     lines = [
         "MONITOR_SESSION pool_generated output=config/main_seal_follow_pool.csv source=combined total=52 amount=1000.0",
@@ -27,7 +36,24 @@ def test_parse_monitor_logs_builds_morning_acceptance_summary():
         "MONITOR_SESSION session_start mode=market-only-monitor dry_run=True csv=config/main_seal_follow_pool.csv stop_at=12:00 account_connected=false",
         "Runtime heartbeat mode=market-only-monitor dry_run=True connected=True strategies=52 tick_subscriptions=52 l2_stocks=3 l2_kinds=9 latest_data_time=2026-05-25T09:45:00 data_delay_ms=100 process_ms=3.2",
         "MSF_EVENT " + json.dumps(payload),
-        "MSF_EVENT " + json.dumps({"event": "dry_run_probe_trade_recorded", "stock": "000001.SZ", "dry_run": True}),
+        "MSF_EVENT "
+        + json.dumps(
+            {
+                "event": "dry_run_probe_trade_recorded",
+                "stock": "000001.SZ",
+                "dry_run": True,
+                "reason": "simulated_probe_fill",
+                "metrics": {
+                    "fill_price": 10.0,
+                    "fill_qty": 100,
+                    "fill_amount": 1000.0,
+                    "traded_shares_after_submit": 1200,
+                    "fill_threshold_shares": 1000,
+                    "submit_bid1_volume_lot": 12000,
+                    "current_bid1_volume_lot": 11000,
+                },
+            }
+        ),
         "[ORDER] [TRADE] [MOCK] observation filled uuid=abc code=000001.SZ price=10.000 qty=100 traded_shares=1200 threshold=1000",
         "MONITOR_SESSION session_stop reason=noon_stop stop_time=12:00 strategy_count=52 tick_subscriptions=52 l2_stocks=3",
         "MONITOR_SESSION stopped system_log=logs/system.1.log trade_log=logs/trade.1.log dry_run=True real_order_sent=false",
@@ -44,6 +70,8 @@ def test_parse_monitor_logs_builds_morning_acceptance_summary():
     assert summary["stock_chains"][0]["stock"] == "000001.SZ"
     assert summary["stock_chains"][0]["entry_signal_accepted_count"] == 1
     assert summary["stock_chains"][0]["dry_run_probe_trade_count"] == 1
+    assert "买一封单12000手" in summary["stock_chains"][0]["events"][0]["summary_cn"]
+    assert "成交：价格10.0" in summary["stock_chains"][0]["events"][1]["summary_cn"]
     assert summary["stock_chain_groups"]["entry_accepted"] == ["000001.SZ"]
     assert summary["stock_chain_groups"]["probe_trade_recorded"] == ["000001.SZ"]
     assert summary["checks"]["minimum_acceptance"] is True
@@ -61,6 +89,8 @@ def test_parse_monitor_logs_builds_morning_acceptance_summary():
     assert "Stock outcome groups" in report
     assert "Dry-run probe filled: `1` 000001.SZ" in report
     assert "Stock event chains" in report
+    assert "中文摘要" in report
+    assert "买一封单12000手" in report
     assert "| 000001.SZ |" in report
     assert "Invalid monitor reason: `none`" in report
 
