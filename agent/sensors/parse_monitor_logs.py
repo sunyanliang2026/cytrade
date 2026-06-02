@@ -423,6 +423,42 @@ def _format_chain_summary_rows(chains: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _stock_ref(chain: dict[str, Any]) -> str:
+    stock = str(chain.get("stock") or "").strip()
+    name = str(chain.get("name") or "").strip()
+    return f"{stock} {name}".strip()
+
+
+def _summarize_stock_chain_groups(chains: list[dict[str, Any]]) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {
+        "entry_accepted": [],
+        "blocked_only": [],
+        "probe_trade_recorded": [],
+        "main_keep_decision": [],
+        "main_cancel_decision": [],
+    }
+    for chain in chains:
+        ref = _stock_ref(chain)
+        if not ref:
+            continue
+        accepted = int(chain.get("entry_signal_accepted_count", 0) or 0)
+        blocked = int(chain.get("entry_signal_blocked_count", 0) or 0)
+        probe = int(chain.get("dry_run_probe_trade_count", 0) or 0)
+        keep = int(chain.get("main_keep_count", 0) or 0)
+        cancel = int(chain.get("main_cancel_count", 0) or 0)
+        if accepted > 0:
+            groups["entry_accepted"].append(ref)
+        if blocked > 0 and accepted == 0 and probe == 0 and keep == 0 and cancel == 0:
+            groups["blocked_only"].append(ref)
+        if probe > 0:
+            groups["probe_trade_recorded"].append(ref)
+        if keep > 0:
+            groups["main_keep_decision"].append(ref)
+        if cancel > 0:
+            groups["main_cancel_decision"].append(ref)
+    return groups
+
+
 def summarize_events(events: Iterable[ParsedLogEvent]) -> dict[str, Any]:
     """Build a deterministic morning-run summary from parsed events."""
 
@@ -462,6 +498,7 @@ def summarize_events(events: Iterable[ParsedLogEvent]) -> dict[str, Any]:
         pool_total = _max_int(event.fields.get("total") for event in pool_generated)
 
     stock_chains = _summarize_msf_chains(event_list)
+    stock_chain_groups = _summarize_stock_chain_groups(stock_chains)
     stock_chain_counts = Counter(
         chain["event_count"]
         for chain in stock_chains
@@ -478,6 +515,8 @@ def summarize_events(events: Iterable[ParsedLogEvent]) -> dict[str, Any]:
         and sum(msf_events.values()) == 0
     ):
         invalid_monitor_reason = "market_data_not_connected"
+    elif not (session_events.get("monitor_start", 0) > 0 or session_events.get("session_start", 0) > 0):
+        invalid_monitor_reason = "monitor_session_not_found"
 
     checks = {
         "pool_generated": bool(pool_generated) and pool_total > 0,
@@ -518,6 +557,7 @@ def summarize_events(events: Iterable[ParsedLogEvent]) -> dict[str, Any]:
         "msf_events": dict(sorted(msf_events.items())),
         "blocked_reasons": dict(blocked_reasons.most_common()),
         "stock_chains": stock_chains,
+        "stock_chain_groups": stock_chain_groups,
         "stock_chain_count": len(stock_chains),
         "stocks_with_msf_events": len(stock_chains),
         "stock_chain_event_counts": dict(sorted(stock_chain_counts.items())),
@@ -602,6 +642,25 @@ def format_markdown(summary: dict[str, Any], *, title: str = "MainSealFollow mor
         lines.append("- No blocked reasons found.")
 
     stock_chains = summary.get("stock_chains", [])
+    stock_chain_groups = summary.get("stock_chain_groups", {})
+    lines.extend(["", "## Stock outcome groups", ""])
+    group_labels = [
+        ("entry_accepted", "Triggered entry"),
+        ("blocked_only", "Blocked only"),
+        ("probe_trade_recorded", "Dry-run probe filled"),
+        ("main_keep_decision", "Main keep decision"),
+        ("main_cancel_decision", "Main cancel decision"),
+    ]
+    if stock_chain_groups:
+        for key, label in group_labels:
+            stocks = list(stock_chain_groups.get(key, []) or [])
+            value = ", ".join(stocks[:20]) if stocks else "none"
+            if len(stocks) > 20:
+                value = f"{value}, ... +{len(stocks) - 20} more"
+            lines.append(f"- {label}: `{len(stocks)}` {value}")
+    else:
+        lines.append("- No stock outcome groups found.")
+
     lines.extend(["", "## Stock event chains", ""])
     lines.extend(_format_chain_summary_rows(stock_chains))
 
@@ -660,8 +719,8 @@ def format_markdown(summary: dict[str, Any], *, title: str = "MainSealFollow mor
             "",
             "## Review notes",
             "",
-            "- 这份报告只判断 dry-run 监控链路，不判断策略收益。",
-            "- 如果 verdict=`invalid_monitor_session`，先修复行情连接或订阅问题，再做任何策略调参。",
+            "- 这份报告只判断 dry-run 监测链路，不判断策略收益。",
+            "- 如果 verdict=`invalid_monitor_session`，先修复监测会话、行情连接或订阅问题，再做策略调参。",
             "- `CHECK` 不一定代表失败；例如没有涨停机会时，`entry_signal_accepted` 可能自然为 0。",
             "- 如果出现 possible real order lines，必须先人工确认日志来源，再继续任何自动修复。",
             "",

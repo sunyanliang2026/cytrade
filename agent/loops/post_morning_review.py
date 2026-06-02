@@ -39,19 +39,33 @@ def _normalize_log_path(path_text: str, *, repo_root: Path) -> str:
 def select_run_session_events(events: list[ParsedLogEvent], *, repo_root: Path, run_id: str | None = None) -> list[ParsedLogEvent]:
     """Keep only the latest stopped session's concrete system/trade logs."""
 
+    run_day_events = [
+        event
+        for event in events
+        if run_id and str(event.fields.get("_logged_at", "")).startswith(run_id)
+    ]
     stopped_events = [
         event
         for event in events
         if event.type == "monitor_session" and event.event == "stopped"
     ]
     if run_id:
-        run_day_events = [
+        run_day_stopped_events = [
             event
             for event in stopped_events
             if str(event.fields.get("_logged_at", "")).startswith(run_id)
         ]
-        if run_day_events:
-            stopped_events = run_day_events
+        if run_day_stopped_events:
+            stopped_events = run_day_stopped_events
+        else:
+            run_day_monitor_starts = [
+                event
+                for event in run_day_events
+                if event.type == "monitor_session" and event.event in {"monitor_start", "session_start"}
+            ]
+            if not run_day_monitor_starts:
+                return []
+            return run_day_events
     if not stopped_events:
         return events
 

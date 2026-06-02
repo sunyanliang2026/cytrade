@@ -1,0 +1,53 @@
+{
+  "blocked_reasons": {},
+  "checks": {
+    "dry_run_probe_trade_seen": false,
+    "entry_signal_seen": false,
+    "heartbeat_seen": false,
+    "invalid_monitor_session": true,
+    "l2_detail_seen": false,
+    "market_data_active": false,
+    "minimum_acceptance": false,
+    "monitor_started": false,
+    "no_real_order_suspected": true,
+    "pool_generated": false,
+    "session_stopped": false,
+    "strategies_after_activation": false
+  },
+  "event_counts": {},
+  "generated_at": "2026-06-02T14:26:28",
+  "heartbeat_count": 0,
+  "invalid_monitor_reason": "monitor_session_not_found",
+  "latest_heartbeat": {},
+  "log_patterns": [
+    "logs/system.*.log",
+    "logs/trade.*.log",
+    "logs/system.log",
+    "logs/trade.log"
+  ],
+  "max_l2_kinds": 0,
+  "max_l2_stocks": 0,
+  "max_strategies": 0,
+  "max_tick_subscriptions": 0,
+  "mock_trade_count": 0,
+  "msf_events": {},
+  "pool_total": 0,
+  "possible_real_order_count": 0,
+  "real_order_suspected": false,
+  "review_verdict": "invalid_monitor_session",
+  "reviewed_at": "2026-06-02T14:26:28",
+  "reviewed_sources": [],
+  "run_id": "2026-06-02",
+  "session_events": {},
+  "stock_chain_count": 0,
+  "stock_chain_event_counts": {},
+  "stock_chain_groups": {
+    "blocked_only": [],
+    "entry_accepted": [],
+    "main_cancel_decision": [],
+    "main_keep_decision": [],
+    "probe_trade_recorded": []
+  },
+  "stock_chains": [],
+  "stocks_with_msf_events": 0
+}

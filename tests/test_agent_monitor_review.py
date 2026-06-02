@@ -44,6 +44,8 @@ def test_parse_monitor_logs_builds_morning_acceptance_summary():
     assert summary["stock_chains"][0]["stock"] == "000001.SZ"
     assert summary["stock_chains"][0]["entry_signal_accepted_count"] == 1
     assert summary["stock_chains"][0]["dry_run_probe_trade_count"] == 1
+    assert summary["stock_chain_groups"]["entry_accepted"] == ["000001.SZ"]
+    assert summary["stock_chain_groups"]["probe_trade_recorded"] == ["000001.SZ"]
     assert summary["checks"]["minimum_acceptance"] is True
     assert summary["checks"]["market_data_active"] is True
     assert summary["checks"]["dry_run_probe_trade_seen"] is True
@@ -56,6 +58,8 @@ def test_parse_monitor_logs_builds_morning_acceptance_summary():
     assert "Verdict: `accepted`" in report
     assert "Minimum acceptance" in report
     assert "Entry signal accepted" in report
+    assert "Stock outcome groups" in report
+    assert "Dry-run probe filled: `1` 000001.SZ" in report
     assert "Stock event chains" in report
     assert "| 000001.SZ |" in report
     assert "Invalid monitor reason: `none`" in report
@@ -176,6 +180,27 @@ def test_select_run_session_events_keeps_only_latest_stopped_session():
     assert len(filtered) == 3
     assert summary["session_events"]["stopped"] == 1
     assert summary["max_strategies"] == 52
+
+
+def test_select_run_session_events_does_not_fallback_to_old_session_for_run_id():
+    repo_root = Path.cwd()
+    events = [
+        _event("Runtime heartbeat connected=False strategies=98 tick_subscriptions=0 l2_stocks=98"),
+        _event("MONITOR_SESSION stopped system_log=./logs/system.old.log trade_log=./logs/trade.old.log dry_run=True real_order_sent=false"),
+    ]
+    events[0].fields["_logged_at"] = "2026-06-02T11:47:37"
+    events[0].source = str(repo_root / "logs" / "system.today.log")
+    events[1].fields["_logged_at"] = "2026-05-26T10:00:00"
+    events[1].source = str(repo_root / "logs" / "system.old.log")
+
+    filtered = select_run_session_events(events, repo_root=repo_root, run_id="2026-06-02")
+    summary = summarize_events(filtered)
+
+    assert filtered == []
+    assert summary["heartbeat_count"] == 0
+    assert summary["review_verdict"] == "invalid_monitor_session"
+    assert summary["invalid_monitor_reason"] == "monitor_session_not_found"
+    assert "stopped" not in summary["session_events"]
 
 
 def test_run_post_morning_review_uses_latest_session_pair(tmp_path: Path):
