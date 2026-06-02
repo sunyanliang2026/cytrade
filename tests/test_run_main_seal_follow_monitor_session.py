@@ -7,6 +7,7 @@ from scripts.run.run_main_seal_follow_monitor_session import (
     build_pool_args,
     build_session_time,
     parse_hhmm,
+    resolve_review_run_id,
     resolve_runtime_start_time,
     should_collect_pool,
 )
@@ -38,10 +39,19 @@ def test_monitor_session_build_monitor_settings_forces_dry_run(tmp_path: Path):
     assert settings.CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN is True
     assert settings.CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH == str((tmp_path / "pool.csv").resolve())
     assert settings.LOG_SUMMARY_MODE is True
-    assert settings.SESSION_START_TIME == "08:50"
+    assert settings.SESSION_START_TIME == "09:15"
     assert settings.RUNTIME_HEARTBEAT_INTERVAL_SEC == 15
     assert settings.SESSION_EXIT_TIME == "10:00"
     assert settings.LOAD_PREVIOUS_STATE_ON_START is False
+
+
+def test_monitor_session_defaults_to_separated_times():
+    args = build_parser().parse_args([])
+
+    assert args.pool_time == "08:50"
+    assert args.strategy_start_time == "09:15"
+    assert args.stop_time == "11:00"
+    assert args.no_post_review is False
 
 
 def test_monitor_session_build_pool_args_uses_wrapper_options(tmp_path: Path):
@@ -90,7 +100,7 @@ def test_monitor_session_can_skip_pool_collection(tmp_path: Path):
 
 
 def test_monitor_session_runtime_start_time_defaults_to_pool_time():
-    args = build_parser().parse_args(["--pool-time", "08:50"])
+    args = build_parser().parse_args(["--pool-time", "08:50", "--strategy-start-time", ""])
 
     assert resolve_runtime_start_time(args) == "08:50"
 
@@ -99,3 +109,15 @@ def test_monitor_session_runtime_start_time_can_be_overridden():
     args = build_parser().parse_args(["--pool-time", "08:50", "--strategy-start-time", "09:15"])
 
     assert resolve_runtime_start_time(args) == "09:15"
+
+
+def test_monitor_session_review_run_id_defaults_to_today():
+    args = build_parser().parse_args([])
+
+    assert resolve_review_run_id(args, datetime(2026, 6, 2, 9, 0)) == "2026-06-02"
+
+
+def test_monitor_session_review_run_id_can_be_overridden():
+    args = build_parser().parse_args(["--review-run-id", "2026-05-25"])
+
+    assert resolve_review_run_id(args, datetime(2026, 6, 2, 9, 0)) == "2026-05-25"

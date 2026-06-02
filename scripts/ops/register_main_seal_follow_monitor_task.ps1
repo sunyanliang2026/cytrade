@@ -2,7 +2,7 @@ param(
     [string]$TaskName = "Cytrade MainSealFollow Monitor",
     [string]$StartTime = "08:50",
     [string]$StrategyStartTime = "09:15",
-    [string]$StopTime = "10:00",
+    [string]$StopTime = "11:00",
     [string]$RepoRoot = "",
     [string]$BatchPath = ""
 )

@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from agent.loops.post_morning_review import run_post_morning_review
 from config.settings import Settings
 from core.trading_calendar import is_market_day
 from monitor.logger import get_log_file_path, get_logger
@@ -102,6 +103,31 @@ def resolve_runtime_start_time(args: argparse.Namespace) -> str:
     return str(getattr(args, "strategy_start_time", "") or getattr(args, "pool_time", "") or "").strip()
 
 
+def resolve_review_run_id(args: argparse.Namespace, now: datetime | None = None) -> str:
+    configured = str(getattr(args, "review_run_id", "") or "").strip()
+    if configured:
+        return configured
+    return (now or datetime.now()).date().isoformat()
+
+
+def run_post_session_review(args: argparse.Namespace, logger) -> dict[str, Path] | None:
+    if bool(getattr(args, "no_post_review", False)):
+        logger.info("%s review_skipped reason=no_post_review", SESSION_EVENT_PREFIX)
+        return None
+    run_id = resolve_review_run_id(args)
+    logger.info("%s review_start run_id=%s", SESSION_EVENT_PREFIX, run_id)
+    paths = run_post_morning_review(run_id=run_id)
+    logger.info(
+        "%s review_generated run_id=%s report=%s summary_json=%s tasks=%s",
+        SESSION_EVENT_PREFIX,
+        run_id,
+        paths.get("report", ""),
+        paths.get("summary_json", ""),
+        paths.get("tasks", ""),
+    )
+    return paths
+
+
 def run_monitor_session(args: argparse.Namespace) -> str:
     logger = get_logger("system")
     now = datetime.now()
@@ -173,14 +199,19 @@ def run_monitor_session(args: argparse.Namespace) -> str:
         session_event_prefix=SESSION_EVENT_PREFIX,
         stop_reason="scheduled_stop",
     )
+    try:
+        run_post_session_review(args, logger)
+    except Exception:
+        logger.exception("%s review_failed", SESSION_EVENT_PREFIX)
+        return "completed_review_failed"
     return "completed"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run MainSealFollow dry-run monitoring session.")
     parser.add_argument("--pool-time", default="08:50", help="Stock-pool generation time in HH:MM.")
-    parser.add_argument("--strategy-start-time", default="", help="Strategy runtime start time in HH:MM. Defaults to pool-time.")
-    parser.add_argument("--stop-time", default="10:00", help="Session stop time in HH:MM.")
+    parser.add_argument("--strategy-start-time", default="09:15", help="Strategy runtime start time in HH:MM.")
+    parser.add_argument("--stop-time", default="11:00", help="Session stop time in HH:MM.")
     parser.add_argument("--pool-source", choices=("combined", "iwencai", "qmt", "jiuyangongshe"), default="combined")
     parser.add_argument("--pool-output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--pool-source-config", default=str(DEFAULT_SOURCE_CONFIG))
@@ -191,6 +222,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-backup", action="store_true")
     parser.add_argument("--skip-pool-collect", action="store_true", help="Skip auto collection and reuse the existing pool CSV.")
     parser.add_argument("--full-console", action="store_true", help="Disable summary mode and print all console logs.")
+    parser.add_argument("--review-run-id", default="", help="Run id for post-session review. Defaults to today's YYYY-MM-DD.")
+    parser.add_argument("--no-post-review", action="store_true", help="Do not generate post-session morning review after stop.")
     parser.add_argument("--no-market-day-check", dest="market_day_only", action="store_false")
     parser.set_defaults(market_day_only=True)
     return parser

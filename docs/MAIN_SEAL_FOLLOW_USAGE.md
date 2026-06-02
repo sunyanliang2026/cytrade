@@ -235,7 +235,7 @@ scripts\ops\start_main_seal_follow_manual_managed.bat
 - 走完整运行时，会连接交易账户和行情
 - 允许启动前账户校验、委托同步、持仓恢复生效
 - 策略只加载手工池里列出的股票
-- 支持继续追加 `--strategy-start-time 09:15 --stop-time 10:00` 这类时序参数
+- 支持继续追加 `--strategy-start-time 09:15 --stop-time 11:00` 这类时序参数
 
 适用场景：
 

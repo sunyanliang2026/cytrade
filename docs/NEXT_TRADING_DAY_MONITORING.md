@@ -16,9 +16,9 @@ scripts\ops\start_main_seal_follow_monitor.bat
 Default behavior:
 
 - Wait until `08:50`, then generate `config/main_seal_follow_pool.csv`.
-- By default, start `MainSealFollow` in `market-only` mode with `dry_run=true`
-  immediately after pool generation.
-- Stop automatically at `10:00`.
+- Start `MainSealFollow` in `market-only` mode with `dry_run=true` at `09:15`.
+- Stop automatically at `11:00`.
+- Generate the post-session morning review automatically after the runtime stops.
 - Keep console output in summary mode, but still print `MSF_EVENT`,
   `[ORDER]`, `[TRADE]`, and runtime heartbeat lines.
 
@@ -26,10 +26,11 @@ Useful switches:
 
 - `--pool-time 08:50`: adjust stock-pool generation time.
 - `--strategy-start-time 09:15`: delay runtime start until after pool generation.
-- `--stop-time 10:00`: adjust session stop time.
+- `--stop-time 11:00`: adjust session stop time.
 - `--pool-source combined`: choose pool source.
 - `--full-console`: disable summary mode and print all console logs.
 - `--strict-sources`: fail the run if any configured stock-pool source fails.
+- `--no-post-review`: skip automatic post-session review generation.
 
 Windows scheduled task helper:
 
@@ -42,8 +43,8 @@ Defaults:
 - Task name: `Cytrade MainSealFollow Monitor`
 - Trigger time / pool time: `08:50`
 - Strategy start time: `09:15`
-- Stop time: `10:00`
-- Action: run `scripts\ops\start_main_seal_follow_monitor.bat --pool-time 08:50 --strategy-start-time 09:15 --stop-time 10:00`
+- Stop time: `11:00`
+- Action: run `scripts\ops\start_main_seal_follow_monitor.bat --pool-time 08:50 --strategy-start-time 09:15 --stop-time 11:00`
 
 Optional overrides:
 
@@ -56,8 +57,20 @@ To separate stock selection and monitoring runtime, for example `08:50`
 selection plus `09:15` strategy start:
 
 ```powershell
-python scripts\run\run_main_seal_follow_monitor_session.py --pool-time 08:50 --strategy-start-time 09:15 --stop-time 10:00
+python scripts\run\run_main_seal_follow_monitor_session.py --pool-time 08:50 --strategy-start-time 09:15 --stop-time 11:00
 ```
+
+After the session stops, the wrapper runs:
+
+```powershell
+python -m agent.loops.post_morning_review --run-id YYYY-MM-DD
+```
+
+and writes:
+
+- `agent/memory/runs/YYYY-MM-DD_morning.md`
+- `agent/memory/runs/YYYY-MM-DD_morning_summary.json`
+- `agent/memory/improvement_tasks.yaml`
 
 Key replay markers in logs:
 
