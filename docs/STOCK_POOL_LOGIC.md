@@ -9,7 +9,7 @@
 输出文件固定为：
 
 ```text
-config/main_seal_follow_pool.csv
+data/stock_pools/current/main_seal_follow_pool.csv
 ```
 
 CSV 字段固定为：
@@ -229,7 +229,7 @@ python scripts\pool\collect_main_seal_pool.py --source combined --strict-sources
 覆盖正式股票池前默认会备份旧文件：
 
 ```text
-config/main_seal_follow_pool.backup_YYYYMMDD_HHMMSS.csv
+data/stock_pools/current/main_seal_follow_pool.backup_YYYYMMDD_HHMMSS.csv
 ```
 
 ## 备用来源一：QMT 本地近似
@@ -309,7 +309,7 @@ python scripts\pool\collect_main_seal_pool.py --source jiuyangongshe --once --am
 策略启动时读取 `CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH`，默认指向：
 
 ```text
-config/main_seal_follow_pool.csv
+data/stock_pools/current/main_seal_follow_pool.csv
 ```
 
 每一行有效股票生成一个独立策略实例：
@@ -325,7 +325,7 @@ config/main_seal_follow_pool.csv
 
 - 查询语句：`涨停，实际流通市值大于19亿,30日最大振幅小于50%，非st，主板`
 - 返回股票数：`52`
-- 输出文件：`config/main_seal_follow_pool.csv`
+- 输出文件：`data/stock_pools/current/main_seal_follow_pool.csv`
 - 沪电股份实际流通市值解析值：`149943676160`，约 `1499.44 亿`
 - 相关测试：`tests/test_collect_main_seal_pool.py`、`tests/test_import_iwencai_pool.py`
 - 测试结果：`10 passed`

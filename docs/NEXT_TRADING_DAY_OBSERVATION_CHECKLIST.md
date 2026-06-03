@@ -25,7 +25,7 @@ Expected log markers:
 Acceptance:
 
 - Stock pool generation succeeds without uncaught exceptions.
-- `config/main_seal_follow_pool.csv` is updated.
+- `data/stock_pools/current/main_seal_follow_pool.csv` is updated.
 - If Jiuyangongshe is skipped, the warning must explain why.
 
 ## 09:30-09:35
@@ -82,7 +82,7 @@ Acceptance:
 - `strategies=0`: check whether the session started on a trading day and
   whether the CSV was generated correctly.
 - `tick_subscriptions=0`: check whether strategies loaded from
-  `config/main_seal_follow_pool.csv`.
+  `data/stock_pools/current/main_seal_follow_pool.csv`.
 - `l2_stocks=0` all morning: likely no stock got near limit-up, or the trigger
   conditions are too strict.
 - No `MSF_EVENT`: check summary mode logs and confirm the strategy actually

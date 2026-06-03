@@ -384,6 +384,7 @@ def test_collect_main_seal_pool_filters_gated_candidates_by_base():
 
 def test_collect_main_seal_pool_combined_source_merges_final_pool(tmp_path, monkeypatch):
     output = tmp_path / "pool.csv"
+    trace_dir = tmp_path / "runs"
 
     source_config = tmp_path / "sources.json"
     source_config.write_text(
@@ -448,6 +449,8 @@ def test_collect_main_seal_pool_combined_source_merges_final_pool(tmp_path, monk
             str(source_config),
             "--output",
             str(output),
+            "--trace-dir",
+            str(trace_dir),
             "--amount",
             "1000",
             "--no-backup",
@@ -464,6 +467,20 @@ def test_collect_main_seal_pool_combined_source_merges_final_pool(tmp_path, monk
         ["600604", "市北高新", "1000"],
         ["000001", "平安银行", "1000"],
     ]
+
+    run_dirs = list(trace_dir.glob("*/*"))
+    assert len(run_dirs) == 1
+    run_dir = run_dirs[0]
+    assert (run_dir / "sources" / "iwencai.base.csv").exists()
+    assert (run_dir / "sources" / "iwencai.direct.csv").exists()
+    assert (run_dir / "sources" / "jiuyangongshe.hot.csv").exists()
+    assert (run_dir / "merge" / "raw_before_unified_filter.csv").exists()
+    assert (run_dir / "merge" / "final_pool.csv").exists()
+
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["source"] == "combined"
+    assert manifest["final_count"] == 3
+    assert sorted(manifest["sources"]) == ["iwencai.base", "iwencai.direct", "jiuyangongshe.hot"]
 
 
 def test_collect_main_seal_pool_extracts_target_article_sections_and_stocks():

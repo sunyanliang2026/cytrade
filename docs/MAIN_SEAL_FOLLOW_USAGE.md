@@ -7,13 +7,13 @@
 默认股票池文件：
 
 ```text
-config/main_seal_follow_pool.csv
+data/stock_pools/current/main_seal_follow_pool.csv
 ```
 
 手工测试股票池文件：
 
 ```text
-config/main_seal_follow_manual_pool.csv
+data/stock_pools/manual/main_seal_follow_manual_pool.csv
 ```
 
 CSV 表头：
@@ -84,7 +84,7 @@ python scripts\pool\collect_jiuyangongshe_pool.py
 - 查询语句：`涨停，实际流通市值大于19亿,30日最大振幅小于50%，非st，主板`
 - 调用方式：`pywencai.get(query=..., query_type="stock", loop=True, cookie=...)`
 - 输出前仍会做代码归一、去重、主板过滤和非 ST 过滤
-- 输出：`config/main_seal_follow_pool.csv`
+- 输出：`data/stock_pools/current/main_seal_follow_pool.csv`
 
 单次立即生成：
 
@@ -120,7 +120,7 @@ QMT 来源筛选条件：
 - 最近一个交易日收盘价等于涨停价
 - 本地流通市值：大于 `19亿`，口径为 QMT `FloatVolume * 最近收盘价`，不是问财“实际流通市值/自由流通市值”的严格口径
 - 30 日最大振幅：小于 `50%`，计算口径为 `30日最高价最大值 / 30日最低价最小值 - 1`
-- 输出：`config/main_seal_follow_pool.csv`
+- 输出：`data/stock_pools/current/main_seal_follow_pool.csv`
 
 QMT 常用参数：
 
@@ -132,7 +132,7 @@ QMT 常用参数：
 每次覆盖正式股票池前，默认会把旧文件备份为：
 
 ```text
-config/main_seal_follow_pool.backup_YYYYMMDD_HHMMSS.csv
+data/stock_pools/current/main_seal_follow_pool.backup_YYYYMMDD_HHMMSS.csv
 ```
 
 股票池生成工具不连接交易账户，不会下单。
@@ -218,7 +218,7 @@ scripts\ops\start_main_seal_follow_manual_monitor.bat
 
 这个入口默认：
 
-- 使用 `config/main_seal_follow_manual_pool.csv`
+- 使用 `data/stock_pools/manual/main_seal_follow_manual_pool.csv`
 - 跳过自动股票池生成
 - 继续走 dry-run market-only 监测链路
 - 支持 1 只或多只股票，按 CSV 内容创建策略实例
@@ -231,7 +231,7 @@ scripts\ops\start_main_seal_follow_manual_managed.bat
 
 这个入口默认：
 
-- 使用 `config/main_seal_follow_manual_pool.csv`
+- 使用 `data/stock_pools/manual/main_seal_follow_manual_pool.csv`
 - 走完整运行时，会连接交易账户和行情
 - 允许启动前账户校验、委托同步、持仓恢复生效
 - 策略只加载手工池里列出的股票

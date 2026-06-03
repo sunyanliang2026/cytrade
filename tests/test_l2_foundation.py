@@ -6,7 +6,7 @@ from core.l2_models import L2OrderEvent, L2OrderQueueEvent, L2QuoteEvent, L2Tran
 from core.models import TickData
 from strategy.base import BaseStrategy
 from strategy.models import StrategyConfig
-from strategy.runner import StrategyRunner
+from strategy.runner import StrategyRunner, _select_configs_in_subprocess
 
 
 class _FakeDataSubscription:
@@ -132,6 +132,25 @@ class _DummyDynamicL2Strategy(BaseStrategy):
     def select_stocks(self):
         return []
 
+
+class _SettingsAwareSelectionStrategy(BaseStrategy):
+    strategy_name = "SettingsAwareSelectionStrategy"
+
+    def on_tick(self, tick):
+        return None
+
+    def select_stocks(self):
+        from config.settings import settings as global_settings
+
+        csv_path = str(getattr(global_settings, "CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH", "") or "")
+        return [
+            StrategyConfig(
+                stock_code="600162",
+                params={
+                    "csv_path": csv_path,
+                },
+            )
+        ]
 
 def test_data_subscription_mock_callbacks_cover_tick_and_l2():
     manager = DataSubscriptionManager()
@@ -273,6 +292,19 @@ def test_data_subscription_parses_l2_orderqueue_partial_coverage():
     assert event.observed_queue_count == 4
     assert event.reported_total_order_count == 704
     assert event.is_partial_queue is True
+
+
+def test_stock_selection_subprocess_entry_applies_runtime_overrides():
+    configs = _select_configs_in_subprocess(
+        _SettingsAwareSelectionStrategy,
+        {
+            "CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH": "data/stock_pools/manual/main_seal_follow_manual_pool.csv",
+        },
+    )
+
+    assert len(configs) == 1
+    assert configs[0].stock_code == "600162"
+    assert configs[0].params["csv_path"] == "data/stock_pools/manual/main_seal_follow_manual_pool.csv"
 
 
 def test_runner_syncs_l2_subscription_plan_and_dispatches_events():

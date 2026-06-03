@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-DEFAULT_OUTPUT = Path("config/main_seal_follow_pool.csv")
+DEFAULT_OUTPUT = Path("data/stock_pools/current/main_seal_follow_pool.csv")
+DEFAULT_TRACE_DIR = Path("data/stock_pools/runs")
 LOCAL_RUNTIME_CONFIG_PATH = Path("config/local_runtime.json")
 DEFAULT_SOURCE_CONFIG = Path("config/main_seal_pool_sources.json")
 DEFAULT_IWENCAI_QUERY_FILE = Path("config/iwencai_pool_queries.json")

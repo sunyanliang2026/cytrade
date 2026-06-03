@@ -15,7 +15,7 @@ scripts\ops\start_main_seal_follow_monitor.bat
 
 Default behavior:
 
-- Wait until `08:50`, then generate `config/main_seal_follow_pool.csv`.
+- Wait until `08:50`, then generate `data/stock_pools/current/main_seal_follow_pool.csv`.
 - Start `MainSealFollow` in `market-only` mode with `dry_run=true` at `09:15`.
 - Stop automatically at `11:00`.
 - Generate the post-session morning review automatically after the runtime stops.

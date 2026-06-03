@@ -6,6 +6,8 @@ logic lives in sibling modules under ``scripts.pool``.
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import os
 import sys
 from datetime import datetime
@@ -21,6 +23,7 @@ from scripts.pool.common import (
     DEFAULT_IWENCAI_QUERY,
     DEFAULT_IWENCAI_QUERY_FILE,
     DEFAULT_OUTPUT,
+    DEFAULT_TRACE_DIR,
     DEFAULT_SECTOR,
     DEFAULT_SOURCE_CONFIG,
     IWENCAI_COOKIE_ENV,
@@ -86,6 +89,55 @@ from scripts.pool.source_config import (
 )
 
 
+def _safe_filename(value: str) -> str:
+    text = str(value or "").strip()
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text) or "unknown"
+
+
+def build_trace_run_dir(args, now: datetime) -> Path:
+    base = Path(str(getattr(args, "trace_dir", DEFAULT_TRACE_DIR) or DEFAULT_TRACE_DIR))
+    return base / now.strftime("%Y-%m-%d") / now.strftime("%H%M%S")
+
+
+def write_candidates_trace(candidates: list[PoolCandidate], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as fp:
+        writer = csv.writer(fp)
+        writer.writerow(
+            [
+                "code",
+                "name",
+                "pct_change",
+                "last_price",
+                "pre_close",
+                "amount",
+                "float_market_value",
+                "max_amplitude_30d",
+            ]
+        )
+        for item in candidates:
+            writer.writerow(
+                [
+                    item.code,
+                    item.name,
+                    f"{item.pct_change:.4f}",
+                    f"{item.last_price:.4f}",
+                    f"{item.pre_close:.4f}",
+                    f"{item.amount:.4f}",
+                    f"{item.float_market_value:.4f}",
+                    f"{item.max_amplitude_30d:.4f}",
+                ]
+            )
+
+
+def write_trace_manifest(run_dir: Path, manifest: dict) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
 def collect_configured_source_sets(args) -> tuple[dict[str, list[PoolCandidate]], object]:
     source_sets, final_expression = read_source_sets_from_config(Path(args.source_config))
     if not source_sets:
@@ -145,6 +197,18 @@ def collect_configured_source_sets(args) -> tuple[dict[str, list[PoolCandidate]]
 
 def collect_once(args) -> int:
     now = datetime.now()
+    trace_run_dir = build_trace_run_dir(args, now)
+    trace_sources_dir = trace_run_dir / "sources"
+    trace_merge_dir = trace_run_dir / "merge"
+    trace_manifest: dict = {
+        "generated_at": now.isoformat(timespec="seconds"),
+        "source": str(args.source),
+        "output": str(args.output),
+        "amount": float(args.amount),
+        "source_config": str(getattr(args, "source_config", "")),
+        "sources": {},
+        "files": {},
+    }
     if args.market_day_only and not is_market_day(now):
         print(f"跳过股票池生成：{now:%Y-%m-%d} 不是交易日", flush=True)
         return 0
@@ -165,6 +229,14 @@ def collect_once(args) -> int:
             require_today=jiuyangongshe_config.require_today,
         )
         print(f"已解析韭研公社文章 {article_url} sections={len(sections)} stocks={len(candidates)}", flush=True)
+        source_path = trace_sources_dir / "jiuyangongshe.csv"
+        write_candidates_trace(candidates, source_path)
+        trace_manifest["sources"]["jiuyangongshe"] = {
+            "raw": len(candidates),
+            "file": str(source_path),
+            "article_url": article_url,
+            "sections": len(sections),
+        }
     elif args.source == "iwencai":
         queries = resolve_iwencai_queries(args)
         candidates = collect_from_iwencai_queries(
@@ -174,12 +246,27 @@ def collect_once(args) -> int:
             loop=not bool(args.no_iwencai_loop),
         )
         print(f"已通过 pywencai 汇总股票池: queries={len(queries)} stocks={len(candidates)}", flush=True)
+        source_path = trace_sources_dir / "iwencai.csv"
+        write_candidates_trace(candidates, source_path)
+        trace_manifest["sources"]["iwencai"] = {
+            "raw": len(candidates),
+            "file": str(source_path),
+            "queries": len(queries),
+        }
     elif args.source == "combined":
         named_sets, final_expression = collect_configured_source_sets(args)
         if named_sets and final_expression is not None:
             candidates = evaluate_candidate_expression(final_expression, named_sets)
             for name, rows in named_sets.items():
+                source_path = trace_sources_dir / f"{_safe_filename(name)}.csv"
+                write_candidates_trace(rows, source_path)
+                trace_manifest["sources"][name] = {
+                    "raw": len(rows),
+                    "merged": len(merge_candidates(rows)),
+                    "file": str(source_path),
+                }
                 print(f"SET_SUMMARY {name} merged={len(merge_candidates(rows))}", flush=True)
+            trace_manifest["final_expression"] = final_expression
             print(f"FINAL expression_result={len(candidates)}", flush=True)
         else:
             queries = resolve_iwencai_queries(args)
@@ -191,6 +278,13 @@ def collect_once(args) -> int:
                 loop=not bool(args.no_iwencai_loop),
             )
             print(f"已汇总股票池来源: compatibility_direct_queries={len(queries)} raw_stocks={len(candidates)}", flush=True)
+            source_path = trace_sources_dir / "compatibility_iwencai_direct.csv"
+            write_candidates_trace(candidates, source_path)
+            trace_manifest["sources"]["compatibility_iwencai_direct"] = {
+                "raw": len(candidates),
+                "file": str(source_path),
+                "queries": len(direct_queries),
+            }
     else:
         candidates = collect_from_qmt(
             sector=str(args.sector),
@@ -200,8 +294,17 @@ def collect_once(args) -> int:
             history_count=int(args.history_count),
             download_history=not bool(args.no_download_history),
         )
+        source_path = trace_sources_dir / "qmt.csv"
+        write_candidates_trace(candidates, source_path)
+        trace_manifest["sources"]["qmt"] = {
+            "raw": len(candidates),
+            "file": str(source_path),
+        }
 
     before_merge_count = len(candidates)
+    raw_path = trace_merge_dir / "raw_before_unified_filter.csv"
+    write_candidates_trace(candidates, raw_path)
+    trace_manifest["files"]["raw_before_unified_filter"] = str(raw_path)
     candidates = merge_candidates(candidates)
     if not candidates:
         raise RuntimeError("股票池为空：所有来源均无有效候选股票")
@@ -215,10 +318,17 @@ def collect_once(args) -> int:
         float(args.amount),
         backup_existing=not bool(args.no_backup),
     )
+    final_trace_path = trace_merge_dir / "final_pool.csv"
+    write_candidates_trace(candidates, final_trace_path)
+    trace_manifest["files"]["final_pool_trace"] = str(final_trace_path)
+    trace_manifest["raw_count"] = before_merge_count
+    trace_manifest["final_count"] = len(candidates)
+    write_trace_manifest(trace_run_dir, trace_manifest)
     print(
         f"已生成股票池: {args.output} 股票数={len(candidates)} source={args.source} amount={args.amount:g}",
         flush=True,
     )
+    print(f"TRACE stock_pool_run={trace_run_dir}", flush=True)
     for item in candidates[:20]:
         print(
             f"ROW code={item.code} name={item.name} pct={item.pct_change:.2f} "
@@ -268,6 +378,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true", help="只立即执行一次后退出。")
     parser.add_argument("--schedule-time", default="", help="常驻定时执行时间，格式 HH:MM。")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help=f"输出路径，默认 {DEFAULT_OUTPUT}")
+    parser.add_argument("--trace-dir", default=str(DEFAULT_TRACE_DIR), help=f"筛选过程留痕目录，默认 {DEFAULT_TRACE_DIR}")
     parser.add_argument("--source-config", default=str(DEFAULT_SOURCE_CONFIG), help=f"股票池来源配置文件，默认 {DEFAULT_SOURCE_CONFIG}。")
     parser.add_argument("--amount", type=float, default=50000.0, help="每只股票计划买入金额，默认 50000。")
     parser.add_argument("--pct-min", type=float, default=6.0, help=argparse.SUPPRESS)

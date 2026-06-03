@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 
 
-DEFAULT_OUTPUT = Path("config/main_seal_follow_pool.csv")
+DEFAULT_OUTPUT = Path("data/stock_pools/current/main_seal_follow_pool.csv")
 OUTPUT_HEADERS = ["股票代码", "名称", "计划买入金额"]
 
 CODE_COLUMNS = (

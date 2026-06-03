@@ -13,12 +13,12 @@ scripts\ops\start_main_seal_follow_manual_managed.bat
 Default pool file:
 
 ```text
-config/main_seal_follow_manual_pool.csv
+data/stock_pools/manual/main_seal_follow_manual_pool.csv
 ```
 
 ## Before Start
 
-- Confirm `config/main_seal_follow_manual_pool.csv` contains only the intended
+- Confirm `data/stock_pools/manual/main_seal_follow_manual_pool.csv` contains only the intended
   stocks.
 - Confirm QMT is logged in and the target account is available.
 - Confirm `CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN=true` if the goal is only takeover
@@ -54,7 +54,7 @@ Expected log markers:
 
 Acceptance:
 
-- Only stocks from `config/main_seal_follow_manual_pool.csv` are loaded.
+- Only stocks from `data/stock_pools/manual/main_seal_follow_manual_pool.csv` are loaded.
 - If the pool has only one row, only one strategy instance is created.
 
 ## Account Sync
