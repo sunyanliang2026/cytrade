@@ -31,9 +31,22 @@ SAFE_ORDER_MARKERS = (
     "忽略重复成交",
     "忽略无策略归属成交",
     "下单拦截",
+    "\u5a09\u3125\u553d\u7481\u3220\u5d1f",
+    "\u7481\u3220\u5d1f\u9418\u8235\u20ac\u4f78\u5f49\u93c7?",
+    "\u8e47\u754c\u6690\u95b2\u5d85\ue632\u93b4\u612a\u6c26",
+    "\u8e47\u754c\u6690\u93c3\u72b5\u74e5\u9423\u30e5\u7d8a\u705e\u70b4\u579a\u6d5c?",
+    "\u6d93\u5b2a\u5d1f\u93b7\ufe3d\u57c5",
+    "注册订单",
+    "订单状态变更",
+    "忽略重复成交",
+    "忽略无策略归属成交",
+    "下单拦截",
 )
 SUSPICIOUS_ORDER_MARKERS = (
     "LIVE preflight passed",
+    "下单提交",
+    "撤单提交",
+    "[ORDER] [TRADE] 成交",
     "下单提交",
     "撤单提交",
     "[ORDER] [TRADE] 成交",
@@ -106,6 +119,13 @@ def parse_key_values(text: str) -> dict[str, Any]:
         key = match.group("key")
         fields[key] = _coerce_scalar(key, match.group("value"))
     return fields
+
+
+def _split_csv_values(value: Any) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [item.strip() for item in text.split(",") if item.strip()]
 
 
 def extract_log_message(line: str) -> str:
@@ -202,6 +222,29 @@ def parse_log_line(line: str, *, source: str = "") -> ParsedLogEvent | None:
             fields={**parse_key_values(message), "_logged_at": timestamp},
             raw=raw,
         )
+
+    if message.startswith("STRATEGY_SELECTION"):
+        fields = {**parse_key_values(message), "_logged_at": timestamp}
+        return ParsedLogEvent(
+            type="strategy_selection",
+            message=message,
+            source=source,
+            event="stock_selection",
+            fields=fields,
+            raw=raw,
+        )
+
+    if "MainSealFollow" in message and "stock=" in message:
+        fields = {**parse_key_values(message), "_logged_at": timestamp}
+        if fields.get("stock"):
+            return ParsedLogEvent(
+                type="strategy_instance",
+                message=message,
+                source=source,
+                event="stock_initialized",
+                fields=fields,
+                raw=raw,
+            )
 
     if MOCK_TRADE_MARKER in message:
         return ParsedLogEvent(
@@ -617,6 +660,8 @@ def summarize_events(events: Iterable[ParsedLogEvent]) -> dict[str, Any]:
     heartbeats = [event for event in event_list if event.type == "runtime_heartbeat"]
     session_stop = [event for event in event_list if event.type == "monitor_session" and event.event in {"session_stop", "stopped"}]
     pool_generated = [event for event in event_list if event.type == "monitor_session" and event.event == "pool_generated"]
+    strategy_selection = [event for event in event_list if event.type == "strategy_selection"]
+    strategy_instances = [event for event in event_list if event.type == "strategy_instance"]
 
     max_strategies = _max_int(
         [event.fields.get("strategies") for event in heartbeats]
@@ -637,6 +682,22 @@ def summarize_events(events: Iterable[ParsedLogEvent]) -> dict[str, Any]:
     pool_total = 0
     if pool_generated:
         pool_total = _max_int(event.fields.get("total") for event in pool_generated)
+    if pool_total <= 0 and strategy_selection:
+        pool_total = _max_int(event.fields.get("total") for event in strategy_selection)
+
+    selected_stocks: list[str] = []
+    seen_selected_stocks: set[str] = set()
+    for event in strategy_selection:
+        for stock in _split_csv_values(event.fields.get("stocks")):
+            if stock not in seen_selected_stocks:
+                seen_selected_stocks.add(stock)
+                selected_stocks.append(stock)
+    if not selected_stocks:
+        for event in strategy_instances:
+            stock = str(event.fields.get("stock") or "").strip()
+            if stock and stock not in seen_selected_stocks:
+                seen_selected_stocks.add(stock)
+                selected_stocks.append(stock)
 
     stock_chains = _summarize_msf_chains(event_list)
     stock_chain_groups = _summarize_stock_chain_groups(stock_chains)
@@ -660,7 +721,7 @@ def summarize_events(events: Iterable[ParsedLogEvent]) -> dict[str, Any]:
         invalid_monitor_reason = "monitor_session_not_found"
 
     checks = {
-        "pool_generated": bool(pool_generated) and pool_total > 0,
+        "pool_generated": (bool(pool_generated) or bool(strategy_selection)) and pool_total > 0,
         "monitor_started": session_events.get("monitor_start", 0) > 0 or session_events.get("session_start", 0) > 0,
         "heartbeat_seen": bool(heartbeats),
         "strategies_after_activation": max_strategies > 0,
@@ -703,6 +764,7 @@ def summarize_events(events: Iterable[ParsedLogEvent]) -> dict[str, Any]:
         "stocks_with_msf_events": len(stock_chains),
         "stock_chain_event_counts": dict(sorted(stock_chain_counts.items())),
         "pool_total": pool_total,
+        "selected_stocks": selected_stocks,
         "heartbeat_count": len(heartbeats),
         "max_strategies": max_strategies,
         "max_tick_subscriptions": max_tick_subscriptions,
@@ -754,10 +816,36 @@ def format_markdown(summary: dict[str, Any], *, title: str = "MainSealFollow mor
         f"- Tick subscriptions max: `{summary.get('max_tick_subscriptions', 0)}`",
         f"- Invalid monitor reason: `{summary.get('invalid_monitor_reason') or 'none'}`",
         "",
-        "## Event counters",
-        "",
-        "### Session events",
     ]
+
+    l2_calibration = summary.get("l2_calibration", {})
+    lines.extend(["## L2 calibration coverage", ""])
+    if l2_calibration:
+        missing = list(l2_calibration.get("missing_stocks", []) or [])
+        missing_text = ", ".join(missing[:30]) if missing else "none"
+        if len(missing) > 30:
+            missing_text = f"{missing_text}, ... +{len(missing) - 30} more"
+        lines.extend(
+            [
+                f"- Complete: `{_status(bool(l2_calibration.get('complete')))}`",
+                f"- Expected stocks: `{l2_calibration.get('expected_count', 0)}`",
+                f"- Files found: `{l2_calibration.get('file_count', 0)}`",
+                f"- Matched stocks: `{l2_calibration.get('matched_count', 0)}`",
+                f"- Missing stocks: `{len(missing)}` {missing_text}",
+                f"- Directory: `{l2_calibration.get('dir', '')}`",
+                "",
+            ]
+        )
+    else:
+        lines.extend(["- No L2 calibration coverage data available.", ""])
+
+    lines.extend(
+        [
+            "## Event counters",
+            "",
+            "### Session events",
+        ]
+    )
 
     session_events = summary.get("session_events", {})
     if session_events:

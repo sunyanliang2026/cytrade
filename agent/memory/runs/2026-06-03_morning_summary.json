@@ -1,0 +1,174 @@
+{
+  "blocked_reasons": {
+    "limit_price_or_queue_missing": 1
+  },
+  "checks": {
+    "dry_run_probe_trade_seen": false,
+    "entry_signal_seen": false,
+    "heartbeat_seen": true,
+    "invalid_monitor_session": false,
+    "l2_detail_seen": true,
+    "market_data_active": false,
+    "minimum_acceptance": false,
+    "monitor_started": true,
+    "no_real_order_suspected": true,
+    "pool_generated": false,
+    "session_stopped": true,
+    "strategies_after_activation": true
+  },
+  "event_counts": {
+    "monitor_session": 12,
+    "msf_event": 1,
+    "runtime_heartbeat": 196,
+    "strategy_instance": 100
+  },
+  "generated_at": "2026-06-03T16:55:16",
+  "heartbeat_count": 196,
+  "invalid_monitor_reason": "",
+  "l2_calibration": {
+    "complete": false,
+    "dir": "C:\\Users\\ysun\\workspace\\cytrade\\logs\\l2_calibration",
+    "expected_count": 25,
+    "extra_stocks": [],
+    "file_count": 23,
+    "matched_count": 23,
+    "missing_stocks": [
+      "600622",
+      "601116"
+    ]
+  },
+  "latest_heartbeat": {
+    "_logged_at": "2026-06-03T10:59:51",
+    "connected": false,
+    "data_delay_ms": 485.0,
+    "dry_run": true,
+    "l2_kinds": 25,
+    "l2_stocks": 25,
+    "last_recv_time": "2026-06-03",
+    "last_strategy_event": "l2quote:1",
+    "last_strategy_event_time": "2026-06-03",
+    "latest_data_time": "2026-06-03",
+    "mode": "market-only-monitor",
+    "process_ms": 0.0,
+    "reason": "changed",
+    "stable_for_sec": "0",
+    "strategies": 25,
+    "tick_subscriptions": 0,
+    "trading_ready": "False"
+  },
+  "log_patterns": [
+    "logs/system.*.log",
+    "logs/trade.*.log",
+    "logs/system.log",
+    "logs/trade.log"
+  ],
+  "max_l2_kinds": 31,
+  "max_l2_stocks": 25,
+  "max_strategies": 25,
+  "max_tick_subscriptions": 0,
+  "mock_trade_count": 0,
+  "msf_events": {
+    "entry_signal_blocked": 1
+  },
+  "pool_total": 0,
+  "possible_real_order_count": 0,
+  "real_order_suspected": false,
+  "review_verdict": "needs_review",
+  "reviewed_at": "2026-06-03T16:55:16",
+  "reviewed_sources": [
+    "C:\\Users\\ysun\\workspace\\cytrade\\logs\\system.12872.log",
+    "C:\\Users\\ysun\\workspace\\cytrade\\logs\\trade.12872.log"
+  ],
+  "run_id": "2026-06-03",
+  "selected_stocks": [
+    "000025",
+    "000037",
+    "000090",
+    "000151",
+    "000608",
+    "000799",
+    "000926",
+    "002251",
+    "002457",
+    "002608",
+    "002806",
+    "002824",
+    "600011",
+    "600110",
+    "600488",
+    "600622",
+    "600693",
+    "600857",
+    "600979",
+    "601116",
+    "601566",
+    "601702",
+    "603011",
+    "603890",
+    "605277"
+  ],
+  "session_events": {
+    "monitor_start": 1,
+    "pool_reused": 1,
+    "review_generated": 1,
+    "review_start": 1,
+    "session_start": 1,
+    "session_stop": 1,
+    "stopped": 1,
+    "waiting": 5
+  },
+  "stock_chain_count": 1,
+  "stock_chain_event_counts": {
+    "1": 1
+  },
+  "stock_chain_groups": {
+    "blocked_only": [
+      "600857 宁波中百"
+    ],
+    "entry_accepted": [],
+    "main_cancel_decision": [],
+    "main_keep_decision": [],
+    "probe_trade_recorded": []
+  },
+  "stock_chains": [
+    {
+      "dry_run_probe_trade_count": 0,
+      "entry_signal_accepted_count": 0,
+      "entry_signal_blocked_count": 1,
+      "event_count": 1,
+      "event_counts": {
+        "entry_signal_blocked": 1
+      },
+      "events": [
+        {
+          "dry_run": true,
+          "event": "entry_signal_blocked",
+          "metrics": {
+            "has_queue": false,
+            "limit_up_price": 18.18
+          },
+          "reason": "limit_price_or_queue_missing",
+          "source": "l2order",
+          "state": "WAIT_SIGNAL",
+          "summary_cn": "排板被阻断：缺少涨停价或买一队列，无法判断排板位置",
+          "time": "2026-06-03T09:25:00"
+        }
+      ],
+      "first_seen": "2026-06-03T09:25:00",
+      "last_seen": "2026-06-03T09:25:00",
+      "latest_reason": "limit_price_or_queue_missing",
+      "latest_state": "WAIT_SIGNAL",
+      "main_cancel_count": 0,
+      "main_keep_count": 0,
+      "name": "宁波中百",
+      "reason_counts": {
+        "limit_price_or_queue_missing": 1
+      },
+      "source_counts": {
+        "l2order": 1
+      },
+      "stock": "600857"
+    }
+  ],
+  "stocks_with_msf_events": 1
+}

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import date, datetime
 from pathlib import Path
 
@@ -24,6 +25,8 @@ DEFAULT_LOG_PATTERNS = [
     "logs/system.log",
     "logs/trade.log",
 ]
+
+L2_CALIBRATION_FILE_RE = re.compile(r"^main_seal_follow_(?P<code>\d{6})(?:_.*)?\.jsonl$")
 
 
 def _normalize_log_path(path_text: str, *, repo_root: Path) -> str:
@@ -92,6 +95,50 @@ def build_default_run_id(value: str | None = None) -> str:
     return date.today().isoformat()
 
 
+def build_l2_calibration_coverage(
+    *,
+    summary: dict,
+    run_id: str,
+    repo_root: Path,
+    calibration_dir: str | None = None,
+) -> dict:
+    """Compare selected strategy stocks with generated L2 calibration files."""
+
+    expected = [str(stock or "").strip() for stock in summary.get("selected_stocks", []) if str(stock or "").strip()]
+    expected_set = set(expected)
+    target_dir = Path(calibration_dir or "logs/l2_calibration")
+    if not target_dir.is_absolute():
+        target_dir = repo_root / target_dir
+
+    files: list[Path] = []
+    matched_stocks: set[str] = set()
+    if target_dir.is_dir():
+        for path in target_dir.glob("main_seal_follow_*.jsonl"):
+            try:
+                if run_id and path.stat().st_mtime:
+                    modified_day = datetime.fromtimestamp(path.stat().st_mtime).date().isoformat()
+                    if modified_day != run_id:
+                        continue
+            except OSError:
+                continue
+            files.append(path)
+            match = L2_CALIBRATION_FILE_RE.match(path.name)
+            if match:
+                matched_stocks.add(match.group("code"))
+
+    missing = sorted(expected_set - matched_stocks)
+    extra = sorted(matched_stocks - expected_set) if expected_set else sorted(matched_stocks)
+    return {
+        "dir": str(target_dir),
+        "expected_count": len(expected),
+        "file_count": len(files),
+        "matched_count": len(expected_set & matched_stocks) if expected_set else len(matched_stocks),
+        "complete": bool(expected_set) and not missing,
+        "missing_stocks": missing,
+        "extra_stocks": extra,
+    }
+
+
 def run_post_morning_review(
     *,
     logs: list[str] | None = None,
@@ -121,6 +168,11 @@ def run_post_morning_review(
             for event in events
             if event.source
         }
+    )
+    summary["l2_calibration"] = build_l2_calibration_coverage(
+        summary=summary,
+        run_id=resolved_run_id,
+        repo_root=repo_root,
     )
 
     markdown = format_markdown(summary, title=f"MainSealFollow morning review - {resolved_run_id}")

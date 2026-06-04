@@ -24,12 +24,25 @@ from monitor.logger import get_logger
 logger = get_logger("system")
 
 
-def _select_configs_in_subprocess(strategy_class):
+def _apply_selection_runtime_overrides(overrides: dict | None) -> None:
+    if not overrides:
+        return
+    from config.settings import settings as global_runtime_settings
+
+    for name, value in dict(overrides).items():
+        if not isinstance(name, str) or not name.isupper():
+            continue
+        if hasattr(global_runtime_settings, name):
+            setattr(global_runtime_settings, name, value)
+
+
+def _select_configs_in_subprocess(strategy_class, runtime_overrides: dict | None = None):
     """鍦ㄥ瓙杩涚▼涓墽琛岄€夎偂閫昏緫骞惰繑鍥為厤缃垪琛ㄣ€?
 
     杩欐牱鍋氱殑涓昏鐩殑鏄妸娼滃湪鑰楁椂杈冮暱銆佷笖鍙兘渚濊禆澶栭儴璁＄畻鐨勯€夎偂閫昏緫
     涓庝富杩涚▼闅旂寮€锛岄檷浣庨樆濉炰富娴佺▼鐨勯闄┿€?
     """
+    _apply_selection_runtime_overrides(runtime_overrides)
     strategy = strategy_class(StrategyConfig(), None, None)
     return strategy.select_stocks()
 
@@ -49,7 +62,8 @@ class StrategyRunner:
                  state_autosave_interval_sec: int = 300,
                  state_realtime_persist_min_interval_sec: float = 3.0,
                  latency_threshold_sec: float = 10.0,
-                 process_threshold_ms: float = 200.0):
+                 process_threshold_ms: float = 200.0,
+                 selection_runtime_overrides: dict | None = None):
         """鍒濆鍖栫瓥鐣ヨ繍琛屽櫒銆?
 
         Args:
@@ -113,6 +127,7 @@ class StrategyRunner:
         self._alert_callback = None
         # ``_known_trade_ids`` 缂撳瓨宸插鐞嗘垚浜わ紝閬垮厤涓诲姩鍚屾閲嶅鍥炴斁鍚屼竴绗旀垚浜ゃ€?
         self._known_trade_ids: Optional[set[str]] = None
+        self._selection_runtime_overrides = dict(selection_runtime_overrides or {})
 
     def set_heartbeat_callback(self, callback) -> None:
         """娉ㄥ唽蹇冭烦鍥炶皟锛屼緵鐪嬮棬鐙楁劅鐭ョ瓥鐣ヤ富寰幆鏄惁浠嶅湪宸ヤ綔銆?"""
@@ -452,17 +467,41 @@ class StrategyRunner:
         for cls in self._strategy_classes:
             try:
                 configs: List[StrategyConfig] = []
+                selection_mode = "subprocess"
                 try:
                     with ProcessPoolExecutor(max_workers=1) as pool:
-                        configs = pool.submit(_select_configs_in_subprocess, cls).result(timeout=30)
+                        configs = pool.submit(
+                            _select_configs_in_subprocess,
+                            cls,
+                            self._selection_runtime_overrides,
+                        ).result(timeout=30)
                 except Exception as e:
                     logger.warning("StrategyRunner: 子进程选股失败，降级为主进程执行 [%s]: %s",
                                    cls.__name__, e)
+                    selection_mode = "main_process_fallback"
+                    _apply_selection_runtime_overrides(self._selection_runtime_overrides)
                     configs = cls(
                         StrategyConfig(),
                         self._trade_exec,
                         self._position_mgr
                     ).select_stocks()
+
+                csv_paths = sorted(
+                    {
+                        str((cfg.params or {}).get("csv_path") or "")
+                        for cfg in configs
+                        if str((cfg.params or {}).get("csv_path") or "")
+                    }
+                )
+                stock_codes = [str(cfg.stock_code or "") for cfg in configs if str(cfg.stock_code or "")]
+                logger.info(
+                    "STRATEGY_SELECTION strategy=%s mode=%s total=%d csv_path=%s stocks=%s",
+                    cls.__name__,
+                    selection_mode,
+                    len(configs),
+                    "|".join(csv_paths),
+                    ",".join(stock_codes),
+                )
 
                 for cfg in configs:
                     strategy = cls(cfg, self._trade_exec, self._position_mgr)

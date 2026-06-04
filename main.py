@@ -62,6 +62,23 @@ from runtime import session as _runtime_session
 from runtime import strategies as _runtime_strategies
 
 
+STRATEGY_SELECTION_SETTING_KEYS = (
+    "CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH",
+    "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN",
+    "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION",
+    "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION_DIR",
+    "LOG_DIR",
+)
+
+
+def _build_strategy_selection_overrides(settings: Settings) -> dict:
+    return {
+        name: getattr(settings, name)
+        for name in STRATEGY_SELECTION_SETTING_KEYS
+        if hasattr(settings, name)
+    }
+
+
 def _to_strategy_spec(strategy_class_or_spec) -> str:
     return _runtime_strategies.to_strategy_spec(strategy_class_or_spec)
 
@@ -196,6 +213,7 @@ def build_app(strategy_classes=None, settings: Settings = None):
         load_previous_state_on_start=settings.LOAD_PREVIOUS_STATE_ON_START,
         latency_threshold_sec=settings.DATA_LATENCY_THRESHOLD_SEC,
         process_threshold_ms=settings.STRATEGY_PROCESS_THRESHOLD_MS,
+        selection_runtime_overrides=_build_strategy_selection_overrides(settings),
     )
 
     # 娉ㄥ唽鈥滆鍗曠姸鎬佸彉鍖?-> 绛栫暐瀵硅薄鈥濈殑鍥炶皟銆?
