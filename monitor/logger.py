@@ -176,7 +176,8 @@ class LogManager:
         if _USE_JSON:
             formatter = jsonlogger.JsonFormatter(
                 fmt="%(asctime)s %(name)s %(levelname)s %(message)s",
-                datefmt="%Y-%m-%dT%H:%M:%S"
+                datefmt="%Y-%m-%dT%H:%M:%S",
+                json_ensure_ascii=False,
             )
         else:
             formatter = logging.Formatter(

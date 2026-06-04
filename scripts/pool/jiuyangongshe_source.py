@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 from collections.abc import Iterable
 from datetime import datetime
@@ -116,7 +117,10 @@ def extract_jiuyangongshe_article_html(page: str) -> str:
     if end < 0:
         return ""
     raw = page[start:end]
-    decoded = raw.encode("utf-8").decode("unicode_escape")
+    try:
+        decoded = json.loads(f'"{raw}"')
+    except json.JSONDecodeError:
+        decoded = raw.encode("utf-8").decode("unicode_escape")
     return html.unescape(decoded)
 
 
