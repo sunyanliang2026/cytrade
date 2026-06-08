@@ -2,6 +2,7 @@ import csv
 import json
 import sys
 import types
+from datetime import datetime
 
 import pandas as pd
 
@@ -386,6 +387,11 @@ def test_collect_main_seal_pool_combined_source_merges_final_pool(tmp_path, monk
     output = tmp_path / "pool.csv"
     trace_dir = tmp_path / "runs"
 
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls):
+            return cls(2026, 6, 8, 8, 50)
+
     source_config = tmp_path / "sources.json"
     source_config.write_text(
         json.dumps(
@@ -438,6 +444,7 @@ def test_collect_main_seal_pool_combined_source_merges_final_pool(tmp_path, monk
     monkeypatch.setattr(pool_module, "collect_from_iwencai", fake_iwencai)
     monkeypatch.setattr(pool_module, "collect_from_jiuyangongshe_nodes", fake_jiuyangongshe_nodes)
     monkeypatch.setattr(pool_module, "resolve_iwencai_cookie", lambda value="": "cookie")
+    monkeypatch.setattr(pool_module, "datetime", FixedDatetime)
 
     args = pool_module.build_parser().parse_args(
         [
@@ -481,6 +488,105 @@ def test_collect_main_seal_pool_combined_source_merges_final_pool(tmp_path, monk
     assert manifest["source"] == "combined"
     assert manifest["final_count"] == 3
     assert sorted(manifest["sources"]) == ["iwencai.base", "iwencai.direct", "jiuyangongshe.hot"]
+
+
+def test_collect_main_seal_pool_reuses_iwencai_cache_after_0900(tmp_path, monkeypatch):
+    source_config = tmp_path / "sources.json"
+    source_config.write_text(
+        json.dumps(
+            {
+                "sets": {
+                    "iwencai.base": {"source": "iwencai", "query": "base query"},
+                    "jiuyangongshe.hot": {"source": "jiuyangongshe", "node": "hot_events"},
+                },
+                "final": {"intersect": ["jiuyangongshe.hot", "iwencai.base"]},
+                "jiuyangongshe": {"enabled": True, "require_today": True},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    args = pool_module.build_parser().parse_args(
+        [
+            "--source",
+            "combined",
+            "--source-config",
+            str(source_config),
+            "--source-cache-dir",
+            str(tmp_path / "cache"),
+            "--no-market-day-check",
+        ]
+    )
+    now = datetime(2026, 6, 8, 9, 15)
+    pool_module.write_source_cache(
+        args,
+        now,
+        "iwencai.base",
+        [PoolCandidate("600604", "市北高新", 0, 0, 0, 0)],
+    )
+
+    def fail_iwencai(**kwargs):
+        raise AssertionError("iwencai must not be collected after 09:00")
+
+    def fake_jiuyangongshe_nodes(**kwargs):
+        return (
+            {"hot_events": [PoolCandidate("600604.SH", "市北高新", 0, 0, 0, 0)]},
+            "https://example.test/a/today",
+            {"hot_events": ("section", "body")},
+        )
+
+    monkeypatch.setattr(pool_module, "collect_from_iwencai", fail_iwencai)
+    monkeypatch.setattr(pool_module, "collect_from_jiuyangongshe_nodes", fake_jiuyangongshe_nodes)
+
+    named_sets, final_expression = pool_module.collect_configured_source_sets(args, now)
+
+    assert [item.code for item in named_sets["iwencai.base"]] == ["600604"]
+    assert [item.code for item in named_sets["jiuyangongshe.hot"]] == ["600604.SH"]
+    assert [item.code for item in evaluate_candidate_expression(final_expression, named_sets)] == ["600604"]
+
+
+def test_collect_main_seal_pool_skips_jiuyangongshe_before_0830(tmp_path, monkeypatch):
+    source_config = tmp_path / "sources.json"
+    source_config.write_text(
+        json.dumps(
+            {
+                "sets": {
+                    "iwencai.base": {"source": "iwencai", "query": "base query"},
+                    "jiuyangongshe.hot": {"source": "jiuyangongshe", "node": "hot_events"},
+                },
+                "final": {"union": ["iwencai.base", "jiuyangongshe.hot"]},
+                "jiuyangongshe": {"enabled": True, "require_today": True},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    args = pool_module.build_parser().parse_args(
+        [
+            "--source",
+            "combined",
+            "--source-config",
+            str(source_config),
+            "--source-cache-dir",
+            str(tmp_path / "cache"),
+            "--no-market-day-check",
+        ]
+    )
+
+    def fake_iwencai(**kwargs):
+        return [PoolCandidate("600604", "市北高新", 0, 0, 0, 0)]
+
+    def fail_jiuyangongshe_nodes(**kwargs):
+        raise AssertionError("jiuyangongshe must not be collected before 08:30")
+
+    monkeypatch.setattr(pool_module, "collect_from_iwencai", fake_iwencai)
+    monkeypatch.setattr(pool_module, "collect_from_jiuyangongshe_nodes", fail_jiuyangongshe_nodes)
+    monkeypatch.setattr(pool_module, "resolve_iwencai_cookie", lambda value="": "cookie")
+
+    named_sets, _ = pool_module.collect_configured_source_sets(args, datetime(2026, 6, 8, 8, 20))
+
+    assert [item.code for item in named_sets["iwencai.base"]] == ["600604"]
+    assert named_sets["jiuyangongshe.hot"] == []
 
 
 def test_collect_main_seal_pool_extracts_target_article_sections_and_stocks():

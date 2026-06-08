@@ -88,6 +88,11 @@ from scripts.pool.source_config import (
     resolve_jiuyangongshe_config,
 )
 
+DEFAULT_SOURCE_CACHE_DIR = Path("data/stock_pools/source_cache")
+IWENCAI_COLLECT_CUTOFF_HOUR = 9
+JIUYANGONGSHE_READY_HOUR = 8
+JIUYANGONGSHE_READY_MINUTE = 30
+
 
 def _safe_filename(value: str) -> str:
     text = str(value or "").strip()
@@ -130,6 +135,54 @@ def write_candidates_trace(candidates: list[PoolCandidate], path: Path) -> None:
             )
 
 
+def read_candidates_trace(path: Path) -> list[PoolCandidate]:
+    if not path.is_file():
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as fp:
+        reader = csv.DictReader(fp)
+        rows: list[PoolCandidate] = []
+        for row in reader:
+            rows.append(
+                PoolCandidate(
+                    code=str(row.get("code", "") or ""),
+                    name=str(row.get("name", "") or ""),
+                    pct_change=float(row.get("pct_change", 0) or 0),
+                    last_price=float(row.get("last_price", 0) or 0),
+                    pre_close=float(row.get("pre_close", 0) or 0),
+                    amount=float(row.get("amount", 0) or 0),
+                    float_market_value=float(row.get("float_market_value", 0) or 0),
+                    max_amplitude_30d=float(row.get("max_amplitude_30d", 0) or 0),
+                )
+            )
+        return rows
+
+
+def build_source_cache_dir(args, now: datetime) -> Path:
+    base = Path(str(getattr(args, "source_cache_dir", DEFAULT_SOURCE_CACHE_DIR) or DEFAULT_SOURCE_CACHE_DIR))
+    return base / now.strftime("%Y-%m-%d")
+
+
+def source_cache_path(args, now: datetime, source_set_name: str) -> Path:
+    return build_source_cache_dir(args, now) / f"{_safe_filename(source_set_name)}.csv"
+
+
+def write_source_cache(args, now: datetime, source_set_name: str, candidates: list[PoolCandidate]) -> Path:
+    path = source_cache_path(args, now, source_set_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    write_candidates_trace(candidates, temp_path)
+    temp_path.replace(path)
+    return path
+
+
+def should_collect_iwencai(now: datetime) -> bool:
+    return now.hour < IWENCAI_COLLECT_CUTOFF_HOUR
+
+
+def should_collect_jiuyangongshe(now: datetime) -> bool:
+    return (now.hour, now.minute) >= (JIUYANGONGSHE_READY_HOUR, JIUYANGONGSHE_READY_MINUTE)
+
+
 def write_trace_manifest(run_dir: Path, manifest: dict) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "manifest.json").write_text(
@@ -138,26 +191,38 @@ def write_trace_manifest(run_dir: Path, manifest: dict) -> None:
     )
 
 
-def collect_configured_source_sets(args) -> tuple[dict[str, list[PoolCandidate]], object]:
+def collect_configured_source_sets(args, now: datetime) -> tuple[dict[str, list[PoolCandidate]], object]:
     source_sets, final_expression = read_source_sets_from_config(Path(args.source_config))
     if not source_sets:
         return {}, None
 
     named_sets: dict[str, list[PoolCandidate]] = {}
-    cookie = resolve_iwencai_cookie(str(args.iwencai_cookie or ""))
     iwencai_sets = [item for item in source_sets.values() if item.source == "iwencai"]
-    for source_set in iwencai_sets:
-        candidates = collect_from_iwencai(
-            query=source_set.query,
-            cookie=cookie,
-            query_type=str(args.iwencai_query_type),
-            loop=not bool(args.no_iwencai_loop),
-        )
-        named_sets[source_set.name] = candidates
-        print(f"SET {source_set.name} source=iwencai raw={len(candidates)}", flush=True)
+    if should_collect_iwencai(now):
+        cookie = resolve_iwencai_cookie(str(args.iwencai_cookie or ""))
+        for source_set in iwencai_sets:
+            candidates = collect_from_iwencai(
+                query=source_set.query,
+                cookie=cookie,
+                query_type=str(args.iwencai_query_type),
+                loop=not bool(args.no_iwencai_loop),
+            )
+            named_sets[source_set.name] = candidates
+            cache_path = write_source_cache(args, now, source_set.name, candidates)
+            print(f"SET {source_set.name} source=iwencai raw={len(candidates)} cache={cache_path}", flush=True)
+    else:
+        for source_set in iwencai_sets:
+            cache_path = source_cache_path(args, now, source_set.name)
+            candidates = read_candidates_trace(cache_path)
+            named_sets[source_set.name] = candidates
+            print(
+                f"SET {source_set.name} source=iwencai reused_cache={cache_path} raw={len(candidates)} "
+                f"reason=after_0900",
+                flush=True,
+            )
 
     jiuyangongshe_sets = [item for item in source_sets.values() if item.source == "jiuyangongshe"]
-    if jiuyangongshe_sets and not args.no_jiuyangongshe:
+    if jiuyangongshe_sets and not args.no_jiuyangongshe and should_collect_jiuyangongshe(now):
         jiuyangongshe_config = resolve_jiuyangongshe_config(args)
         if jiuyangongshe_config.enabled:
             try:
@@ -178,9 +243,10 @@ def collect_configured_source_sets(args) -> tuple[dict[str, list[PoolCandidate]]
                 for source_set in jiuyangongshe_sets:
                     candidates = node_results.get(source_set.node, [])
                     named_sets[source_set.name] = candidates
+                    cache_path = write_source_cache(args, now, source_set.name, candidates)
                     print(
                         f"SET {source_set.name} source=jiuyangongshe node={source_set.node} "
-                        f"raw={len(candidates)} article={article_url}",
+                        f"raw={len(candidates)} article={article_url} cache={cache_path}",
                         flush=True,
                     )
             except RuntimeError as exc:
@@ -206,6 +272,7 @@ def collect_once(args) -> int:
         "output": str(args.output),
         "amount": float(args.amount),
         "source_config": str(getattr(args, "source_config", "")),
+        "source_cache_dir": str(build_source_cache_dir(args, now)),
         "sources": {},
         "files": {},
     }
@@ -254,7 +321,7 @@ def collect_once(args) -> int:
             "queries": len(queries),
         }
     elif args.source == "combined":
-        named_sets, final_expression = collect_configured_source_sets(args)
+        named_sets, final_expression = collect_configured_source_sets(args, now)
         if named_sets and final_expression is not None:
             candidates = evaluate_candidate_expression(final_expression, named_sets)
             for name, rows in named_sets.items():
@@ -379,6 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--schedule-time", default="", help="常驻定时执行时间，格式 HH:MM。")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help=f"输出路径，默认 {DEFAULT_OUTPUT}")
     parser.add_argument("--trace-dir", default=str(DEFAULT_TRACE_DIR), help=f"筛选过程留痕目录，默认 {DEFAULT_TRACE_DIR}")
+    parser.add_argument("--source-cache-dir", default=str(DEFAULT_SOURCE_CACHE_DIR), help=f"source-level cache directory, default {DEFAULT_SOURCE_CACHE_DIR}.")
     parser.add_argument("--source-config", default=str(DEFAULT_SOURCE_CONFIG), help=f"股票池来源配置文件，默认 {DEFAULT_SOURCE_CONFIG}。")
     parser.add_argument("--amount", type=float, default=50000.0, help="每只股票计划买入金额，默认 50000。")
     parser.add_argument("--pct-min", type=float, default=6.0, help=argparse.SUPPRESS)
