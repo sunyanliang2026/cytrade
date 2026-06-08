@@ -13,6 +13,8 @@ saved_states/
 data/db/*.db
 data/db/*.sqlite
 data/db/*.sqlite3
+data/probe/
+data/replay/
 data/stock_pools/
 .tmp_pytest*/
 docs/_zip_inspect/
