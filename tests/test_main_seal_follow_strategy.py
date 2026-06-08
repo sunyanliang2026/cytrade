@@ -4,8 +4,8 @@ from pathlib import Path
 from config.enums import OrderStatus
 from core.l2_models import L2OrderEvent, L2OrderQueueEvent, L2QuoteEvent, L2TransactionEvent
 from monitor.logger import _SummaryFilter
-import strategy.main_seal_follow_strategy as msf_module
-from strategy.main_seal_follow_strategy import MainSealFollowStrategy
+import strategy.main_seal_follow.strategy as msf_module
+from strategy.main_seal_follow import MainSealFollowStrategy
 from strategy.models import StrategyConfig
 
 

@@ -21,7 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 os.chdir(REPO_ROOT)
 
 from core.data_subscription import DataSubscriptionManager
-from strategy.main_seal_follow_strategy import MainSealFollowStrategy
+from strategy.main_seal_follow import MainSealFollowStrategy
 from strategy.models import StrategyConfig
 
 

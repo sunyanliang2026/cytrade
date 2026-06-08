@@ -26,7 +26,7 @@ if str(ROOT) not in sys.path:
 from main import _log_runtime_startup_config, _start_runtime_heartbeat, build_app
 from config.settings import Settings
 from monitor.logger import get_log_file_path, get_logger
-from strategy.main_seal_follow_strategy import MainSealFollowStrategy
+from strategy.main_seal_follow import MainSealFollowStrategy
 
 
 def _apply_runtime_settings(runtime_settings) -> None:

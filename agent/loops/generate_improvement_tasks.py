@@ -183,7 +183,7 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 reason="策略已经激活，但复盘没有观察到 Level2 明细订阅，需要在报告中明确订阅状态。",
                 allowed_files=[
                     "core/data_subscription.py",
-                    "strategy/main_seal_follow_strategy.py",
+                    "strategy/main_seal_follow/strategy.py",
                     "tests/test_main_seal_follow_strategy.py",
                     "docs/NEXT_TRADING_DAY_OBSERVATION_CHECKLIST.md",
                 ],
@@ -203,7 +203,7 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 task_type="observability",
                 reason="策略已经激活，但没有 entry_signal_accepted 事件；需要汇总阻断原因，让下一次复盘能直接定位问题。",
                 allowed_files=[
-                    "strategy/main_seal_follow_strategy.py",
+                    "strategy/main_seal_follow/strategy.py",
                     "agent/sensors/parse_monitor_logs.py",
                     "tests/test_main_seal_follow_strategy.py",
                     "tests/test_agent_monitor_review.py",
@@ -224,7 +224,7 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 task_type="replay",
                 reason="出现 entry_signal_accepted，但没有 dry_run_probe_trade_recorded 或模拟成交日志，需要补充回放诊断。",
                 allowed_files=[
-                    "strategy/main_seal_follow_strategy.py",
+                    "strategy/main_seal_follow/strategy.py",
                     "tests/test_main_seal_follow_strategy.py",
                     "agent/sensors/parse_monitor_logs.py",
                 ],

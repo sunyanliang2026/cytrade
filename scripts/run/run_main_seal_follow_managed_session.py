@@ -35,7 +35,7 @@ from scripts.run.run_main_seal_follow_monitor_session import (
     wait_until,
 )
 from scripts.pool.collect_main_seal_pool import DEFAULT_OUTPUT, DEFAULT_SOURCE_CONFIG
-from strategy.main_seal_follow_strategy import MainSealFollowStrategy
+from strategy.main_seal_follow import MainSealFollowStrategy
 
 
 def build_managed_settings(args: argparse.Namespace) -> Settings:
