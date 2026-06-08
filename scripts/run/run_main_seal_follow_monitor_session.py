@@ -11,9 +11,13 @@ This wrapper is for dry-run monitoring only:
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import os
+import queue
 import sys
 import time
+import traceback
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +36,17 @@ from scripts.pool.collect_main_seal_pool import DEFAULT_OUTPUT, DEFAULT_SOURCE_C
 from scripts.run.run_main_seal_follow_market_only import run_market_only
 
 SESSION_EVENT_PREFIX = "MONITOR_SESSION"
+
+
+class PoolCollectTimeoutError(RuntimeError):
+    """Raised when stock-pool collection does not finish within the session guard."""
+
+
+@dataclass(frozen=True)
+class PoolCollectionOutcome:
+    status: str
+    count: int = 0
+    reason: str = ""
 
 
 def parse_hhmm(value: str) -> tuple[int, int]:
@@ -68,6 +83,52 @@ def wait_until(target: datetime, logger, label: str) -> None:
         time.sleep(min(30.0, max(1.0, remaining)))
 
 
+def _pool_collect_worker(pool_args: argparse.Namespace, result_queue) -> None:
+    try:
+        result_queue.put({"ok": True, "count": int(collect_once(pool_args))})
+    except BaseException as exc:
+        result_queue.put(
+            {
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+
+
+def collect_pool_once_with_timeout(pool_args: argparse.Namespace, timeout_sec: int) -> int:
+    timeout = int(timeout_sec or 0)
+    if timeout <= 0:
+        return int(collect_once(pool_args))
+
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    process = ctx.Process(target=_pool_collect_worker, args=(pool_args, result_queue), daemon=True)
+    process.start()
+    process.join(timeout)
+    if process.is_alive():
+        process.terminate()
+        process.join(10)
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+        raise PoolCollectTimeoutError(f"stock-pool collection timed out after {timeout}s")
+
+    try:
+        result = result_queue.get(timeout=5)
+    except queue.Empty as exc:
+        exitcode = process.exitcode
+        raise RuntimeError(f"stock-pool collection exited without result exitcode={exitcode}") from exc
+    if result.get("ok"):
+        return int(result.get("count", 0) or 0)
+
+    error = str(result.get("error") or "")
+    error_type = str(result.get("error_type") or "RuntimeError")
+    tb = str(result.get("traceback") or "")
+    raise RuntimeError(f"stock-pool collection failed [{error_type}]: {error}\n{tb}")
+
+
 def build_pool_args(args: argparse.Namespace) -> argparse.Namespace:
     pool_args = build_pool_parser().parse_args(["--once"])
     pool_args.source = str(args.pool_source)
@@ -79,6 +140,67 @@ def build_pool_args(args: argparse.Namespace) -> argparse.Namespace:
     pool_args.strict_sources = bool(args.strict_sources)
     pool_args.market_day_only = bool(args.market_day_only)
     return pool_args
+
+
+def handle_pool_collection_failure(
+    *,
+    args: argparse.Namespace,
+    logger,
+    reason: str,
+    error: BaseException,
+) -> PoolCollectionOutcome:
+    pool_path = Path(args.pool_output)
+    allow_fallback = not bool(getattr(args, "no_pool_fallback", False))
+    logger.error(
+        "%s pool_collect_failed reason=%s error_type=%s error=%s fallback_allowed=%s csv=%s",
+        SESSION_EVENT_PREFIX,
+        reason,
+        type(error).__name__,
+        error,
+        allow_fallback,
+        pool_path,
+    )
+    if allow_fallback and pool_path.is_file():
+        logger.warning(
+            "%s pool_reused csv=%s source=fallback reason=%s amount=%s",
+            SESSION_EVENT_PREFIX,
+            pool_path,
+            reason,
+            args.amount,
+        )
+        return PoolCollectionOutcome(status="reused", reason=reason)
+    logger.error("%s skipped reason=pool_collect_failed_no_fallback csv=%s", SESSION_EVENT_PREFIX, pool_path)
+    return PoolCollectionOutcome(status="failed", reason=reason)
+
+
+def collect_or_reuse_pool(args: argparse.Namespace, logger) -> PoolCollectionOutcome:
+    pool_args = build_pool_args(args)
+    timeout_sec = int(getattr(args, "pool_collect_timeout_sec", 0) or 0)
+    logger.info(
+        "%s pool_collect_start source=%s output=%s source_config=%s amount=%s timeout_sec=%d",
+        SESSION_EVENT_PREFIX,
+        pool_args.source,
+        pool_args.output,
+        pool_args.source_config,
+        pool_args.amount,
+        timeout_sec,
+    )
+    try:
+        pool_count = collect_pool_once_with_timeout(pool_args, timeout_sec)
+    except PoolCollectTimeoutError as exc:
+        return handle_pool_collection_failure(args=args, logger=logger, reason="pool_collect_timeout", error=exc)
+    except Exception as exc:
+        return handle_pool_collection_failure(args=args, logger=logger, reason="pool_collect_error", error=exc)
+
+    logger.info(
+        "%s pool_generated output=%s source=%s total=%d amount=%s",
+        SESSION_EVENT_PREFIX,
+        pool_args.output,
+        pool_args.source,
+        pool_count,
+        pool_args.amount,
+    )
+    return PoolCollectionOutcome(status="generated", count=pool_count)
 
 
 def build_monitor_settings(args: argparse.Namespace) -> Settings:
@@ -147,24 +269,9 @@ def run_monitor_session(args: argparse.Namespace) -> str:
         if now < pool_at:
             wait_until(pool_at, logger, label="pool_wait")
 
-        pool_args = build_pool_args(args)
-        logger.info(
-            "%s pool_collect_start source=%s output=%s source_config=%s amount=%s",
-            SESSION_EVENT_PREFIX,
-            pool_args.source,
-            pool_args.output,
-            pool_args.source_config,
-            pool_args.amount,
-        )
-        pool_count = collect_once(pool_args)
-        logger.info(
-            "%s pool_generated output=%s source=%s total=%d amount=%s",
-            SESSION_EVENT_PREFIX,
-            pool_args.output,
-            pool_args.source,
-            pool_count,
-            pool_args.amount,
-        )
+        pool_outcome = collect_or_reuse_pool(args, logger)
+        if pool_outcome.status == "failed":
+            return "skipped_pool_collect_failed"
     else:
         pool_path = Path(args.pool_output)
         if not pool_path.is_file():
@@ -221,6 +328,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-count", type=int, default=0, help="Maximum stock count, 0 means unlimited.")
     parser.add_argument("--heartbeat-interval-sec", type=int, default=30)
     parser.add_argument("--heartbeat-stable-repeat", type=int, default=10, help="Stable heartbeat repeat count. Default 10 means about 5 minutes when interval is 30s.")
+    parser.add_argument("--pool-collect-timeout-sec", type=int, default=600, help="Maximum seconds to wait for stock-pool collection. 0 disables the guard.")
+    parser.add_argument("--no-pool-fallback", action="store_true", help="Do not reuse the existing pool CSV when collection fails or times out.")
     parser.add_argument("--strict-sources", action="store_true")
     parser.add_argument("--no-backup", action="store_true")
     parser.add_argument("--skip-pool-collect", action="store_true", help="Skip auto collection and reuse the existing pool CSV.")

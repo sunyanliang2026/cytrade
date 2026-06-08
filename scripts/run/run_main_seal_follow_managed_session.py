@@ -28,13 +28,13 @@ from main import run_daily_session
 from monitor.logger import get_log_file_path, get_logger
 from scripts.run.run_main_seal_follow_monitor_session import (
     SESSION_EVENT_PREFIX,
-    build_pool_args,
     build_session_time,
+    collect_or_reuse_pool,
     resolve_runtime_start_time,
     should_collect_pool,
     wait_until,
 )
-from scripts.pool.collect_main_seal_pool import DEFAULT_OUTPUT, DEFAULT_SOURCE_CONFIG, collect_once
+from scripts.pool.collect_main_seal_pool import DEFAULT_OUTPUT, DEFAULT_SOURCE_CONFIG
 from strategy.main_seal_follow_strategy import MainSealFollowStrategy
 
 
@@ -69,24 +69,9 @@ def run_managed_session(args: argparse.Namespace) -> str:
         if now < pool_at:
             wait_until(pool_at, logger, label="pool_wait")
 
-        pool_args = build_pool_args(args)
-        logger.info(
-            "%s pool_collect_start source=%s output=%s source_config=%s amount=%s",
-            SESSION_EVENT_PREFIX,
-            pool_args.source,
-            pool_args.output,
-            pool_args.source_config,
-            pool_args.amount,
-        )
-        pool_count = collect_once(pool_args)
-        logger.info(
-            "%s pool_generated output=%s source=%s total=%d amount=%s",
-            SESSION_EVENT_PREFIX,
-            pool_args.output,
-            pool_args.source,
-            pool_count,
-            pool_args.amount,
-        )
+        pool_outcome = collect_or_reuse_pool(args, logger)
+        if pool_outcome.status == "failed":
+            return "skipped_pool_collect_failed"
     else:
         pool_path = Path(args.pool_output)
         if not pool_path.is_file():
@@ -133,6 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amount", type=float, default=50000.0, help="Planned amount per stock in the output CSV.")
     parser.add_argument("--max-count", type=int, default=0, help="Maximum stock count, 0 means unlimited.")
     parser.add_argument("--heartbeat-interval-sec", type=int, default=30)
+    parser.add_argument("--pool-collect-timeout-sec", type=int, default=600, help="Maximum seconds to wait for stock-pool collection. 0 disables the guard.")
+    parser.add_argument("--no-pool-fallback", action="store_true", help="Do not reuse the existing pool CSV when collection fails or times out.")
     parser.add_argument("--strict-sources", action="store_true")
     parser.add_argument("--no-backup", action="store_true")
     parser.add_argument("--skip-pool-collect", action="store_true", help="Skip auto collection and reuse the existing pool CSV.")

@@ -2,10 +2,12 @@ from datetime import datetime
 from pathlib import Path
 
 from scripts.run.run_main_seal_follow_monitor_session import (
+    PoolCollectTimeoutError,
     build_monitor_settings,
     build_parser,
     build_pool_args,
     build_session_time,
+    collect_or_reuse_pool,
     parse_hhmm,
     resolve_review_run_id,
     resolve_runtime_start_time,
@@ -53,6 +55,8 @@ def test_monitor_session_defaults_to_separated_times():
     assert args.strategy_start_time == "09:15"
     assert args.stop_time == "11:00"
     assert args.heartbeat_stable_repeat == 10
+    assert args.pool_collect_timeout_sec == 600
+    assert args.no_pool_fallback is False
     assert args.no_post_review is False
 
 
@@ -102,6 +106,59 @@ def test_monitor_session_build_pool_args_uses_wrapper_options(tmp_path: Path):
     assert pool_args.strict_sources is True
     assert pool_args.no_backup is True
     assert pool_args.market_day_only is False
+    assert args.pool_collect_timeout_sec == 600
+    assert args.no_pool_fallback is False
+
+
+def test_monitor_session_reuses_existing_pool_when_collection_times_out(monkeypatch, tmp_path: Path):
+    pool_path = tmp_path / "main_seal_follow_pool.csv"
+    pool_path.write_text("code,name,amount\n000001.SZ,Test,50000\n", encoding="utf-8")
+    args = build_parser().parse_args(["--pool-output", str(pool_path), "--pool-collect-timeout-sec", "1"])
+
+    def fake_collect_pool_once_with_timeout(pool_args, timeout_sec):
+        raise PoolCollectTimeoutError("timed out")
+
+    monkeypatch.setattr(
+        "scripts.run.run_main_seal_follow_monitor_session.collect_pool_once_with_timeout",
+        fake_collect_pool_once_with_timeout,
+    )
+
+    outcome = collect_or_reuse_pool(args, logger=_NoopLogger())
+
+    assert outcome.status == "reused"
+    assert outcome.reason == "pool_collect_timeout"
+
+
+def test_monitor_session_fails_when_collection_times_out_without_fallback(monkeypatch, tmp_path: Path):
+    pool_path = tmp_path / "main_seal_follow_pool.csv"
+    pool_path.write_text("code,name,amount\n000001.SZ,Test,50000\n", encoding="utf-8")
+    args = build_parser().parse_args(
+        ["--pool-output", str(pool_path), "--pool-collect-timeout-sec", "1", "--no-pool-fallback"]
+    )
+
+    def fake_collect_pool_once_with_timeout(pool_args, timeout_sec):
+        raise PoolCollectTimeoutError("timed out")
+
+    monkeypatch.setattr(
+        "scripts.run.run_main_seal_follow_monitor_session.collect_pool_once_with_timeout",
+        fake_collect_pool_once_with_timeout,
+    )
+
+    outcome = collect_or_reuse_pool(args, logger=_NoopLogger())
+
+    assert outcome.status == "failed"
+    assert outcome.reason == "pool_collect_timeout"
+
+
+class _NoopLogger:
+    def info(self, *args, **kwargs):
+        pass
+
+    def warning(self, *args, **kwargs):
+        pass
+
+    def error(self, *args, **kwargs):
+        pass
 
 
 def test_monitor_session_can_skip_pool_collection(tmp_path: Path):
