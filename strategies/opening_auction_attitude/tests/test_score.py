@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from strategy.opening_auction_attitude import (
+from strategies.opening_auction_attitude import (
     AUCTION_BIG_ORDER_CONFIRMED,
     AUCTION_FAKE_RISK,
     AUCTION_MONEY_LIFT,

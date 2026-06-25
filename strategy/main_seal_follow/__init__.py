@@ -1,5 +1,4 @@
-"""MainSealFollow strategy package."""
+"""Compatibility wrapper for ``strategies.main_seal_follow``."""
 
-from .strategy import MainSealFollowStrategy
-
-__all__ = ["MainSealFollowStrategy"]
+from strategies.main_seal_follow import *  # noqa: F401,F403
+from strategies.main_seal_follow import __all__  # noqa: F401

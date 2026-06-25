@@ -1,0 +1,710 @@
+"""Run OpeningAuctionAttitude in market-only observe-only mode.
+
+This entry point does not connect a trading account and does not place orders.
+It subscribes the configured symbols, collects opening-auction tick/Level2
+evidence, and logs one MSF_AUCTION_ATTITUDE payload per strategy on exit.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import signal
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional
+
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from config.settings import Settings
+from main import _log_runtime_startup_config, _start_runtime_heartbeat, build_app
+from monitor.logger import get_log_file_path, get_logger
+from strategy.models import StrategyConfig
+from strategies.opening_auction_attitude import OpeningAuctionAttitudeStrategy
+from scripts.pool.common import limit_up_price as calc_limit_up_price
+
+
+DEFAULT_POOL = "data/stock_pools/current/opening_auction_universe.csv"
+SESSION_EVENT_PREFIX = "OPENING_AUCTION_ATTITUDE_SESSION"
+EVENT_NAME = "MSF_AUCTION_ATTITUDE"
+
+CODE_COLUMN_CANDIDATES = (
+    "stock_code",
+    "code",
+    "symbol",
+    "\u80a1\u7968\u4ee3\u7801",
+    "\u4ee3\u7801",
+    "\u8bc1\u5238\u4ee3\u7801",
+)
+NAME_COLUMN_CANDIDATES = (
+    "stock_name",
+    "name",
+    "\u80a1\u7968\u540d\u79f0",
+    "\u540d\u79f0",
+    "\u8bc1\u5238\u540d\u79f0",
+)
+
+
+@dataclass(frozen=True)
+class PoolEntry:
+    stock_code: str
+    stock_name: str = ""
+
+
+@dataclass(frozen=True)
+class SnapshotTick:
+    stock_code: str
+    last_price: float = 0.0
+    pre_close: float = 0.0
+    amount: float = 0.0
+    volume: float = 0.0
+    snapshot_time: datetime | None = None
+    raw: dict[str, Any] | None = None
+
+
+def _apply_runtime_settings(runtime_settings) -> None:
+    from config.settings import settings as global_runtime_settings
+
+    for name in dir(runtime_settings):
+        if not name.isupper():
+            continue
+        try:
+            setattr(global_runtime_settings, name, getattr(runtime_settings, name))
+        except Exception:
+            continue
+
+
+def normalize_stock_code(value: object) -> str:
+    text = str(value or "").strip().upper()
+    if "." in text:
+        text = text.split(".", 1)[0]
+    if text.isdigit():
+        return text.zfill(6)
+    return ""
+
+
+def parse_codes(values: Iterable[str] | str | None) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        raw_values = [values]
+    else:
+        raw_values = list(values)
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        for token in re.split(r"[\s,;，；]+", str(raw or "")):
+            code = normalize_stock_code(token)
+            if code and code not in seen:
+                seen.add(code)
+                result.append(code)
+    return result
+
+
+def parse_hhmmss(value: str) -> tuple[int, int, int]:
+    text = str(value or "").strip()
+    parts = text.split(":")
+    if len(parts) not in (2, 3):
+        raise argparse.ArgumentTypeError(f"invalid time format: {value!r}, expected HH:MM or HH:MM:SS")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+        second = int(parts[2]) if len(parts) == 3 else 0
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid time format: {value!r}, expected HH:MM or HH:MM:SS") from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        raise argparse.ArgumentTypeError(f"invalid time range: {value!r}")
+    return hour, minute, second
+
+
+def build_session_time(anchor: datetime, value: str) -> datetime:
+    hour, minute, second = parse_hhmmss(value)
+    return anchor.replace(hour=hour, minute=minute, second=second, microsecond=0)
+
+
+def to_xt_code(stock_code: str) -> str:
+    code = normalize_stock_code(stock_code)
+    if not code:
+        return ""
+    if code.startswith(("5", "6", "9", "11")):
+        return f"{code}.SH"
+    return f"{code}.SZ"
+
+
+def _extract_scalar(payload: Any, default: Any = None) -> Any:
+    if isinstance(payload, (list, tuple)):
+        return payload[0] if payload else default
+    return payload if payload is not None else default
+
+
+def _to_float(value: Any) -> float:
+    try:
+        return float(_extract_scalar(value, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _first_book_price(payload: dict[str, Any]) -> float:
+    bid = _to_float(payload.get("bidPrice"))
+    ask = _to_float(payload.get("askPrice"))
+    if bid > 0 and ask > 0 and abs(bid - ask) < 1e-8:
+        return bid
+    return bid or ask
+
+
+def _coerce_snapshot_time(value: Any, fallback: datetime) -> datetime:
+    raw = _extract_scalar(value)
+    if raw is None:
+        return fallback
+    try:
+        numeric = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if numeric <= 0:
+        return fallback
+    if numeric > 10_000_000_000:
+        numeric = numeric / 1000.0
+    try:
+        return datetime.fromtimestamp(numeric)
+    except (OSError, OverflowError, ValueError):
+        return fallback
+
+
+def parse_snapshot_tick(stock_code: str, payload: dict[str, Any], *, recv_time: datetime | None = None) -> SnapshotTick:
+    recv_time = recv_time or datetime.now()
+    pre_close = (
+        _to_float(payload.get("lastClose"))
+        or _to_float(payload.get("preClose"))
+        or _to_float(payload.get("pre_close"))
+    )
+    return SnapshotTick(
+        stock_code=normalize_stock_code(stock_code),
+        last_price=_to_float(payload.get("lastPrice") or payload.get("last_price")) or _first_book_price(payload),
+        pre_close=pre_close,
+        amount=_to_float(payload.get("amount") or payload.get("turnover")),
+        volume=_to_float(payload.get("volume") or payload.get("pvolume")),
+        snapshot_time=_coerce_snapshot_time(payload.get("time") or payload.get("sysTime"), recv_time),
+        raw=dict(payload),
+    )
+
+
+def fetch_full_tick_snapshots(codes: Iterable[str]) -> dict[str, SnapshotTick]:
+    normalized_codes = [code for code in (normalize_stock_code(value) for value in codes) if code]
+    if not normalized_codes:
+        return {}
+    try:
+        from xtquant import xtdata
+    except ImportError as exc:
+        raise RuntimeError("xtquant.xtdata is required for opening auction snapshot polling") from exc
+
+    snapshots: dict[str, SnapshotTick] = {}
+    xt_to_code = {to_xt_code(code): code for code in normalized_codes}
+    xt_codes = [xt_code for xt_code in xt_to_code if xt_code]
+    recv_time = datetime.now()
+    for offset in range(0, len(xt_codes), 400):
+        batch = xt_codes[offset : offset + 400]
+        tick_map = xtdata.get_full_tick(batch) or {}
+        for key, payload in tick_map.items():
+            code = normalize_stock_code(key) or xt_to_code.get(str(key), "")
+            if not code or not isinstance(payload, dict):
+                continue
+            snapshots[code] = parse_snapshot_tick(code, payload, recv_time=recv_time)
+    return snapshots
+
+
+def _find_column(columns: Iterable[str], candidates: tuple[str, ...]) -> str:
+    normalized = {str(column or "").strip().lower(): str(column or "") for column in columns}
+    for candidate in candidates:
+        found = normalized.get(candidate.lower())
+        if found:
+            return found
+    return ""
+
+
+def _read_pool_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    last_error: Exception | None = None
+    for encoding in ("utf-8-sig", "gbk"):
+        try:
+            with path.open("r", encoding=encoding, newline="") as handle:
+                reader = csv.DictReader(handle)
+                fieldnames = list(reader.fieldnames or [])
+                return fieldnames, [dict(row) for row in reader]
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+    if last_error:
+        raise last_error
+    return [], []
+
+
+def load_pool_entries(pool_path: str) -> list[PoolEntry]:
+    if not pool_path:
+        return []
+    path = Path(pool_path)
+    if not path.is_file():
+        return []
+
+    fieldnames, rows = _read_pool_rows(path)
+    if not fieldnames:
+        return []
+
+    code_column = _find_column(fieldnames, CODE_COLUMN_CANDIDATES)
+    name_column = _find_column(fieldnames, NAME_COLUMN_CANDIDATES)
+    if not code_column:
+        code_column = fieldnames[0]
+
+    entries: list[PoolEntry] = []
+    seen: set[str] = set()
+    for row in rows:
+        code = normalize_stock_code(row.get(code_column))
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        name = str(row.get(name_column) or "").strip() if name_column else ""
+        entries.append(PoolEntry(stock_code=code, stock_name=name))
+    return entries
+
+
+def resolve_observe_entries(
+    *,
+    codes: Iterable[str] | str | None = None,
+    pool_path: str = DEFAULT_POOL,
+    max_count: int = 0,
+) -> list[PoolEntry]:
+    pool_entries = load_pool_entries(pool_path)
+    names_by_code = {entry.stock_code: entry.stock_name for entry in pool_entries}
+    requested_codes = parse_codes(codes)
+
+    if requested_codes:
+        entries = [PoolEntry(stock_code=code, stock_name=names_by_code.get(code, "")) for code in requested_codes]
+    else:
+        entries = pool_entries
+
+    if max_count and max_count > 0:
+        entries = entries[: int(max_count)]
+    return entries
+
+
+def build_strategy_configs(entries: Iterable[PoolEntry]) -> list[StrategyConfig]:
+    configs: list[StrategyConfig] = []
+    for entry in entries:
+        code = normalize_stock_code(entry.stock_code)
+        if not code:
+            continue
+        configs.append(
+            StrategyConfig(
+                stock_code=code,
+                max_position_amount=0.0,
+                params={
+                    "instance_key": code,
+                    "stock_name": str(entry.stock_name or ""),
+                    "observe_only": True,
+                    "quote_volume_unit": 100,
+                },
+            )
+        )
+    return configs
+
+
+def install_observe_strategies(
+    runner,
+    configs: Iterable[StrategyConfig],
+    *,
+    trade_executor=None,
+    position_manager=None,
+) -> int:
+    installed = 0
+    for config in configs:
+        runner.add_strategy(OpeningAuctionAttitudeStrategy(config, trade_executor, position_manager))
+        installed += 1
+    return installed
+
+
+class OpeningAuctionLimitUpScanner:
+    def __init__(
+        self,
+        entries: Iterable[PoolEntry],
+        *,
+        snapshot_provider: Callable[[Iterable[str]], dict[str, SnapshotTick]],
+        freeze_at: datetime,
+        limit_up_tolerance: float = 0.01,
+        snapshot_record_path: str = "",
+        logger=None,
+    ):
+        self._entries = [
+            PoolEntry(normalize_stock_code(entry.stock_code), entry.stock_name)
+            for entry in entries
+            if normalize_stock_code(entry.stock_code)
+        ]
+        self._entries_by_code = {entry.stock_code: entry for entry in self._entries}
+        self._snapshot_provider = snapshot_provider
+        self._freeze_at = freeze_at
+        self._limit_up_tolerance = max(0.0, float(limit_up_tolerance or 0.0))
+        self._logger = logger or get_logger("system")
+        self._candidate_codes: set[str] = set()
+        self._frozen = False
+        self._snapshot_record_handle = None
+        if snapshot_record_path:
+            path = Path(snapshot_record_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._snapshot_record_handle = path.open("a", encoding="utf-8", newline="")
+
+    @property
+    def candidate_count(self) -> int:
+        return len(self._candidate_codes)
+
+    @property
+    def universe_count(self) -> int:
+        return len(self._entries)
+
+    def close(self) -> None:
+        if self._snapshot_record_handle is not None:
+            self._snapshot_record_handle.close()
+            self._snapshot_record_handle = None
+
+    def scan_once(self, now: datetime) -> list[PoolEntry]:
+        if self._frozen or now >= self._freeze_at:
+            self._frozen = True
+            return []
+
+        pending_codes = [entry.stock_code for entry in self._entries if entry.stock_code not in self._candidate_codes]
+        if not pending_codes:
+            return []
+
+        snapshots = self._snapshot_provider(pending_codes)
+        found: list[PoolEntry] = []
+        for code, tick in snapshots.items():
+            normalized_code = normalize_stock_code(code)
+            if not normalized_code or normalized_code in self._candidate_codes:
+                continue
+            entry = self._entries_by_code.get(normalized_code)
+            if not entry:
+                continue
+            last_price = float(tick.last_price or 0.0)
+            pre_close = float(tick.pre_close or 0.0)
+            limit_price = calc_limit_up_price(pre_close)
+            is_hit = limit_price > 0 and last_price > 0 and last_price >= limit_price - self._limit_up_tolerance
+            self._record_snapshot(now, entry, tick, limit_price=limit_price, is_hit=is_hit)
+            if limit_price <= 0 or last_price <= 0:
+                continue
+            if not is_hit:
+                continue
+            self._candidate_codes.add(normalized_code)
+            found.append(entry)
+            self._logger.info(
+                "%s candidate_found stock=%s name=%s last_price=%.3f pre_close=%.3f limit_up=%.3f amount=%.0f snapshot_time=%s",
+                SESSION_EVENT_PREFIX,
+                normalized_code,
+                entry.stock_name,
+                last_price,
+                pre_close,
+                limit_price,
+                float(tick.amount or 0.0),
+                tick.snapshot_time.strftime("%H:%M:%S") if tick.snapshot_time else "",
+            )
+        return found
+
+    def _record_snapshot(
+        self,
+        now: datetime,
+        entry: PoolEntry,
+        tick: SnapshotTick,
+        *,
+        limit_price: float,
+        is_hit: bool,
+    ) -> None:
+        if self._snapshot_record_handle is None:
+            return
+        row = {
+            "scan_time": now,
+            "stock": entry.stock_code,
+            "stock_name": entry.stock_name,
+            "last_price": float(tick.last_price or 0.0),
+            "pre_close": float(tick.pre_close or 0.0),
+            "limit_up_price": float(limit_price or 0.0),
+            "amount": float(tick.amount or 0.0),
+            "volume": float(tick.volume or 0.0),
+            "snapshot_time": tick.snapshot_time,
+            "is_hit": bool(is_hit),
+            "raw": tick.raw or {},
+        }
+        self._snapshot_record_handle.write(
+            json.dumps(row, ensure_ascii=False, sort_keys=True, default=_json_default) + "\n"
+        )
+        self._snapshot_record_handle.flush()
+
+
+def build_observe_settings(args: argparse.Namespace) -> Settings:
+    overrides = {
+        "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN": True,
+        "LOAD_PREVIOUS_STATE_ON_START": False,
+        "LOG_SUMMARY_MODE": not bool(args.full_console),
+        "SESSION_EXIT_TIME": str(args.stop_time),
+    }
+    if int(args.heartbeat_interval_sec) > 0:
+        overrides["RUNTIME_HEARTBEAT_INTERVAL_SEC"] = int(args.heartbeat_interval_sec)
+    return Settings(**overrides)
+
+
+def _json_default(value):
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)
+
+
+def emit_auction_decisions(runner, logger=None) -> int:
+    logger = logger or get_logger("system")
+    emitted = 0
+    for strategy in runner.get_all_strategies():
+        if not isinstance(strategy, OpeningAuctionAttitudeStrategy):
+            continue
+        decision = strategy.classify_auction()
+        payload = strategy.build_event_payload(decision)
+        params = getattr(getattr(strategy, "config", None), "params", {}) or {}
+        payload["stock_name"] = str(params.get("stock_name") or "")
+        payload["observe_only"] = True
+        logger.info(
+            "%s %s",
+            EVENT_NAME,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, default=_json_default),
+        )
+        emitted += 1
+    return emitted
+
+
+def run_market_only(
+    *,
+    codes: Iterable[str] | str | None = None,
+    pool_path: str = DEFAULT_POOL,
+    max_count: int = 0,
+    settings=None,
+    stop_at: Optional[datetime] = None,
+    mode: str = "opening-auction-attitude-market-only",
+    session_event_prefix: str = SESSION_EVENT_PREFIX,
+    stop_reason: str = "scheduled_stop",
+    now_provider: Callable[[], datetime] = datetime.now,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    build_app_fn=build_app,
+    dynamic_candidates: bool = True,
+    snapshot_provider: Callable[[Iterable[str]], dict[str, SnapshotTick]] = fetch_full_tick_snapshots,
+    scan_start_time: str = "09:15:00",
+    candidate_freeze_time: str = "09:24:30",
+    snapshot_interval_sec: float = 2.0,
+    limit_up_tolerance: float = 0.01,
+    snapshot_record_path: str = "",
+) -> None:
+    entries = resolve_observe_entries(codes=codes, pool_path=pool_path, max_count=max_count)
+    if not entries:
+        raise SystemExit("No opening-auction observe symbols. Use --codes or a valid --pool file.")
+    configs = build_strategy_configs(entries)
+
+    if settings is None:
+        settings = Settings(
+            CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN=True,
+            LOAD_PREVIOUS_STATE_ON_START=False,
+        )
+    else:
+        settings.CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN = True
+        settings.LOAD_PREVIOUS_STATE_ON_START = False
+
+    _apply_runtime_settings(settings)
+
+    ctx = build_app_fn(strategy_classes=[], settings=settings)
+    logger = get_logger("system")
+    settings = ctx["settings"]
+    conn_mgr = ctx["conn_mgr"]
+    runner = ctx["runner"]
+    data_sub = ctx["data_sub"]
+    trade_exec = ctx.get("trade_exec")
+    pos_mgr = ctx.get("pos_mgr")
+    stop_event = threading.Event()
+    anchor = now_provider()
+    scan_start_at = build_session_time(anchor, scan_start_time)
+    freeze_at = build_session_time(anchor, candidate_freeze_time)
+    snapshot_interval_sec = max(0.2, float(snapshot_interval_sec or 0.0))
+    scanner = (
+        OpeningAuctionLimitUpScanner(
+            entries,
+            snapshot_provider=snapshot_provider,
+            freeze_at=freeze_at,
+            limit_up_tolerance=limit_up_tolerance,
+            snapshot_record_path=snapshot_record_path,
+            logger=logger,
+        )
+        if dynamic_candidates
+        else None
+    )
+
+    def _stop(sig=None, frame=None) -> None:
+        logger.info("OpeningAuctionAttitude observe-only session stopping sig=%s", sig)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    logger.info(
+        "%s session_start mode=%s dry_run=%s pool=%s codes=%s max_count=%d stop_at=%s account_connected=false",
+        session_event_prefix,
+        mode,
+        settings.CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN,
+        pool_path,
+        ",".join(entry.stock_code for entry in entries),
+        max_count,
+        stop_at.strftime("%H:%M:%S") if stop_at else "",
+    )
+    _log_runtime_startup_config(settings, conn_mgr, mode=mode)
+
+    started = False
+    try:
+        runner.start()
+        installed = 0
+        if scanner:
+            logger.info(
+                "%s scanner_start universe=%d scan_start=%s freeze_time=%s interval_sec=%.1f limit_up_tolerance=%.3f",
+                session_event_prefix,
+                len(entries),
+                scan_start_at.strftime("%H:%M:%S"),
+                freeze_at.strftime("%H:%M:%S"),
+                snapshot_interval_sec,
+                float(limit_up_tolerance or 0.0),
+            )
+            if snapshot_record_path:
+                logger.info("%s snapshot_record_path=%s", session_event_prefix, snapshot_record_path)
+        else:
+            installed = install_observe_strategies(
+                runner,
+                configs,
+                trade_executor=trade_exec,
+                position_manager=pos_mgr,
+            )
+        started = True
+        data_thread = threading.Thread(target=data_sub.start, daemon=True, name="opening-auction-data-sub")
+        data_thread.start()
+        _start_runtime_heartbeat(ctx, stop_event, mode=mode)
+        logger.info(
+            "%s running strategies=%d installed=%d tick_subscriptions=%d l2_stocks=%d l2=%s",
+            session_event_prefix,
+            len(runner.get_all_strategies()),
+            installed,
+            len(data_sub.get_subscription_list()),
+            len(data_sub.get_l2_subscription_map()),
+            data_sub.get_l2_subscription_map(),
+        )
+
+        freeze_logged = False
+        while not stop_event.is_set():
+            now = now_provider()
+            if scanner and scan_start_at <= now < freeze_at:
+                try:
+                    for candidate in scanner.scan_once(now):
+                        installed += install_observe_strategies(
+                            runner,
+                            build_strategy_configs([candidate]),
+                            trade_executor=trade_exec,
+                            position_manager=pos_mgr,
+                        )
+                except Exception as exc:
+                    logger.error("%s snapshot_scan_failed error=%s", session_event_prefix, exc, exc_info=True)
+
+            if scanner and not freeze_logged and now >= freeze_at:
+                scanner.scan_once(now)
+                logger.info(
+                    "%s candidate_freeze candidates=%d universe=%d freeze_time=%s installed=%d",
+                    session_event_prefix,
+                    scanner.candidate_count,
+                    scanner.universe_count,
+                    freeze_at.strftime("%H:%M:%S"),
+                    installed,
+                )
+                freeze_logged = True
+
+            if stop_at is not None and now >= stop_at:
+                logger.info(
+                    "%s session_stop reason=%s stop_time=%s strategy_count=%d tick_subscriptions=%d l2_stocks=%d",
+                    session_event_prefix,
+                    stop_reason,
+                    stop_at.strftime("%H:%M:%S"),
+                    len(runner.get_all_strategies()),
+                    len(data_sub.get_subscription_list()),
+                    len(data_sub.get_l2_subscription_map()),
+                )
+                stop_event.set()
+                break
+            if scanner and scan_start_at <= now < freeze_at:
+                sleep_fn(snapshot_interval_sec)
+            else:
+                sleep_fn(1)
+    finally:
+        emitted = emit_auction_decisions(runner, logger) if started else 0
+        logger.info("%s decisions_emitted=%d", session_event_prefix, emitted)
+        if scanner:
+            scanner.close()
+        try:
+            runner.stop()
+        finally:
+            data_sub.stop()
+        logger.info(
+            "%s stopped system_log=%s trade_log=%s dry_run=%s real_order_sent=false",
+            session_event_prefix,
+            get_log_file_path("system"),
+            get_log_file_path("trade"),
+            settings.CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN,
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run OpeningAuctionAttitude observe-only market session.")
+    parser.add_argument("--codes", action="append", default=[], help="Comma/space separated stock codes.")
+    parser.add_argument("--pool", default=DEFAULT_POOL, help="CSV stock pool path used when --codes is empty.")
+    parser.add_argument("--max-count", type=int, default=0, help="Limit observed symbols, 0 means unlimited.")
+    parser.add_argument("--stop-time", default="09:35:00", help="Auto stop time in HH:MM or HH:MM:SS.")
+    parser.add_argument("--scan-start-time", default="09:15:00", help="Snapshot scan start time.")
+    parser.add_argument("--candidate-freeze-time", default="09:24:30", help="Stop adding dynamic candidates after this time.")
+    parser.add_argument("--snapshot-interval-sec", type=float, default=2.0, help="Snapshot polling interval before freeze.")
+    parser.add_argument("--limit-up-tolerance", type=float, default=0.01, help="Price tolerance for limit-up snapshot hit.")
+    parser.add_argument("--snapshot-record-path", default="", help="Optional JSONL path for full snapshot scan records.")
+    parser.add_argument("--install-all", action="store_true", help="Install strategies for the whole pool at startup.")
+    parser.add_argument("--heartbeat-interval-sec", type=int, default=30)
+    parser.add_argument("--full-console", action="store_true", help="Disable summary mode and print all console logs.")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    settings = build_observe_settings(args)
+    stop_at = build_session_time(datetime.now(), str(args.stop_time))
+    run_market_only(
+        codes=args.codes,
+        pool_path=str(args.pool),
+        max_count=int(args.max_count),
+        settings=settings,
+        stop_at=stop_at,
+        dynamic_candidates=not bool(args.install_all),
+        scan_start_time=str(args.scan_start_time),
+        candidate_freeze_time=str(args.candidate_freeze_time),
+        snapshot_interval_sec=float(args.snapshot_interval_sec),
+        limit_up_tolerance=float(args.limit_up_tolerance),
+        snapshot_record_path=str(args.snapshot_record_path),
+    )
+
+
+if __name__ == "__main__":
+    main()

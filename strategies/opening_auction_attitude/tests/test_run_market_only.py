@@ -4,9 +4,9 @@ from pathlib import Path
 
 from core.l2_models import L2OrderEvent
 from core.models import TickData
-from strategy.opening_auction_attitude import AUCTION_STRONG_CONFIRMED, OpeningAuctionAttitudeStrategy
+from strategies.opening_auction_attitude import AUCTION_STRONG_CONFIRMED, OpeningAuctionAttitudeStrategy
 
-from scripts.run.run_opening_auction_attitude_market_only import (
+from strategies.opening_auction_attitude.scripts.run_market_only import (
     DEFAULT_POOL,
     EVENT_NAME,
     OpeningAuctionLimitUpScanner,

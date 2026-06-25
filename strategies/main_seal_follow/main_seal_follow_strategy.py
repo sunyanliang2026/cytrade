@@ -1,5 +1,5 @@
 """Compatibility import for the MainSealFollow strategy package."""
 
-from strategies.main_seal_follow.strategy import MainSealFollowStrategy
+from strategies.main_seal_follow import MainSealFollowStrategy
 
 __all__ = ["MainSealFollowStrategy"]

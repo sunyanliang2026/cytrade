@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 
-from scripts.probe.analyze_opening_auction_l2_probe import analyze_raw_jsonl, render_markdown, run_analysis, build_parser
+from strategies.opening_auction_attitude.scripts.analyze_l2_probe import analyze_raw_jsonl, render_markdown, run_analysis, build_parser
 
 
 def _row(stock, kind, phase, event_time, **extra):

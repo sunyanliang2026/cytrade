@@ -2,7 +2,6 @@
 
 from .base import BaseStrategy
 from .csv_signal_strategy import CsvSignalStrategy
-from .main_seal_follow_strategy import MainSealFollowStrategy
 from .models import StrategyConfig, StrategySnapshot
 from .runner import StrategyRunner
 
@@ -14,3 +13,11 @@ __all__ = [
     "MainSealFollowStrategy",
     "StrategyRunner",
 ]
+
+
+def __getattr__(name):
+    if name == "MainSealFollowStrategy":
+        from .main_seal_follow_strategy import MainSealFollowStrategy as _MainSealFollowStrategy
+
+        return _MainSealFollowStrategy
+    raise AttributeError(name)

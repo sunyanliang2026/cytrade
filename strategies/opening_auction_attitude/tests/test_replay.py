@@ -2,7 +2,7 @@ import csv
 import json
 from datetime import datetime
 
-from scripts.replay.replay_opening_auction_attitude import (
+from strategies.opening_auction_attitude.scripts.replay_session import (
     build_score_config_from_args,
     load_stock_names,
     load_stock_names_from_tree,
@@ -10,7 +10,7 @@ from scripts.replay.replay_opening_auction_attitude import (
     run_replay,
     build_parser,
 )
-from strategy.opening_auction_attitude import AUCTION_STRONG_CONFIRMED, OPEN_DIRECT_PULL
+from strategies.opening_auction_attitude import AUCTION_STRONG_CONFIRMED, OPEN_DIRECT_PULL
 
 
 def _row(stock, kind, clock, normalized=None, raw=None):

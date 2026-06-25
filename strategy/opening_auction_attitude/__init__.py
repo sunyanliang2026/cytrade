@@ -1,63 +1,7 @@
-"""Opening auction attitude strategy package."""
+"""Compatibility wrapper for the relocated OpeningAuctionAttitude strategy package.
 
-from .models import (
-    AUCTION_BIG_ORDER_CONFIRMED,
-    AUCTION_BIG_TRADE_CONFIRMED,
-    AUCTION_FAKE_RISK,
-    AUCTION_MONEY_LIFT,
-    AUCTION_NO_SIGNAL,
-    AUCTION_SPEED_ONLY,
-    AUCTION_STRONG_CONFIRMED,
-    OPEN_DIRECT_PULL,
-    OPEN_FAKE_BREAKDOWN,
-    OPEN_NO_FOLLOW_THROUGH,
-    OPEN_WASH_THEN_PULL,
-    AuctionDecision,
-    AuctionL1Window,
-    AuctionL2Window,
-    AuctionPricePoint,
-    AuctionScoreConfig,
-    AuctionWindowMetrics,
-    OpenVerifyConfig,
-    OpenVerifyDecision,
-    OpenVerifyMetrics,
-    OpenVerifyPoint,
-    OpenVerifyWindow,
-)
-from .score import (
-    calculate_auction_window_metrics,
-    calculate_open_verify_metrics,
-    evaluate_auction_attitude,
-    evaluate_open_behavior,
-)
-from .strategy import OpeningAuctionAttitudeStrategy
+New code should import from ``strategies.opening_auction_attitude``.
+"""
 
-__all__ = [
-    "AUCTION_NO_SIGNAL",
-    "AUCTION_SPEED_ONLY",
-    "AUCTION_MONEY_LIFT",
-    "AUCTION_BIG_ORDER_CONFIRMED",
-    "AUCTION_BIG_TRADE_CONFIRMED",
-    "AUCTION_STRONG_CONFIRMED",
-    "AUCTION_FAKE_RISK",
-    "OPEN_DIRECT_PULL",
-    "OPEN_WASH_THEN_PULL",
-    "OPEN_FAKE_BREAKDOWN",
-    "OPEN_NO_FOLLOW_THROUGH",
-    "AuctionPricePoint",
-    "AuctionL1Window",
-    "AuctionL2Window",
-    "AuctionScoreConfig",
-    "AuctionWindowMetrics",
-    "AuctionDecision",
-    "OpenVerifyPoint",
-    "OpenVerifyWindow",
-    "OpenVerifyConfig",
-    "OpenVerifyMetrics",
-    "OpenVerifyDecision",
-    "calculate_auction_window_metrics",
-    "calculate_open_verify_metrics",
-    "evaluate_auction_attitude",
-    "evaluate_open_behavior",
-    "OpeningAuctionAttitudeStrategy",
-]
+from strategies.opening_auction_attitude import *  # noqa: F401,F403
+from strategies.opening_auction_attitude import __all__  # noqa: F401

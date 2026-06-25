@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 
 from core.l2_models import L2OrderEvent, L2QuoteEvent, L2TransactionEvent
-from scripts.probe.probe_opening_auction_l2 import OpeningAuctionL2Recorder, load_codes, record_with_modes
+from strategies.opening_auction_attitude.scripts.probe_l2 import OpeningAuctionL2Recorder, load_codes, record_with_modes
 
 
 def test_opening_auction_l2_recorder_writes_raw_summary_and_schema(tmp_path):

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from scripts.run.run_main_seal_follow_managed_session import build_managed_settings, build_parser
+from strategies.main_seal_follow.scripts.run_managed_session import build_managed_settings, build_parser
 
 
 def test_managed_session_build_settings_uses_separate_strategy_start_time(tmp_path: Path):

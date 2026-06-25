@@ -1,7 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 
-from scripts.run.run_main_seal_follow_monitor_session import (
+from strategies.main_seal_follow.scripts.run_monitor_session import (
     PoolCollectTimeoutError,
     build_monitor_settings,
     build_parser,
@@ -119,7 +119,7 @@ def test_monitor_session_reuses_existing_pool_when_collection_times_out(monkeypa
         raise PoolCollectTimeoutError("timed out")
 
     monkeypatch.setattr(
-        "scripts.run.run_main_seal_follow_monitor_session.collect_pool_once_with_timeout",
+        "strategies.main_seal_follow.scripts.run_monitor_session.collect_pool_once_with_timeout",
         fake_collect_pool_once_with_timeout,
     )
 
@@ -140,7 +140,7 @@ def test_monitor_session_fails_when_collection_times_out_without_fallback(monkey
         raise PoolCollectTimeoutError("timed out")
 
     monkeypatch.setattr(
-        "scripts.run.run_main_seal_follow_monitor_session.collect_pool_once_with_timeout",
+        "strategies.main_seal_follow.scripts.run_monitor_session.collect_pool_once_with_timeout",
         fake_collect_pool_once_with_timeout,
     )
 

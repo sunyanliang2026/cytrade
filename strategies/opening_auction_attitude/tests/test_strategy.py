@@ -3,7 +3,7 @@ from datetime import datetime
 from core.l2_models import L2OrderEvent, L2OrderQueueEvent, L2QuoteEvent, L2TransactionEvent
 from core.models import TickData
 from strategy.models import StrategyConfig
-from strategy.opening_auction_attitude import AUCTION_STRONG_CONFIRMED, OPEN_DIRECT_PULL, OpeningAuctionAttitudeStrategy
+from strategies.opening_auction_attitude import AUCTION_STRONG_CONFIRMED, OPEN_DIRECT_PULL, OpeningAuctionAttitudeStrategy
 
 
 def _ts(clock: str) -> datetime:
