@@ -1,0 +1,19 @@
+  # 1. 启动整套流程
+  scripts\ops\start_main_seal_follow_monitor.bat
+
+  # 2. 看状态
+  # 控制台关注:
+  # - MONITOR_SESSION monitor_start
+  # - Runtime heartbeat
+  # - MSF_EVENT
+  # - [ORDER] [TRADE] [MOCK]
+
+  # 3. 看日志
+  # 最新 system / trade 日志在 logs\ 下按时间查看
+
+  # 4. 看晨报
+  agent\memory\runs\2026-06-03_morning.md
+  agent\memory\runs\2026-06-03_morning_summary.json
+
+  # 5. 如需手动补跑晨报
+  python -m agent.loops.post_morning_review --run-id 2026-06-03 --print-paths
