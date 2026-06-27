@@ -2,6 +2,7 @@
 
 from .base import BaseStrategy
 from .csv_signal_strategy import CsvSignalStrategy
+from .juejin_sell_strategy import JuejinSellStrategy
 from .models import StrategyConfig, StrategySnapshot
 from .runner import StrategyRunner
 
@@ -10,6 +11,7 @@ __all__ = [
     "StrategySnapshot",
     "BaseStrategy",
     "CsvSignalStrategy",
+    "JuejinSellStrategy",
     "MainSealFollowStrategy",
     "StrategyRunner",
 ]
