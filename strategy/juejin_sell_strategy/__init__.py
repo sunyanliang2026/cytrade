@@ -1,5 +1,5 @@
-"""Juejin sell strategy package."""
+"""Compatibility wrapper for ``strategies.juejin_sell_strategy``."""
 
-from .strategy import JuejinSellStrategy
+from strategies.juejin_sell_strategy import JuejinSellStrategy
 
 __all__ = ["JuejinSellStrategy"]
