@@ -129,6 +129,25 @@ def test_monitor_session_reuses_existing_pool_when_collection_times_out(monkeypa
     assert outcome.reason == "pool_collect_timeout"
 
 
+def test_monitor_session_reuses_existing_pool_when_collection_errors(monkeypatch, tmp_path: Path):
+    pool_path = tmp_path / "main_seal_follow_pool.csv"
+    pool_path.write_text("code,name,amount\n000001.SZ,Test,50000\n", encoding="utf-8")
+    args = build_parser().parse_args(["--pool-output", str(pool_path), "--pool-collect-timeout-sec", "1"])
+
+    def fake_collect_pool_once_with_timeout(pool_args, timeout_sec):
+        raise RuntimeError("missing pre-open cache")
+
+    monkeypatch.setattr(
+        "strategies.main_seal_follow.scripts.run_monitor_session.collect_pool_once_with_timeout",
+        fake_collect_pool_once_with_timeout,
+    )
+
+    outcome = collect_or_reuse_pool(args, logger=_NoopLogger())
+
+    assert outcome.status == "reused"
+    assert outcome.reason == "pool_collect_error"
+
+
 def test_monitor_session_fails_when_collection_times_out_without_fallback(monkeypatch, tmp_path: Path):
     pool_path = tmp_path / "main_seal_follow_pool.csv"
     pool_path.write_text("code,name,amount\n000001.SZ,Test,50000\n", encoding="utf-8")

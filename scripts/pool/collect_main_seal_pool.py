@@ -175,6 +175,47 @@ def write_source_cache(args, now: datetime, source_set_name: str, candidates: li
     return path
 
 
+def read_iwencai_cache_after_cutoff(
+    args,
+    now: datetime,
+    source_set_name: str,
+) -> tuple[list[PoolCandidate], Path, str]:
+    """Read the pre-09:00 iWenCai cache, failing closed when it is absent.
+
+    iWenCai query semantics change after the open. If the morning job did not
+    run before the cutoff, silently treating a missing cache as an empty set can
+    still produce a non-empty but incomplete final pool from other sources. The
+    safe default is therefore to stop generation and let the monitor-session
+    fallback reuse the previous complete CSV, or skip the run when no fallback
+    exists.
+    """
+    cache_path = source_cache_path(args, now, source_set_name)
+    allow_missing = bool(getattr(args, "allow_missing_iwencai_cache_after_cutoff", False))
+    allow_empty = bool(getattr(args, "allow_empty_iwencai_cache_after_cutoff", False))
+    if not cache_path.is_file():
+        if not allow_missing:
+            raise RuntimeError(
+                "9点后禁止重新采集 iWenCai，且未找到当天盘前缓存；"
+                f"set={source_set_name} cache={cache_path}。"
+                "为避免生成不完整股票池，本次停止生成；"
+                "请确认 9 点前定时任务已运行，或仅在人工确认风险后使用 "
+                "--allow-missing-iwencai-cache-after-cutoff。"
+            )
+        return [], cache_path, "missing_allowed"
+
+    candidates = read_candidates_trace(cache_path)
+    if not candidates and not allow_empty:
+        raise RuntimeError(
+            "9点后 iWenCai 当天盘前缓存为空；"
+            f"set={source_set_name} cache={cache_path}。"
+            "为避免生成不完整股票池，本次停止生成；"
+            "如确认当天该来源确实为空，仅可人工加 "
+            "--allow-empty-iwencai-cache-after-cutoff。"
+        )
+    status = "hit" if candidates else "empty_allowed"
+    return candidates, cache_path, status
+
+
 def should_collect_iwencai(now: datetime) -> bool:
     return now.hour < IWENCAI_COLLECT_CUTOFF_HOUR
 
@@ -212,12 +253,11 @@ def collect_configured_source_sets(args, now: datetime) -> tuple[dict[str, list[
             print(f"SET {source_set.name} source=iwencai raw={len(candidates)} cache={cache_path}", flush=True)
     else:
         for source_set in iwencai_sets:
-            cache_path = source_cache_path(args, now, source_set.name)
-            candidates = read_candidates_trace(cache_path)
+            candidates, cache_path, cache_status = read_iwencai_cache_after_cutoff(args, now, source_set.name)
             named_sets[source_set.name] = candidates
             print(
                 f"SET {source_set.name} source=iwencai reused_cache={cache_path} raw={len(candidates)} "
-                f"reason=after_0900",
+                f"reason=after_0900 cache_status={cache_status}",
                 flush=True,
             )
 
@@ -447,6 +487,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help=f"输出路径，默认 {DEFAULT_OUTPUT}")
     parser.add_argument("--trace-dir", default=str(DEFAULT_TRACE_DIR), help=f"筛选过程留痕目录，默认 {DEFAULT_TRACE_DIR}")
     parser.add_argument("--source-cache-dir", default=str(DEFAULT_SOURCE_CACHE_DIR), help=f"source-level cache directory, default {DEFAULT_SOURCE_CACHE_DIR}.")
+    parser.add_argument("--allow-missing-iwencai-cache-after-cutoff", action="store_true", help="9:00 后 iWenCai 当天缓存缺失时仍允许继续，仅用于人工调试；默认失败以避免不完整股票池。")
+    parser.add_argument("--allow-empty-iwencai-cache-after-cutoff", action="store_true", help="9:00 后 iWenCai 当天缓存为空时仍允许继续，仅在确认当天该来源确实为空时使用。")
     parser.add_argument("--source-config", default=str(DEFAULT_SOURCE_CONFIG), help=f"股票池来源配置文件，默认 {DEFAULT_SOURCE_CONFIG}。")
     parser.add_argument("--amount", type=float, default=50000.0, help="每只股票计划买入金额，默认 50000。")
     parser.add_argument("--pct-min", type=float, default=6.0, help=argparse.SUPPRESS)

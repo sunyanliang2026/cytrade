@@ -208,6 +208,19 @@ python scripts\pool\collect_main_seal_pool.py --source combined --once --amount 
 python scripts\pool\collect_main_seal_pool.py --source combined --schedule-time 08:45 --amount 50000
 ```
 
+### 9:00 后保护
+
+`combined` 来源在 9:00 后不再重新请求 iWenCai，而是只读取当天 `data/stock_pools/source_cache/YYYY-MM-DD/*.csv` 盘前缓存。这样避免开盘后问财语义变化导致股票池漂移。
+
+安全默认值：如果 9:00 后发现任一 iWenCai 结果集的当天缓存缺失或为空，程序会失败退出，不会用韭研公社等其他来源继续生成一份“看起来非空但实际不完整”的正式股票池。监控会话入口如果允许 fallback，会复用已有正式 CSV；没有可复用 CSV 时本次会跳过。
+
+仅人工确认风险时才使用调试开关：
+
+```powershell
+python scripts\pool\collect_main_seal_pool.py --source combined --once --allow-missing-iwencai-cache-after-cutoff
+python scripts\pool\collect_main_seal_pool.py --source combined --once --allow-empty-iwencai-cache-after-cutoff
+```
+
 只使用问财，不叠加其他来源：
 
 ```powershell

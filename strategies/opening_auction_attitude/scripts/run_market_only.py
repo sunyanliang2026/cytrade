@@ -32,13 +32,70 @@ from config.settings import Settings
 from main import _log_runtime_startup_config, _start_runtime_heartbeat, build_app
 from monitor.logger import get_log_file_path, get_logger
 from strategy.models import StrategyConfig
-from strategies.opening_auction_attitude import OpeningAuctionAttitudeStrategy
+from strategies.opening_auction_attitude import (
+    AUCTION_BIG_ORDER_CONFIRMED,
+    AUCTION_BIG_TRADE_CONFIRMED,
+    AUCTION_MONEY_LIFT,
+    AUCTION_STRONG_CONFIRMED,
+    OpeningAuctionAttitudeStrategy,
+)
 from scripts.pool.common import limit_up_price as calc_limit_up_price
 
 
 DEFAULT_POOL = "data/stock_pools/current/opening_auction_universe.csv"
 SESSION_EVENT_PREFIX = "OPENING_AUCTION_ATTITUDE_SESSION"
 EVENT_NAME = "MSF_AUCTION_ATTITUDE"
+RANKING_EVENT_NAME = "MSF_AUCTION_RANKING"
+BUY_PLAN_EVENT_NAME = "MSF_AUCTION_BUY_PLAN"
+
+ACTIONABLE_AUCTION_LABELS = {
+    AUCTION_STRONG_CONFIRMED,
+    AUCTION_BIG_ORDER_CONFIRMED,
+    AUCTION_BIG_TRADE_CONFIRMED,
+    AUCTION_MONEY_LIFT,
+}
+AUCTION_LABEL_BONUS = {
+    AUCTION_STRONG_CONFIRMED: 20.0,
+    AUCTION_BIG_ORDER_CONFIRMED: 14.0,
+    AUCTION_BIG_TRADE_CONFIRMED: 14.0,
+    AUCTION_MONEY_LIFT: 8.0,
+}
+DEFAULT_BUY_PLAN_TOP_N = 3
+DEFAULT_BUY_PLAN_MIN_SCORE = 75.0
+DEFAULT_BUY_PLAN_AMOUNT = 0.0
+RANKING_HEADERS = [
+    "rank",
+    "stock_code",
+    "stock_name",
+    "auction_label",
+    "auction_rank_score",
+    "auction_attitude_score",
+    "auction_speed_score",
+    "final_gap_pct",
+    "low_to_final_lift_pct",
+    "low_to_final_amount_ratio",
+    "amount_at_final",
+    "big_order_buy_ratio",
+    "big_trade_buy_ratio",
+    "has_order_confirmation",
+    "has_trade_confirmation",
+    "has_sell_pressure",
+    "plan_eligible",
+    "reason",
+]
+BUY_PLAN_HEADERS = [
+    "rank",
+    "stock_code",
+    "stock_name",
+    "plan_amount",
+    "reference_price",
+    "auction_rank_score",
+    "auction_label",
+    "reason",
+    "status",
+    "observe_only",
+    "real_order_sent",
+]
 
 CODE_COLUMN_CANDIDATES = (
     "stock_code",
@@ -428,23 +485,119 @@ class OpeningAuctionLimitUpScanner:
     ) -> None:
         if self._snapshot_record_handle is None:
             return
-        row = {
-            "scan_time": now,
-            "stock": entry.stock_code,
-            "stock_name": entry.stock_name,
-            "last_price": float(tick.last_price or 0.0),
-            "pre_close": float(tick.pre_close or 0.0),
-            "limit_up_price": float(limit_price or 0.0),
-            "amount": float(tick.amount or 0.0),
-            "volume": float(tick.volume or 0.0),
-            "snapshot_time": tick.snapshot_time,
-            "is_hit": bool(is_hit),
-            "raw": tick.raw or {},
-        }
+        row = build_snapshot_record_row(
+            now,
+            entry,
+            tick,
+            limit_price=limit_price,
+            is_hit=is_hit,
+            record_mode="dynamic_candidates",
+        )
         self._snapshot_record_handle.write(
             json.dumps(row, ensure_ascii=False, sort_keys=True, default=_json_default) + "\n"
         )
         self._snapshot_record_handle.flush()
+
+
+class FullPoolSnapshotRecorder:
+    """Periodically record full-tick snapshots for every loaded candidate.
+
+    This is the default install-all companion to the legacy dynamic candidate
+    scanner. It does not select candidates; it only preserves market snapshots
+    for replay/debugging alongside the separate L2 raw recorder.
+    """
+
+    def __init__(
+        self,
+        entries: Iterable[PoolEntry],
+        *,
+        snapshot_provider: Callable[[Iterable[str]], dict[str, SnapshotTick]],
+        snapshot_record_path: str = "",
+        limit_up_tolerance: float = 0.01,
+    ):
+        self._entries = [
+            PoolEntry(normalize_stock_code(entry.stock_code), entry.stock_name)
+            for entry in entries
+            if normalize_stock_code(entry.stock_code)
+        ]
+        self._entries_by_code = {entry.stock_code: entry for entry in self._entries}
+        self._snapshot_provider = snapshot_provider
+        self._limit_up_tolerance = max(0.0, float(limit_up_tolerance or 0.0))
+        self._rows_written = 0
+        self._snapshot_record_handle = None
+        if snapshot_record_path:
+            path = Path(snapshot_record_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._snapshot_record_handle = path.open("a", encoding="utf-8", newline="")
+
+    @property
+    def universe_count(self) -> int:
+        return len(self._entries)
+
+    @property
+    def rows_written(self) -> int:
+        return self._rows_written
+
+    def close(self) -> None:
+        if self._snapshot_record_handle is not None:
+            self._snapshot_record_handle.close()
+            self._snapshot_record_handle = None
+
+    def record_once(self, now: datetime) -> int:
+        if self._snapshot_record_handle is None or not self._entries:
+            return 0
+        snapshots = self._snapshot_provider([entry.stock_code for entry in self._entries])
+        written = 0
+        for code, tick in snapshots.items():
+            normalized_code = normalize_stock_code(code)
+            entry = self._entries_by_code.get(normalized_code)
+            if not entry:
+                continue
+            last_price = float(tick.last_price or 0.0)
+            pre_close = float(tick.pre_close or 0.0)
+            limit_price = calc_limit_up_price(pre_close)
+            is_hit = limit_price > 0 and last_price > 0 and last_price >= limit_price - self._limit_up_tolerance
+            row = build_snapshot_record_row(
+                now,
+                entry,
+                tick,
+                limit_price=limit_price,
+                is_hit=is_hit,
+                record_mode="install_all_full_pool",
+            )
+            self._snapshot_record_handle.write(
+                json.dumps(row, ensure_ascii=False, sort_keys=True, default=_json_default) + "\n"
+            )
+            written += 1
+        if written:
+            self._snapshot_record_handle.flush()
+            self._rows_written += written
+        return written
+
+
+def build_snapshot_record_row(
+    now: datetime,
+    entry: PoolEntry,
+    tick: SnapshotTick,
+    *,
+    limit_price: float,
+    is_hit: bool,
+    record_mode: str,
+) -> dict[str, Any]:
+    return {
+        "record_mode": record_mode,
+        "scan_time": now,
+        "stock": entry.stock_code,
+        "stock_name": entry.stock_name,
+        "last_price": float(tick.last_price or 0.0),
+        "pre_close": float(tick.pre_close or 0.0),
+        "limit_up_price": float(limit_price or 0.0),
+        "amount": float(tick.amount or 0.0),
+        "volume": float(tick.volume or 0.0),
+        "snapshot_time": tick.snapshot_time,
+        "is_hit": bool(is_hit),
+        "raw": tick.raw or {},
+    }
 
 
 def build_observe_settings(args: argparse.Namespace) -> Settings:
@@ -468,6 +621,198 @@ def _json_default(value):
         except Exception:
             pass
     return str(value)
+
+
+def default_output_path(kind: str, anchor: datetime | None = None) -> str:
+    date_label = (anchor or datetime.now()).strftime("%Y%m%d")
+    filename = f"{date_label}_{kind}.csv"
+    return str(Path(__file__).resolve().parents[1] / "output" / filename)
+
+
+def _to_output_float(value: Any, digits: int = 6) -> float:
+    try:
+        return round(float(value or 0.0), digits)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _auction_rank_score(decision) -> float:
+    label = str(getattr(decision, "auction_label", "") or "")
+    evidence = dict(getattr(decision, "evidence", {}) or {})
+    score = (
+        float(getattr(decision, "auction_attitude_score", 0.0) or 0.0) * 0.75
+        + float(getattr(decision, "auction_speed_score", 0.0) or 0.0) * 0.25
+        + float(AUCTION_LABEL_BONUS.get(label, 0.0))
+    )
+    if evidence.get("has_order_sell_pressure") or evidence.get("has_trade_sell_pressure"):
+        score -= 15.0
+    if evidence.get("has_unmatched_sell_pressure"):
+        score -= 8.0
+    return round(max(0.0, min(120.0, score)), 3)
+
+
+def build_auction_rankings(
+    strategies: Iterable[OpeningAuctionAttitudeStrategy],
+    *,
+    min_plan_score: float = DEFAULT_BUY_PLAN_MIN_SCORE,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for strategy in strategies:
+        if not isinstance(strategy, OpeningAuctionAttitudeStrategy):
+            continue
+        decision = strategy.classify_auction()
+        evidence = dict(decision.evidence or {})
+        params = getattr(getattr(strategy, "config", None), "params", {}) or {}
+        label = str(decision.auction_label or "")
+        sell_pressure = bool(
+            evidence.get("has_order_sell_pressure")
+            or evidence.get("has_trade_sell_pressure")
+            or evidence.get("has_unmatched_sell_pressure")
+        )
+        rank_score = _auction_rank_score(decision)
+        plan_eligible = label in ACTIONABLE_AUCTION_LABELS and rank_score >= float(min_plan_score or 0.0) and not sell_pressure
+        rows.append(
+            {
+                "rank": 0,
+                "stock_code": strategy.stock_code,
+                "stock_name": str(params.get("stock_name") or ""),
+                "auction_label": label,
+                "auction_rank_score": rank_score,
+                "auction_attitude_score": _to_output_float(decision.auction_attitude_score, 3),
+                "auction_speed_score": _to_output_float(decision.auction_speed_score, 3),
+                "final_gap_pct": _to_output_float(evidence.get("final_gap_pct"), 6),
+                "low_to_final_lift_pct": _to_output_float(evidence.get("low_to_final_lift_pct"), 6),
+                "low_to_final_amount_ratio": _to_output_float(evidence.get("low_to_final_amount_ratio"), 6),
+                "amount_at_final": _to_output_float(evidence.get("amount_at_final"), 2),
+                "big_order_buy_ratio": _to_output_float(evidence.get("big_order_buy_ratio"), 6),
+                "big_trade_buy_ratio": _to_output_float(evidence.get("big_trade_buy_ratio"), 6),
+                "has_order_confirmation": bool(evidence.get("has_order_confirmation")),
+                "has_trade_confirmation": bool(evidence.get("has_trade_confirmation")),
+                "has_sell_pressure": sell_pressure,
+                "plan_eligible": plan_eligible,
+                "reason": str(decision.reason or ""),
+                "reference_price": _to_output_float(evidence.get("auction_final_price"), 3),
+            }
+        )
+
+    rows.sort(
+        key=lambda row: (
+            not bool(row["plan_eligible"]),
+            -float(row["auction_rank_score"]),
+            -float(row["auction_attitude_score"]),
+            -float(row["auction_speed_score"]),
+            str(row["stock_code"]),
+        )
+    )
+    for index, row in enumerate(rows, start=1):
+        row["rank"] = index
+    return rows
+
+
+def build_buy_plan_rows(
+    rankings: Iterable[dict[str, Any]],
+    *,
+    top_n: int = DEFAULT_BUY_PLAN_TOP_N,
+    plan_amount: float = DEFAULT_BUY_PLAN_AMOUNT,
+) -> list[dict[str, Any]]:
+    limit = max(0, int(top_n or 0))
+    if limit <= 0:
+        return []
+    rows: list[dict[str, Any]] = []
+    for row in rankings:
+        if not bool(row.get("plan_eligible")):
+            continue
+        rows.append(
+            {
+                "rank": int(row.get("rank", 0) or 0),
+                "stock_code": str(row.get("stock_code") or ""),
+                "stock_name": str(row.get("stock_name") or ""),
+                "plan_amount": _to_output_float(plan_amount, 2),
+                "reference_price": _to_output_float(row.get("reference_price"), 3),
+                "auction_rank_score": _to_output_float(row.get("auction_rank_score"), 3),
+                "auction_label": str(row.get("auction_label") or ""),
+                "reason": str(row.get("reason") or ""),
+                "status": "PLAN_ONLY",
+                "observe_only": True,
+                "real_order_sent": False,
+            }
+        )
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _write_rows(path: str, rows: Iterable[dict[str, Any]], headers: list[str]) -> str:
+    if not path:
+        return ""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8-sig", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=headers, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return str(output_path)
+
+
+def write_auction_rankings(path: str, rankings: Iterable[dict[str, Any]]) -> str:
+    return _write_rows(path, rankings, RANKING_HEADERS)
+
+
+def write_buy_plan(path: str, buy_plan_rows: Iterable[dict[str, Any]]) -> str:
+    return _write_rows(path, buy_plan_rows, BUY_PLAN_HEADERS)
+
+
+def emit_auction_rankings_and_buy_plan(
+    runner,
+    *,
+    logger=None,
+    ranking_output_path: str = "",
+    buy_plan_output_path: str = "",
+    buy_plan_top_n: int = DEFAULT_BUY_PLAN_TOP_N,
+    buy_plan_min_score: float = DEFAULT_BUY_PLAN_MIN_SCORE,
+    buy_plan_amount: float = DEFAULT_BUY_PLAN_AMOUNT,
+) -> tuple[int, int]:
+    logger = logger or get_logger("system")
+    rankings = build_auction_rankings(runner.get_all_strategies(), min_plan_score=buy_plan_min_score)
+    buy_plan_rows = build_buy_plan_rows(rankings, top_n=buy_plan_top_n, plan_amount=buy_plan_amount)
+    ranking_path = write_auction_rankings(ranking_output_path, rankings)
+    plan_path = write_buy_plan(buy_plan_output_path, buy_plan_rows)
+    logger.info(
+        "%s %s",
+        RANKING_EVENT_NAME,
+        json.dumps(
+            {
+                "event_name": RANKING_EVENT_NAME,
+                "rows": len(rankings),
+                "output_path": ranking_path,
+                "observe_only": True,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=_json_default,
+        ),
+    )
+    logger.info(
+        "%s %s",
+        BUY_PLAN_EVENT_NAME,
+        json.dumps(
+            {
+                "event_name": BUY_PLAN_EVENT_NAME,
+                "rows": len(buy_plan_rows),
+                "top_n": int(buy_plan_top_n or 0),
+                "min_score": float(buy_plan_min_score or 0.0),
+                "plan_amount": float(buy_plan_amount or 0.0),
+                "output_path": plan_path,
+                "observe_only": True,
+                "real_order_sent": False,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=_json_default,
+        ),
+    )
+    return len(rankings), len(buy_plan_rows)
 
 
 def emit_auction_decisions(runner, logger=None) -> int:
@@ -503,13 +848,18 @@ def run_market_only(
     now_provider: Callable[[], datetime] = datetime.now,
     sleep_fn: Callable[[float], None] = time.sleep,
     build_app_fn=build_app,
-    dynamic_candidates: bool = True,
+    dynamic_candidates: bool = False,
     snapshot_provider: Callable[[Iterable[str]], dict[str, SnapshotTick]] = fetch_full_tick_snapshots,
     scan_start_time: str = "09:15:00",
     candidate_freeze_time: str = "09:24:30",
     snapshot_interval_sec: float = 2.0,
     limit_up_tolerance: float = 0.01,
     snapshot_record_path: str = "",
+    ranking_output_path: str = "",
+    buy_plan_output_path: str = "",
+    buy_plan_top_n: int = DEFAULT_BUY_PLAN_TOP_N,
+    buy_plan_min_score: float = DEFAULT_BUY_PLAN_MIN_SCORE,
+    buy_plan_amount: float = DEFAULT_BUY_PLAN_AMOUNT,
 ) -> None:
     entries = resolve_observe_entries(codes=codes, pool_path=pool_path, max_count=max_count)
     if not entries:
@@ -552,6 +902,17 @@ def run_market_only(
         if dynamic_candidates
         else None
     )
+    full_snapshot_recorder = (
+        FullPoolSnapshotRecorder(
+            entries,
+            snapshot_provider=snapshot_provider,
+            snapshot_record_path=snapshot_record_path,
+            limit_up_tolerance=limit_up_tolerance,
+        )
+        if (not dynamic_candidates and snapshot_record_path)
+        else None
+    )
+    last_full_snapshot_at: datetime | None = None
 
     def _stop(sig=None, frame=None) -> None:
         logger.info("OpeningAuctionAttitude observe-only session stopping sig=%s", sig)
@@ -595,6 +956,15 @@ def run_market_only(
                 trade_executor=trade_exec,
                 position_manager=pos_mgr,
             )
+            if full_snapshot_recorder:
+                logger.info(
+                    "%s full_pool_snapshot_record_start universe=%d scan_start=%s interval_sec=%.1f path=%s",
+                    session_event_prefix,
+                    full_snapshot_recorder.universe_count,
+                    scan_start_at.strftime("%H:%M:%S"),
+                    snapshot_interval_sec,
+                    snapshot_record_path,
+                )
         started = True
         data_thread = threading.Thread(target=data_sub.start, daemon=True, name="opening-auction-data-sub")
         data_thread.start()
@@ -624,6 +994,19 @@ def run_market_only(
                 except Exception as exc:
                     logger.error("%s snapshot_scan_failed error=%s", session_event_prefix, exc, exc_info=True)
 
+            if full_snapshot_recorder and now >= scan_start_at:
+                elapsed = (
+                    snapshot_interval_sec
+                    if last_full_snapshot_at is None
+                    else (now - last_full_snapshot_at).total_seconds()
+                )
+                if elapsed >= snapshot_interval_sec:
+                    try:
+                        full_snapshot_recorder.record_once(now)
+                    except Exception as exc:
+                        logger.error("%s full_pool_snapshot_record_failed error=%s", session_event_prefix, exc, exc_info=True)
+                    last_full_snapshot_at = now
+
             if scanner and not freeze_logged and now >= freeze_at:
                 scanner.scan_once(now)
                 logger.info(
@@ -650,13 +1033,41 @@ def run_market_only(
                 break
             if scanner and scan_start_at <= now < freeze_at:
                 sleep_fn(snapshot_interval_sec)
+            elif full_snapshot_recorder and now >= scan_start_at:
+                sleep_fn(snapshot_interval_sec)
             else:
                 sleep_fn(1)
     finally:
         emitted = emit_auction_decisions(runner, logger) if started else 0
         logger.info("%s decisions_emitted=%d", session_event_prefix, emitted)
+        ranking_rows = 0
+        buy_plan_rows = 0
+        if started:
+            ranking_rows, buy_plan_rows = emit_auction_rankings_and_buy_plan(
+                runner,
+                logger=logger,
+                ranking_output_path=ranking_output_path,
+                buy_plan_output_path=buy_plan_output_path,
+                buy_plan_top_n=buy_plan_top_n,
+                buy_plan_min_score=buy_plan_min_score,
+                buy_plan_amount=buy_plan_amount,
+            )
+        logger.info(
+            "%s ranking_and_plan rows=%d buy_plan_rows=%d observe_only=true real_order_sent=false",
+            session_event_prefix,
+            ranking_rows,
+            buy_plan_rows,
+        )
         if scanner:
             scanner.close()
+        if full_snapshot_recorder:
+            logger.info(
+                "%s full_pool_snapshot_record_stop rows=%d path=%s",
+                session_event_prefix,
+                full_snapshot_recorder.rows_written,
+                snapshot_record_path,
+            )
+            full_snapshot_recorder.close()
         try:
             runner.stop()
         finally:
@@ -677,11 +1088,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-count", type=int, default=0, help="Limit observed symbols, 0 means unlimited.")
     parser.add_argument("--stop-time", default="09:35:00", help="Auto stop time in HH:MM or HH:MM:SS.")
     parser.add_argument("--scan-start-time", default="09:15:00", help="Snapshot scan start time.")
-    parser.add_argument("--candidate-freeze-time", default="09:24:30", help="Stop adding dynamic candidates after this time.")
-    parser.add_argument("--snapshot-interval-sec", type=float, default=2.0, help="Snapshot polling interval before freeze.")
+    parser.add_argument("--candidate-freeze-time", default="09:24:30", help="Legacy --dynamic-candidates only: stop adding candidates after this time.")
+    parser.add_argument("--snapshot-interval-sec", type=float, default=2.0, help="Full-tick snapshot polling interval in seconds.")
     parser.add_argument("--limit-up-tolerance", type=float, default=0.01, help="Price tolerance for limit-up snapshot hit.")
-    parser.add_argument("--snapshot-record-path", default="", help="Optional JSONL path for full snapshot scan records.")
-    parser.add_argument("--install-all", action="store_true", help="Install strategies for the whole pool at startup.")
+    parser.add_argument("--snapshot-record-path", default="", help="Optional JSONL path. In default install-all mode records full-pool snapshots; in --dynamic-candidates mode records legacy scanner snapshots.")
+    candidate_mode = parser.add_mutually_exclusive_group()
+    candidate_mode.add_argument(
+        "--install-all",
+        dest="install_all",
+        action="store_true",
+        default=True,
+        help="Install strategies for the whole loaded pool at startup (default).",
+    )
+    candidate_mode.add_argument(
+        "--dynamic-candidates",
+        dest="install_all",
+        action="store_false",
+        help="Use legacy snapshot scanner and install only symbols that hit the limit-up condition before freeze.",
+    )
+    parser.add_argument("--ranking-output", default="", help="CSV path for 09:25 auction ranking output. Empty uses strategy output dir.")
+    parser.add_argument("--buy-plan-output", default="", help="CSV path for plan-only buy-plan output. Empty uses strategy output dir.")
+    parser.add_argument("--buy-plan-top-n", type=int, default=DEFAULT_BUY_PLAN_TOP_N, help="Maximum plan-only candidates to output.")
+    parser.add_argument("--buy-plan-min-score", type=float, default=DEFAULT_BUY_PLAN_MIN_SCORE, help="Minimum auction rank score for plan-only candidates.")
+    parser.add_argument("--buy-plan-amount", type=float, default=DEFAULT_BUY_PLAN_AMOUNT, help="Reference plan amount; no order is sent.")
     parser.add_argument("--heartbeat-interval-sec", type=int, default=30)
     parser.add_argument("--full-console", action="store_true", help="Disable summary mode and print all console logs.")
     return parser
@@ -690,7 +1119,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     settings = build_observe_settings(args)
-    stop_at = build_session_time(datetime.now(), str(args.stop_time))
+    anchor = datetime.now()
+    stop_at = build_session_time(anchor, str(args.stop_time))
+    ranking_output = str(args.ranking_output or default_output_path("auction_rankings", anchor))
+    buy_plan_output = str(args.buy_plan_output or default_output_path("auction_buy_plan", anchor))
     run_market_only(
         codes=args.codes,
         pool_path=str(args.pool),
@@ -703,6 +1135,11 @@ def main() -> None:
         snapshot_interval_sec=float(args.snapshot_interval_sec),
         limit_up_tolerance=float(args.limit_up_tolerance),
         snapshot_record_path=str(args.snapshot_record_path),
+        ranking_output_path=ranking_output,
+        buy_plan_output_path=buy_plan_output,
+        buy_plan_top_n=int(args.buy_plan_top_n),
+        buy_plan_min_score=float(args.buy_plan_min_score),
+        buy_plan_amount=float(args.buy_plan_amount),
     )
 
 

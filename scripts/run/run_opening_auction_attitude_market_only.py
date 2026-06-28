@@ -1,7 +1,16 @@
 """Compatibility wrapper for the relocated OpeningAuctionAttitude market-only runner."""
 
-from strategies.opening_auction_attitude.scripts.run_market_only import *  # noqa: F401,F403
-from strategies.opening_auction_attitude.scripts.run_market_only import main
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from strategies.opening_auction_attitude.scripts.run_market_only import *  # noqa: F401,F403,E402
+from strategies.opening_auction_attitude.scripts.run_market_only import main  # noqa: E402
 
 
 if __name__ == "__main__":

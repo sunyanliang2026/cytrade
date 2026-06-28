@@ -5,6 +5,7 @@ import types
 from datetime import datetime
 
 import pandas as pd
+import pytest
 
 import scripts.pool.collect_main_seal_pool as pool_module
 from scripts.pool.collect_main_seal_pool import (
@@ -543,6 +544,72 @@ def test_collect_main_seal_pool_reuses_iwencai_cache_after_0900(tmp_path, monkey
     assert [item.code for item in named_sets["iwencai.base"]] == ["600604"]
     assert [item.code for item in named_sets["jiuyangongshe.hot"]] == ["600604.SH"]
     assert [item.code for item in evaluate_candidate_expression(final_expression, named_sets)] == ["600604"]
+
+
+def test_collect_main_seal_pool_fails_after_0900_when_iwencai_cache_missing(tmp_path):
+    source_config = tmp_path / "sources.json"
+    source_config.write_text(
+        json.dumps(
+            {
+                "sets": {
+                    "iwencai.base": {"source": "iwencai", "query": "base query"},
+                    "jiuyangongshe.hot": {"source": "jiuyangongshe", "node": "hot_events"},
+                },
+                "final": {"intersect": ["jiuyangongshe.hot", "iwencai.base"]},
+                "jiuyangongshe": {"enabled": True, "require_today": True},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    args = pool_module.build_parser().parse_args(
+        [
+            "--source",
+            "combined",
+            "--source-config",
+            str(source_config),
+            "--source-cache-dir",
+            str(tmp_path / "cache"),
+            "--no-market-day-check",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="未找到当天盘前缓存"):
+        pool_module.collect_configured_source_sets(args, datetime(2026, 6, 8, 9, 15))
+
+
+def test_collect_main_seal_pool_fails_after_0900_when_iwencai_cache_empty(tmp_path):
+    source_config = tmp_path / "sources.json"
+    source_config.write_text(
+        json.dumps(
+            {
+                "sets": {
+                    "iwencai.base": {"source": "iwencai", "query": "base query"},
+                    "jiuyangongshe.hot": {"source": "jiuyangongshe", "node": "hot_events"},
+                },
+                "final": {"intersect": ["jiuyangongshe.hot", "iwencai.base"]},
+                "jiuyangongshe": {"enabled": True, "require_today": True},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    args = pool_module.build_parser().parse_args(
+        [
+            "--source",
+            "combined",
+            "--source-config",
+            str(source_config),
+            "--source-cache-dir",
+            str(tmp_path / "cache"),
+            "--no-market-day-check",
+        ]
+    )
+    now = datetime(2026, 6, 8, 9, 15)
+    pool_module.write_source_cache(args, now, "iwencai.base", [])
+
+    with pytest.raises(RuntimeError, match="缓存为空"):
+        pool_module.collect_configured_source_sets(args, now)
 
 
 def test_collect_main_seal_pool_skips_jiuyangongshe_before_0830(tmp_path, monkeypatch):

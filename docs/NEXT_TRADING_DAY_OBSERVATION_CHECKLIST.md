@@ -26,7 +26,19 @@ Acceptance:
 
 - Stock pool generation succeeds without uncaught exceptions.
 - `data/stock_pools/current/main_seal_follow_pool.csv` is updated.
+- iWenCai source cache exists for every configured iWenCai set under
+  `data/stock_pools/source_cache/YYYY-MM-DD/` and is non-empty unless manually
+  confirmed otherwise.
 - If Jiuyangongshe is skipped, the warning must explain why.
+
+## After 09:00 Late-Start Guard
+
+Expected behavior when the monitor/process starts late:
+
+- The pool generator must not silently regenerate iWenCai results after 09:00.
+- If today's iWenCai source cache is missing or empty, generation fails closed.
+- The monitor session may reuse an existing official CSV as fallback; otherwise
+  it skips instead of overwriting the official pool with an incomplete file.
 
 ## 09:30-09:35
 
