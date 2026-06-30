@@ -30,11 +30,11 @@ echo Probe output: %PROBE_DIR%
 start "OpeningAuctionL2Probe" /min cmd /c ""%PY%" scripts\probe\probe_opening_auction_l2.py --early-pool "%POOL%" --output-dir "%PROBE_DIR%" --early-subscribe-at 09:15:00 --capture-start 09:15:00 --capture-end 09:35:00 --final-10s-start 09:24:50 --final-10s-end 09:25:05 --open-5m-start 09:30:00 --open-5m-end 09:35:00 --stop-at 09:35:00 --log-file "%PROBE_DIR%\probe_console.log""
 
 echo [4/5] Run all-candidate opening auction strategy and full-pool snapshot recorder...
-"%PY%" scripts\run\run_opening_auction_attitude_market_only.py --pool "%POOL%" --install-all --scan-start-time 09:15:00 --snapshot-interval-sec 2 --snapshot-record-path "%SNAPSHOT_OUTPUT%" --ranking-output "%RANKING_OUTPUT%" --buy-plan-output "%BUY_PLAN_OUTPUT%" --stop-time 09:35:00 --heartbeat-interval-sec 10
+"%PY%" scripts\run\run_opening_auction_attitude_market_only.py --pool "%POOL%" --install-all --scan-start-time 09:15:00 --snapshot-interval-sec 2 --snapshot-record-path "%SNAPSHOT_OUTPUT%" --ranking-output "%RANKING_OUTPUT%" --buy-plan-output "%BUY_PLAN_OUTPUT%" --preopen-reference-time 09:25:15 --stop-time 09:35:00 --heartbeat-interval-sec 10
 if errorlevel 1 goto failed
 
 echo [5/5] Write run manifest...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$manifest=[ordered]@{run_id='%RUN_ID%';strategy='opening_auction_attitude';mode='install_all_full_candidate_pool';pool='%POOL%';probe_dir='%PROBE_DIR%';l2_raw=(Join-Path '%PROBE_DIR%' 'opening_l2_raw.jsonl');l2_summary=(Join-Path '%PROBE_DIR%' 'opening_l2_summary.csv');l2_schema=(Join-Path '%PROBE_DIR%' 'opening_l2_schema.json');probe_console_log=(Join-Path '%PROBE_DIR%' 'probe_console.log');snapshot_full_pool='%SNAPSHOT_OUTPUT%';ranking_output='%RANKING_OUTPUT%';buy_plan_output='%BUY_PLAN_OUTPUT%';observe_only=$true;real_order_sent=$false}; $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 '%MANIFEST_OUTPUT%'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$manifest=[ordered]@{run_id='%RUN_ID%';strategy='opening_auction_attitude';mode='install_all_full_candidate_pool';pool='%POOL%';probe_dir='%PROBE_DIR%';l2_raw=(Join-Path '%PROBE_DIR%' 'opening_l2_raw.jsonl');l2_summary=(Join-Path '%PROBE_DIR%' 'opening_l2_summary.csv');l2_schema=(Join-Path '%PROBE_DIR%' 'opening_l2_schema.json');probe_console_log=(Join-Path '%PROBE_DIR%' 'probe_console.log');snapshot_full_pool='%SNAPSHOT_OUTPUT%';ranking_output='%RANKING_OUTPUT%';buy_plan_output='%BUY_PLAN_OUTPUT%';preopen_reference_time='09:25:15';observe_only=$true;real_order_sent=$false}; $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 '%MANIFEST_OUTPUT%'"
 if errorlevel 1 goto failed
 
 echo Done.

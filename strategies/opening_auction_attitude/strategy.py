@@ -1,7 +1,7 @@
 """Observe-only opening auction attitude strategy."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time
 from typing import Any
 
 from core.l2_models import L2OrderEvent, L2OrderQueueEvent, L2QuoteEvent, L2TransactionEvent
@@ -86,6 +86,19 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         self._cancel_sell_order_amount = 0.0
         self._big_buy_trade_amount = 0.0
         self._big_sell_trade_amount = 0.0
+        self._orders_by_no: dict[str, dict[str, Any]] = {}
+        self._final_tx_amount = 0.0
+        self._final_tx_count = 0
+        self._final_from_last20_bid_amount = 0.0
+        self._final_from_last10_bid_amount = 0.0
+        self._final_from_limit_up_bid_amount = 0.0
+        self._last20_bid_amount = 0.0
+        self._last10_bid_amount = 0.0
+        self._last20_bid_count = 0
+        self._last10_bid_count = 0
+        self._final_auction_quote_amount = 0.0
+        self._open_price_0925 = 0.0
+        self._limit_up_price = float(params.get("limit_up_price", 0.0) or 0.0)
         self._open_l2transaction_count = 0
         self._open_buy_trade_amount = 0.0
         self._open_sell_trade_amount = 0.0
@@ -126,6 +139,8 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         if event.stock_code != self.stock_code or not self._in_auction_window(event.event_time):
             return
         self._l2quote_count += 1
+        if float(event.limit_up_price or 0.0) > 0:
+            self._limit_up_price = float(event.limit_up_price)
         quote_amount = self._auction_quote_amount(event.raw_xt_fields, fallback_price=float(event.last_price or 0.0))
         price = quote_amount["price"] or float(event.last_price or 0.0)
         self._record_price_point(
@@ -140,6 +155,12 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
             unmatched_sell_amount=quote_amount["unmatched_sell_amount"],
             amount_source=quote_amount["amount_source"],
         )
+        if self._in_final_auction_result_window(event.event_time):
+            raw_amount = self._amount_from_raw(event.raw_xt_fields)
+            final_amount = raw_amount if raw_amount > 0 else float(quote_amount["matched_amount"] or 0.0)
+            if final_amount >= self._final_auction_quote_amount:
+                self._final_auction_quote_amount = final_amount
+                self._open_price_0925 = float(price or 0.0)
 
     def on_l2_order(self, event: L2OrderEvent) -> None:
         if event.stock_code != self.stock_code or not self._in_auction_window(event.event_time):
@@ -147,8 +168,30 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         self._l2order_count += 1
         amount = self._event_amount(event)
         side = str(event.side or "").strip().upper()
+        is_cancel = bool(getattr(event, "is_cancel", False))
+        entrust_no = str(getattr(event, "entrust_no", "") or "").strip()
+        if entrust_no:
+            self._orders_by_no[entrust_no] = {
+                "side": side,
+                "event_time": event.event_time,
+                "price": float(event.price or 0.0),
+                "amount": amount,
+                "is_cancel": is_cancel,
+            }
+        if is_cancel:
+            if side == "BUY":
+                self._cancel_buy_order_amount += amount
+            elif side == "SELL":
+                self._cancel_sell_order_amount += amount
+            return
         if side == "BUY":
             self._big_buy_order_amount += amount
+            if self._in_last20_bid_window(event.event_time):
+                self._last20_bid_amount += amount
+                self._last20_bid_count += 1
+            if self._in_last10_bid_window(event.event_time):
+                self._last10_bid_amount += amount
+                self._last10_bid_count += 1
         elif side == "SELL":
             self._big_sell_order_amount += amount
         elif side == "CANCEL_BUY":
@@ -163,6 +206,18 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         amount = self._event_amount(event)
         if self._in_auction_window(event.event_time):
             self._l2transaction_count += 1
+            if amount > 0 and float(event.price or 0.0) > 0:
+                self._final_tx_amount += amount
+                self._final_tx_count += 1
+                buy_order = self._orders_by_no.get(str(event.buy_no or "").strip())
+                if buy_order:
+                    order_time = buy_order.get("event_time")
+                    if self._in_last20_bid_window(order_time):
+                        self._final_from_last20_bid_amount += amount
+                    if self._in_last10_bid_window(order_time):
+                        self._final_from_last10_bid_amount += amount
+                    if self._is_limit_up_bid_order(buy_order):
+                        self._final_from_limit_up_bid_amount += amount
             if side == "BUY":
                 self._big_buy_trade_amount += amount
             elif side == "SELL":
@@ -268,6 +323,7 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
             "open_l2transaction_count": self._open_l2transaction_count,
             "open_buy_trade_amount": self._open_buy_trade_amount,
             "open_sell_trade_amount": self._open_sell_trade_amount,
+            "auction_reference": self.build_auction_reference_metrics(),
             "evidence": evidence,
             "open_evidence": open_evidence,
         }
@@ -331,6 +387,84 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
             return True
         clock = event_time.time()
         return self._score_config.window_start <= clock <= self._score_config.window_end
+
+    def build_auction_reference_metrics(self) -> dict[str, Any]:
+        final_amount = self._final_auction_quote_amount or self._final_tx_amount
+        open_pct = 0.0
+        if self._pre_close > 0 and self._open_price_0925 > 0:
+            open_pct = (self._open_price_0925 / self._pre_close - 1.0) * 100.0
+        tx_detail_available = self._final_tx_amount > 0 and self._final_tx_count > 0
+        if self._final_auction_quote_amount > 0:
+            final_amount_source = "quote_0925"
+        elif self._final_tx_amount > 0:
+            final_amount_source = "l2transaction_sum"
+        else:
+            final_amount_source = ""
+        return {
+            "pre_close": float(self._pre_close or 0.0),
+            "open_price_0925": float(self._open_price_0925 or 0.0),
+            "open_pct": open_pct,
+            "final_auction_amount": float(final_amount or 0.0),
+            "final_amount_source": final_amount_source,
+            "tx_detail_available": tx_detail_available,
+            "final_tx_amount": float(self._final_tx_amount or 0.0),
+            "final_tx_count": int(self._final_tx_count or 0),
+            "last10_bid_amount": float(self._last10_bid_amount or 0.0),
+            "last20_bid_amount": float(self._last20_bid_amount or 0.0),
+            "last10_bid_count": int(self._last10_bid_count or 0),
+            "last20_bid_count": int(self._last20_bid_count or 0),
+            "final_from_last20_bid_amount": float(self._final_from_last20_bid_amount or 0.0),
+            "final_from_last20_bid_pct": self._amount_pct(self._final_from_last20_bid_amount, self._final_tx_amount),
+            "final_from_last10_bid_amount": float(self._final_from_last10_bid_amount or 0.0),
+            "final_from_last10_bid_pct": self._amount_pct(self._final_from_last10_bid_amount, self._final_tx_amount),
+            "limit_up_price": float(self._effective_limit_up_price() or 0.0),
+            "final_from_limit_up_bid_amount": float(self._final_from_limit_up_bid_amount or 0.0),
+            "final_from_limit_up_bid_pct": self._amount_pct(self._final_from_limit_up_bid_amount, self._final_tx_amount),
+        }
+
+    def _in_final_auction_result_window(self, event_time: datetime | None) -> bool:
+        if event_time is None:
+            return False
+        return time(9, 25, 0) <= event_time.time() <= self._score_config.window_end
+
+    @staticmethod
+    def _in_last20_bid_window(event_time: datetime | None) -> bool:
+        if event_time is None:
+            return False
+        return time(9, 24, 40) <= event_time.time() < time(9, 25, 0)
+
+    @staticmethod
+    def _in_last10_bid_window(event_time: datetime | None) -> bool:
+        if event_time is None:
+            return False
+        return time(9, 24, 50) <= event_time.time() < time(9, 25, 0)
+
+    @staticmethod
+    def _amount_pct(numerator: float, denominator: float) -> float:
+        denominator = float(denominator or 0.0)
+        if denominator <= 0:
+            return 0.0
+        return float(numerator or 0.0) / denominator * 100.0
+
+    def _is_limit_up_bid_order(self, order: dict[str, Any]) -> bool:
+        if str(order.get("side") or "").upper() != "BUY":
+            return False
+        limit_price = self._effective_limit_up_price()
+        price = float(order.get("price", 0.0) or 0.0)
+        return limit_price > 0 and price >= limit_price - 1e-8
+
+    def _effective_limit_up_price(self) -> float:
+        if self._limit_up_price > 0:
+            return self._limit_up_price
+        if self._pre_close <= 0:
+            return 0.0
+        if self.stock_code.startswith(("300", "301", "688", "689")):
+            ratio = 0.20
+        elif self.stock_code.startswith(("4", "8")):
+            ratio = 0.30
+        else:
+            ratio = 0.10
+        return round(self._pre_close * (1.0 + ratio) + 1e-9, 2)
 
     def _in_open_verify_window(self, event_time: datetime | None) -> bool:
         if event_time is None:

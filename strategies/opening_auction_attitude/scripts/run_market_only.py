@@ -75,6 +75,22 @@ RANKING_HEADERS = [
     "low_to_final_lift_pct",
     "low_to_final_amount_ratio",
     "amount_at_final",
+    "open_pct",
+    "open_price_0925",
+    "final_auction_amount",
+    "final_amount_source",
+    "tx_detail_available",
+    "final_tx_amount",
+    "final_tx_count",
+    "last10_bid_amount",
+    "last20_bid_amount",
+    "final_from_last20_bid_amount",
+    "final_from_last20_bid_pct",
+    "final_from_last10_bid_amount",
+    "final_from_last10_bid_pct",
+    "limit_up_price",
+    "final_from_limit_up_bid_amount",
+    "final_from_limit_up_bid_pct",
     "big_order_buy_ratio",
     "big_trade_buy_ratio",
     "has_order_confirmation",
@@ -89,6 +105,13 @@ BUY_PLAN_HEADERS = [
     "stock_name",
     "plan_amount",
     "reference_price",
+    "open_pct",
+    "final_auction_amount",
+    "last10_bid_amount",
+    "last20_bid_amount",
+    "final_from_last20_bid_pct",
+    "final_from_last10_bid_pct",
+    "final_from_limit_up_bid_pct",
     "auction_rank_score",
     "auction_label",
     "reason",
@@ -651,6 +674,13 @@ def _auction_rank_score(decision) -> float:
     return round(max(0.0, min(120.0, score)), 3)
 
 
+def _auction_reference_metrics(strategy: OpeningAuctionAttitudeStrategy) -> dict[str, Any]:
+    try:
+        return dict(strategy.build_auction_reference_metrics())
+    except Exception:
+        return {}
+
+
 def build_auction_rankings(
     strategies: Iterable[OpeningAuctionAttitudeStrategy],
     *,
@@ -662,6 +692,7 @@ def build_auction_rankings(
             continue
         decision = strategy.classify_auction()
         evidence = dict(decision.evidence or {})
+        reference = _auction_reference_metrics(strategy)
         params = getattr(getattr(strategy, "config", None), "params", {}) or {}
         label = str(decision.auction_label or "")
         sell_pressure = bool(
@@ -684,6 +715,22 @@ def build_auction_rankings(
                 "low_to_final_lift_pct": _to_output_float(evidence.get("low_to_final_lift_pct"), 6),
                 "low_to_final_amount_ratio": _to_output_float(evidence.get("low_to_final_amount_ratio"), 6),
                 "amount_at_final": _to_output_float(evidence.get("amount_at_final"), 2),
+                "open_pct": _to_output_float(reference.get("open_pct"), 2),
+                "open_price_0925": _to_output_float(reference.get("open_price_0925"), 3),
+                "final_auction_amount": _to_output_float(reference.get("final_auction_amount"), 2),
+                "final_amount_source": str(reference.get("final_amount_source") or ""),
+                "tx_detail_available": bool(reference.get("tx_detail_available")),
+                "final_tx_amount": _to_output_float(reference.get("final_tx_amount"), 2),
+                "final_tx_count": int(reference.get("final_tx_count", 0) or 0),
+                "last10_bid_amount": _to_output_float(reference.get("last10_bid_amount"), 2),
+                "last20_bid_amount": _to_output_float(reference.get("last20_bid_amount"), 2),
+                "final_from_last20_bid_amount": _to_output_float(reference.get("final_from_last20_bid_amount"), 2),
+                "final_from_last20_bid_pct": _to_output_float(reference.get("final_from_last20_bid_pct"), 2),
+                "final_from_last10_bid_amount": _to_output_float(reference.get("final_from_last10_bid_amount"), 2),
+                "final_from_last10_bid_pct": _to_output_float(reference.get("final_from_last10_bid_pct"), 2),
+                "limit_up_price": _to_output_float(reference.get("limit_up_price"), 3),
+                "final_from_limit_up_bid_amount": _to_output_float(reference.get("final_from_limit_up_bid_amount"), 2),
+                "final_from_limit_up_bid_pct": _to_output_float(reference.get("final_from_limit_up_bid_pct"), 2),
                 "big_order_buy_ratio": _to_output_float(evidence.get("big_order_buy_ratio"), 6),
                 "big_trade_buy_ratio": _to_output_float(evidence.get("big_trade_buy_ratio"), 6),
                 "has_order_confirmation": bool(evidence.get("has_order_confirmation")),
@@ -729,6 +776,13 @@ def build_buy_plan_rows(
                 "stock_name": str(row.get("stock_name") or ""),
                 "plan_amount": _to_output_float(plan_amount, 2),
                 "reference_price": _to_output_float(row.get("reference_price"), 3),
+                "open_pct": _to_output_float(row.get("open_pct"), 2),
+                "final_auction_amount": _to_output_float(row.get("final_auction_amount"), 2),
+                "last10_bid_amount": _to_output_float(row.get("last10_bid_amount"), 2),
+                "last20_bid_amount": _to_output_float(row.get("last20_bid_amount"), 2),
+                "final_from_last20_bid_pct": _to_output_float(row.get("final_from_last20_bid_pct"), 2),
+                "final_from_last10_bid_pct": _to_output_float(row.get("final_from_last10_bid_pct"), 2),
+                "final_from_limit_up_bid_pct": _to_output_float(row.get("final_from_limit_up_bid_pct"), 2),
                 "auction_rank_score": _to_output_float(row.get("auction_rank_score"), 3),
                 "auction_label": str(row.get("auction_label") or ""),
                 "reason": str(row.get("reason") or ""),
@@ -857,6 +911,7 @@ def run_market_only(
     snapshot_record_path: str = "",
     ranking_output_path: str = "",
     buy_plan_output_path: str = "",
+    preopen_reference_time: str = "09:25:15",
     buy_plan_top_n: int = DEFAULT_BUY_PLAN_TOP_N,
     buy_plan_min_score: float = DEFAULT_BUY_PLAN_MIN_SCORE,
     buy_plan_amount: float = DEFAULT_BUY_PLAN_AMOUNT,
@@ -889,6 +944,7 @@ def run_market_only(
     anchor = now_provider()
     scan_start_at = build_session_time(anchor, scan_start_time)
     freeze_at = build_session_time(anchor, candidate_freeze_time)
+    preopen_reference_at = build_session_time(anchor, preopen_reference_time)
     snapshot_interval_sec = max(0.2, float(snapshot_interval_sec or 0.0))
     scanner = (
         OpeningAuctionLimitUpScanner(
@@ -934,6 +990,7 @@ def run_market_only(
     _log_runtime_startup_config(settings, conn_mgr, mode=mode)
 
     started = False
+    preopen_reference_emitted = False
     try:
         runner.start()
         installed = 0
@@ -1018,6 +1075,27 @@ def run_market_only(
                     installed,
                 )
                 freeze_logged = True
+
+            if started and not preopen_reference_emitted and now >= preopen_reference_at:
+                ranking_rows, buy_plan_rows = emit_auction_rankings_and_buy_plan(
+                    runner,
+                    logger=logger,
+                    ranking_output_path=ranking_output_path,
+                    buy_plan_output_path=buy_plan_output_path,
+                    buy_plan_top_n=buy_plan_top_n,
+                    buy_plan_min_score=buy_plan_min_score,
+                    buy_plan_amount=buy_plan_amount,
+                )
+                logger.info(
+                    "%s preopen_reference_emitted time=%s rows=%d buy_plan_rows=%d ranking_output=%s buy_plan_output=%s observe_only=true real_order_sent=false",
+                    session_event_prefix,
+                    preopen_reference_at.strftime("%H:%M:%S"),
+                    ranking_rows,
+                    buy_plan_rows,
+                    ranking_output_path,
+                    buy_plan_output_path,
+                )
+                preopen_reference_emitted = True
 
             if stop_at is not None and now >= stop_at:
                 logger.info(
@@ -1108,6 +1186,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ranking-output", default="", help="CSV path for 09:25 auction ranking output. Empty uses strategy output dir.")
     parser.add_argument("--buy-plan-output", default="", help="CSV path for plan-only buy-plan output. Empty uses strategy output dir.")
+    parser.add_argument("--preopen-reference-time", default="09:25:15", help="Write auction ranking/buy-plan reference once before open.")
     parser.add_argument("--buy-plan-top-n", type=int, default=DEFAULT_BUY_PLAN_TOP_N, help="Maximum plan-only candidates to output.")
     parser.add_argument("--buy-plan-min-score", type=float, default=DEFAULT_BUY_PLAN_MIN_SCORE, help="Minimum auction rank score for plan-only candidates.")
     parser.add_argument("--buy-plan-amount", type=float, default=DEFAULT_BUY_PLAN_AMOUNT, help="Reference plan amount; no order is sent.")
@@ -1137,6 +1216,7 @@ def main() -> None:
         snapshot_record_path=str(args.snapshot_record_path),
         ranking_output_path=ranking_output,
         buy_plan_output_path=buy_plan_output,
+        preopen_reference_time=str(args.preopen_reference_time),
         buy_plan_top_n=int(args.buy_plan_top_n),
         buy_plan_min_score=float(args.buy_plan_min_score),
         buy_plan_amount=float(args.buy_plan_amount),

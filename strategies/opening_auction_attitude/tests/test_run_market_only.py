@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from core.l2_models import L2OrderEvent
+from core.l2_models import L2OrderEvent, L2QuoteEvent, L2TransactionEvent
 from core.models import TickData
 from strategies.opening_auction_attitude import AUCTION_STRONG_CONFIRMED, OpeningAuctionAttitudeStrategy
 from strategy.models import StrategyConfig
@@ -113,6 +113,7 @@ def test_runner_default_stop_time_covers_open_verify_window():
     assert args.scan_start_time == "09:15:00"
     assert args.candidate_freeze_time == "09:24:30"
     assert args.snapshot_interval_sec == 2.0
+    assert args.preopen_reference_time == "09:25:15"
     assert args.install_all is True
 
 
@@ -133,6 +134,8 @@ def test_morning_batch_uses_all_candidate_entry_and_run_artifact_paths():
     assert "snapshot_full_pool.jsonl" in text
     assert "auction_rankings.csv" in text
     assert "auction_buy_plan.csv" in text
+    assert "--preopen-reference-time 09:25:15" in text
+    assert "preopen_reference_time='09:25:15'" in text
     assert "run_manifest.json" in text
     assert "real_order_sent=$false" in text
 
@@ -362,21 +365,71 @@ def test_build_buy_plan_rows_is_plan_only_and_limited():
 
     plan_rows = build_buy_plan_rows(rankings, top_n=1, plan_amount=50000)
 
-    assert plan_rows == [
-        {
-            "rank": 1,
-            "stock_code": "000700",
-            "stock_name": "强势股",
-            "plan_amount": 50000.0,
-            "reference_price": 10.3,
-            "auction_rank_score": 112.5,
-            "auction_label": AUCTION_STRONG_CONFIRMED,
-            "reason": "ok",
-            "status": "PLAN_ONLY",
-            "observe_only": True,
-            "real_order_sent": False,
-        }
-    ]
+    assert len(plan_rows) == 1
+    assert plan_rows[0]["rank"] == 1
+    assert plan_rows[0]["stock_code"] == "000700"
+    assert plan_rows[0]["stock_name"] == "强势股"
+    assert plan_rows[0]["plan_amount"] == 50000.0
+    assert plan_rows[0]["reference_price"] == 10.3
+    assert plan_rows[0]["auction_rank_score"] == 112.5
+    assert plan_rows[0]["auction_label"] == AUCTION_STRONG_CONFIRMED
+    assert plan_rows[0]["reason"] == "ok"
+    assert plan_rows[0]["status"] == "PLAN_ONLY"
+    assert plan_rows[0]["observe_only"] is True
+    assert plan_rows[0]["real_order_sent"] is False
+    assert plan_rows[0]["final_auction_amount"] == 0.0
+
+
+def test_build_rankings_and_buy_plan_include_auction_reference_metrics():
+    strategy = OpeningAuctionAttitudeStrategy(
+        StrategyConfig(stock_code="000700", params={"stock_name": "model stock", "pre_close": 10.0})
+    )
+    strategy.on_tick(TickData(stock_code="000700", last_price=10.0, pre_close=10.0, amount=1_000_000, data_time=_ts("09:24:50")))
+    strategy.on_tick(TickData(stock_code="000700", last_price=10.3, pre_close=10.0, amount=3_000_000, data_time=_ts("09:25:05")))
+    strategy.on_l2_quote(
+        L2QuoteEvent(
+            stock_code="000700",
+            last_price=10.3,
+            pre_close=10.0,
+            limit_up_price=11.0,
+            event_time=_ts("09:25:00"),
+            raw_xt_fields={"lastPrice": 10.3, "amount": 3_000_000},
+        )
+    )
+    strategy.on_l2_order(
+        L2OrderEvent(
+            stock_code="000700",
+            price=11.0,
+            volume=100_000,
+            amount=1_000_000,
+            side="BUY",
+            entrust_no="B10",
+            event_time=_ts("09:24:55"),
+        )
+    )
+    strategy.on_l2_transaction(
+        L2TransactionEvent(
+            stock_code="000700",
+            price=10.3,
+            volume=80_000,
+            amount=800_000,
+            buy_no="B10",
+            event_time=_ts("09:25:00"),
+        )
+    )
+
+    rankings = build_auction_rankings([strategy], min_plan_score=0)
+    plan_rows = build_buy_plan_rows(rankings, top_n=1)
+
+    assert rankings[0]["open_pct"] == 3.0
+    assert rankings[0]["final_auction_amount"] == 3_000_000.0
+    assert rankings[0]["last10_bid_amount"] == 1_000_000.0
+    assert rankings[0]["last20_bid_amount"] == 1_000_000.0
+    assert rankings[0]["final_from_last20_bid_pct"] == 100.0
+    assert rankings[0]["final_from_last10_bid_pct"] == 100.0
+    assert rankings[0]["final_from_limit_up_bid_pct"] == 100.0
+    assert plan_rows[0]["final_auction_amount"] == 3_000_000.0
+    assert plan_rows[0]["final_from_last10_bid_pct"] == 100.0
 
 
 def test_write_auction_rankings_and_buy_plan_csv(tmp_path: Path):

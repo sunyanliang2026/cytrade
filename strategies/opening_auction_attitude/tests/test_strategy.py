@@ -165,6 +165,73 @@ def test_l2_quote_order_transaction_and_orderqueue_are_aggregated():
     assert l2.big_sell_trade_amount == 100_000
 
 
+def test_auction_reference_metrics_link_final_trades_to_late_buy_orders():
+    strategy = _strategy()
+
+    strategy.on_l2_quote(
+        L2QuoteEvent(
+            stock_code="000001",
+            last_price=10.3,
+            pre_close=10.0,
+            limit_up_price=11.0,
+            event_time=_ts("09:25:00"),
+            raw_xt_fields={"lastPrice": 10.3, "open": 10.3, "amount": 3_000_000},
+        )
+    )
+    strategy.on_l2_order(
+        L2OrderEvent(
+            stock_code="000001",
+            price=10.2,
+            volume=20_000,
+            amount=200_000,
+            side="BUY",
+            entrust_no="B20",
+            event_time=_ts("09:24:45"),
+        )
+    )
+    strategy.on_l2_order(
+        L2OrderEvent(
+            stock_code="000001",
+            price=11.0,
+            volume=100_000,
+            amount=1_000_000,
+            side="BUY",
+            entrust_no="B10",
+            event_time=_ts("09:24:55"),
+        )
+    )
+    strategy.on_l2_transaction(
+        L2TransactionEvent(
+            stock_code="000001",
+            price=10.3,
+            volume=20_000,
+            amount=200_000,
+            buy_no="B20",
+            event_time=_ts("09:25:00"),
+        )
+    )
+    strategy.on_l2_transaction(
+        L2TransactionEvent(
+            stock_code="000001",
+            price=10.3,
+            volume=80_000,
+            amount=800_000,
+            buy_no="B10",
+            event_time=_ts("09:25:00"),
+        )
+    )
+
+    metrics = strategy.build_auction_reference_metrics()
+
+    assert round(metrics["open_pct"], 2) == 3.0
+    assert metrics["final_auction_amount"] == 3_000_000
+    assert metrics["last20_bid_amount"] == 1_200_000
+    assert metrics["last10_bid_amount"] == 1_000_000
+    assert metrics["final_from_last20_bid_pct"] == 100.0
+    assert metrics["final_from_last10_bid_pct"] == 80.0
+    assert metrics["final_from_limit_up_bid_pct"] == 80.0
+
+
 def test_l2_quote_uses_auction_book_matched_and_unmatched_volumes():
     strategy = _strategy()
 
