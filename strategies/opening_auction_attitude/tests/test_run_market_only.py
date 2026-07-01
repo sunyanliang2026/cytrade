@@ -11,6 +11,7 @@ from strategies.opening_auction_attitude.scripts.run_market_only import (
     BUY_PLAN_EVENT_NAME,
     DEFAULT_POOL,
     EVENT_NAME,
+    MATCHED_CANDIDATES_EVENT_NAME,
     RANKING_EVENT_NAME,
     FullPoolSnapshotRecorder,
     OpeningAuctionLimitUpScanner,
@@ -18,6 +19,7 @@ from strategies.opening_auction_attitude.scripts.run_market_only import (
     SnapshotTick,
     build_auction_rankings,
     build_buy_plan_rows,
+    build_matched_candidate_rows,
     build_observe_settings,
     build_parser,
     build_session_time,
@@ -31,6 +33,8 @@ from strategies.opening_auction_attitude.scripts.run_market_only import (
     resolve_observe_entries,
     write_auction_rankings,
     write_buy_plan,
+    write_matched_candidates,
+    write_matched_candidates_markdown,
 )
 
 
@@ -114,6 +118,7 @@ def test_runner_default_stop_time_covers_open_verify_window():
     assert args.candidate_freeze_time == "09:24:30"
     assert args.snapshot_interval_sec == 2.0
     assert args.preopen_reference_time == "09:25:15"
+    assert args.buy_plan_top_n == 0
     assert args.install_all is True
 
 
@@ -136,6 +141,8 @@ def test_morning_batch_uses_all_candidate_entry_and_run_artifact_paths():
     assert "auction_buy_plan.csv" in text
     assert "--preopen-reference-time 09:25:15" in text
     assert "preopen_reference_time='09:25:15'" in text
+    assert "auction_matched_candidates.csv" in text
+    assert "auction_matched_candidates.md" in text
     assert "run_manifest.json" in text
     assert "real_order_sent=$false" in text
 
@@ -351,9 +358,9 @@ def test_build_auction_rankings_sorts_actionable_candidates_first():
     assert [row["stock_code"] for row in rankings] == ["000700", "600000"]
     assert rankings[0]["rank"] == 1
     assert rankings[0]["stock_name"] == "\u6a21\u5851\u79d1\u6280"
-    assert rankings[0]["auction_label"] == AUCTION_STRONG_CONFIRMED
     assert rankings[0]["plan_eligible"] is True
-    assert rankings[0]["has_order_confirmation"] is True
+    assert rankings[0]["auction_rank_score"] == 0.0
+    assert rankings[0]["reason"] == "condition_filter_matched"
     assert rankings[1]["plan_eligible"] is False
 
 
@@ -385,15 +392,15 @@ def test_build_rankings_and_buy_plan_include_auction_reference_metrics():
         StrategyConfig(stock_code="000700", params={"stock_name": "model stock", "pre_close": 10.0})
     )
     strategy.on_tick(TickData(stock_code="000700", last_price=10.0, pre_close=10.0, amount=1_000_000, data_time=_ts("09:24:50")))
-    strategy.on_tick(TickData(stock_code="000700", last_price=10.3, pre_close=10.0, amount=3_000_000, data_time=_ts("09:25:05")))
+    strategy.on_tick(TickData(stock_code="000700", last_price=10.31, pre_close=10.0, amount=31_000_000, data_time=_ts("09:25:05")))
     strategy.on_l2_quote(
         L2QuoteEvent(
             stock_code="000700",
-            last_price=10.3,
+            last_price=10.31,
             pre_close=10.0,
             limit_up_price=11.0,
             event_time=_ts("09:25:00"),
-            raw_xt_fields={"lastPrice": 10.3, "amount": 3_000_000},
+            raw_xt_fields={"lastPrice": 10.31, "amount": 31_000_000},
         )
     )
     strategy.on_l2_order(
@@ -410,7 +417,7 @@ def test_build_rankings_and_buy_plan_include_auction_reference_metrics():
     strategy.on_l2_transaction(
         L2TransactionEvent(
             stock_code="000700",
-            price=10.3,
+            price=10.31,
             volume=80_000,
             amount=800_000,
             buy_no="B10",
@@ -421,15 +428,38 @@ def test_build_rankings_and_buy_plan_include_auction_reference_metrics():
     rankings = build_auction_rankings([strategy], min_plan_score=0)
     plan_rows = build_buy_plan_rows(rankings, top_n=1)
 
-    assert rankings[0]["open_pct"] == 3.0
-    assert rankings[0]["final_auction_amount"] == 3_000_000.0
+    assert rankings[0]["open_pct"] == 3.1
+    assert rankings[0]["post_0920_low_price"] == 10.0
+    assert rankings[0]["filter_final_amount_gt_3000w"] is True
+    assert rankings[0]["filter_final_price_gt_post_0920_low"] is True
+    assert rankings[0]["filter_open_pct_gt_3"] is True
+    assert rankings[0]["auction_rank_score"] == 0.0
+    assert rankings[0]["final_auction_amount"] == 31_000_000.0
     assert rankings[0]["last10_bid_amount"] == 1_000_000.0
     assert rankings[0]["last20_bid_amount"] == 1_000_000.0
     assert rankings[0]["final_from_last20_bid_pct"] == 100.0
     assert rankings[0]["final_from_last10_bid_pct"] == 100.0
     assert rankings[0]["final_from_limit_up_bid_pct"] == 100.0
-    assert plan_rows[0]["final_auction_amount"] == 3_000_000.0
+    assert plan_rows[0]["final_auction_amount"] == 31_000_000.0
     assert plan_rows[0]["final_from_last10_bid_pct"] == 100.0
+
+
+def test_matched_candidate_outputs_are_human_readable(tmp_path: Path):
+    rankings = build_auction_rankings([install_and_get_strategy()], min_plan_score=75.0)
+    rows = build_matched_candidate_rows(rankings)
+    csv_path = tmp_path / "matched.csv"
+    md_path = tmp_path / "matched.md"
+
+    assert write_matched_candidates(str(csv_path), rows) == str(csv_path)
+    assert write_matched_candidates_markdown(str(md_path), rows) == str(md_path)
+
+    csv_text = csv_path.read_text(encoding="utf-8-sig")
+    md_text = md_path.read_text(encoding="utf-8")
+    assert "\u80a1\u7968\u4ee3\u7801" in csv_text
+    assert "\u6700\u7ec8\u7ade\u4ef7\u6210\u4ea4\u989d(\u4e07)" in csv_text
+    assert "3100.0" in csv_text
+    assert "| \u6392\u540d | \u80a1\u7968\u4ee3\u7801 |" in md_text
+    assert "000700" in md_text
 
 
 def test_write_auction_rankings_and_buy_plan_csv(tmp_path: Path):
@@ -466,6 +496,8 @@ def test_emit_auction_rankings_and_buy_plan_logs_and_writes_outputs(tmp_path: Pa
 
     ranking_path = tmp_path / "ranking.csv"
     plan_path = tmp_path / "plan.csv"
+    matched_path = tmp_path / "matched.csv"
+    matched_md_path = tmp_path / "matched.md"
     logger = FakeLogger()
 
     ranking_count, plan_count = emit_auction_rankings_and_buy_plan(
@@ -473,6 +505,8 @@ def test_emit_auction_rankings_and_buy_plan_logs_and_writes_outputs(tmp_path: Pa
         logger=logger,
         ranking_output_path=str(ranking_path),
         buy_plan_output_path=str(plan_path),
+        matched_candidates_output_path=str(matched_path),
+        matched_candidates_md_output_path=str(matched_md_path),
         buy_plan_top_n=1,
         buy_plan_min_score=75,
         buy_plan_amount=0,
@@ -482,8 +516,11 @@ def test_emit_auction_rankings_and_buy_plan_logs_and_writes_outputs(tmp_path: Pa
     assert plan_count == 1
     assert ranking_path.exists()
     assert plan_path.exists()
+    assert matched_path.exists()
+    assert matched_md_path.exists()
     assert logger.messages[0].startswith(RANKING_EVENT_NAME)
     assert logger.messages[1].startswith(BUY_PLAN_EVENT_NAME)
+    assert logger.messages[2].startswith(MATCHED_CANDIDATES_EVENT_NAME)
     _, plan_payload_text = logger.messages[1].split(" ", 1)
     plan_payload = json.loads(plan_payload_text)
     assert plan_payload["observe_only"] is True
@@ -504,7 +541,16 @@ def install_and_get_strategy() -> OpeningAuctionAttitudeStrategy:
     install_observe_strategies(runner, configs)
     strategy = runner.strategies[0]
     strategy.on_tick(TickData(stock_code="000700", last_price=10.0, pre_close=10.0, amount=1_000_000, data_time=_ts("09:24:50")))
-    strategy.on_tick(TickData(stock_code="000700", last_price=10.3, pre_close=10.0, amount=3_000_000, data_time=_ts("09:25:05")))
+    strategy.on_tick(TickData(stock_code="000700", last_price=10.31, pre_close=10.0, amount=31_000_000, data_time=_ts("09:25:05")))
+    strategy.on_l2_quote(
+        L2QuoteEvent(
+            stock_code="000700",
+            last_price=10.31,
+            pre_close=10.0,
+            event_time=_ts("09:25:00"),
+            raw_xt_fields={"lastPrice": 10.31, "amount": 31_000_000},
+        )
+    )
     strategy.on_l2_order(
         L2OrderEvent(
             stock_code="000700",

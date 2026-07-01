@@ -98,6 +98,8 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         self._last10_bid_count = 0
         self._final_auction_quote_amount = 0.0
         self._open_price_0925 = 0.0
+        self._post_0920_low_price = 0.0
+        self._post_0920_low_time: datetime | None = None
         self._limit_up_price = float(params.get("limit_up_price", 0.0) or 0.0)
         self._open_l2transaction_count = 0
         self._open_buy_trade_amount = 0.0
@@ -115,10 +117,12 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         if tick.stock_code != self.stock_code:
             return None
         event_time = tick.data_time or tick.recv_time
+        price = float(tick.last_price or 0.0)
+        self._record_post_0920_low(event_time=event_time, price=price)
         if self._in_auction_window(event_time):
             self._record_price_point(
                 event_time=event_time,
-                price=float(tick.last_price or 0.0),
+                price=price,
                 matched_amount=float(tick.amount or 0.0),
                 pre_close=float(tick.pre_close or 0.0),
                 amount_source="tick_amount" if float(tick.amount or 0.0) > 0 else "",
@@ -136,13 +140,16 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         return []
 
     def on_l2_quote(self, event: L2QuoteEvent) -> None:
-        if event.stock_code != self.stock_code or not self._in_auction_window(event.event_time):
+        if event.stock_code != self.stock_code:
             return
-        self._l2quote_count += 1
         if float(event.limit_up_price or 0.0) > 0:
             self._limit_up_price = float(event.limit_up_price)
         quote_amount = self._auction_quote_amount(event.raw_xt_fields, fallback_price=float(event.last_price or 0.0))
         price = quote_amount["price"] or float(event.last_price or 0.0)
+        self._record_post_0920_low(event_time=event.event_time, price=price)
+        if not self._in_auction_window(event.event_time):
+            return
+        self._l2quote_count += 1
         self._record_price_point(
             event_time=event.event_time,
             price=price,
@@ -393,6 +400,9 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         open_pct = 0.0
         if self._pre_close > 0 and self._open_price_0925 > 0:
             open_pct = (self._open_price_0925 / self._pre_close - 1.0) * 100.0
+        final_vs_low_pct = 0.0
+        if self._post_0920_low_price > 0 and self._open_price_0925 > 0:
+            final_vs_low_pct = (self._open_price_0925 / self._post_0920_low_price - 1.0) * 100.0
         tx_detail_available = self._final_tx_amount > 0 and self._final_tx_count > 0
         if self._final_auction_quote_amount > 0:
             final_amount_source = "quote_0925"
@@ -404,7 +414,15 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
             "pre_close": float(self._pre_close or 0.0),
             "open_price_0925": float(self._open_price_0925 or 0.0),
             "open_pct": open_pct,
+            "post_0920_low_price": float(self._post_0920_low_price or 0.0),
+            "post_0920_low_time": self._post_0920_low_time.strftime("%H:%M:%S") if self._post_0920_low_time else "",
+            "final_vs_post_0920_low_pct": final_vs_low_pct,
             "final_auction_amount": float(final_amount or 0.0),
+            "final_amount_gt_3000w": final_amount > 30_000_000,
+            "final_price_gt_post_0920_low": (
+                self._post_0920_low_price > 0 and self._open_price_0925 > self._post_0920_low_price
+            ),
+            "open_pct_gt_3": open_pct > 3.0,
             "final_amount_source": final_amount_source,
             "tx_detail_available": tx_detail_available,
             "final_tx_amount": float(self._final_tx_amount or 0.0),
@@ -426,6 +444,22 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         if event_time is None:
             return False
         return time(9, 25, 0) <= event_time.time() <= self._score_config.window_end
+
+    @staticmethod
+    def _in_post_0920_reference_window(event_time: datetime | None) -> bool:
+        if event_time is None:
+            return False
+        return time(9, 20, 0) <= event_time.time() <= time(9, 25, 5)
+
+    def _record_post_0920_low(self, *, event_time: datetime | None, price: float) -> None:
+        if not self._in_post_0920_reference_window(event_time):
+            return
+        price = float(price or 0.0)
+        if price <= 0:
+            return
+        if self._post_0920_low_price <= 0 or price < self._post_0920_low_price:
+            self._post_0920_low_price = price
+            self._post_0920_low_time = event_time
 
     @staticmethod
     def _in_last20_bid_window(event_time: datetime | None) -> bool:

@@ -47,6 +47,7 @@ SESSION_EVENT_PREFIX = "OPENING_AUCTION_ATTITUDE_SESSION"
 EVENT_NAME = "MSF_AUCTION_ATTITUDE"
 RANKING_EVENT_NAME = "MSF_AUCTION_RANKING"
 BUY_PLAN_EVENT_NAME = "MSF_AUCTION_BUY_PLAN"
+MATCHED_CANDIDATES_EVENT_NAME = "MSF_AUCTION_MATCHED_CANDIDATES"
 
 ACTIONABLE_AUCTION_LABELS = {
     AUCTION_STRONG_CONFIRMED,
@@ -60,9 +61,11 @@ AUCTION_LABEL_BONUS = {
     AUCTION_BIG_TRADE_CONFIRMED: 14.0,
     AUCTION_MONEY_LIFT: 8.0,
 }
-DEFAULT_BUY_PLAN_TOP_N = 3
+DEFAULT_BUY_PLAN_TOP_N = 0
 DEFAULT_BUY_PLAN_MIN_SCORE = 75.0
 DEFAULT_BUY_PLAN_AMOUNT = 0.0
+MIN_FILTER_FINAL_AUCTION_AMOUNT = 30_000_000.0
+MIN_FILTER_OPEN_PCT = 3.0
 RANKING_HEADERS = [
     "rank",
     "stock_code",
@@ -77,7 +80,13 @@ RANKING_HEADERS = [
     "amount_at_final",
     "open_pct",
     "open_price_0925",
+    "post_0920_low_price",
+    "post_0920_low_time",
+    "final_vs_post_0920_low_pct",
     "final_auction_amount",
+    "filter_final_amount_gt_3000w",
+    "filter_final_price_gt_post_0920_low",
+    "filter_open_pct_gt_3",
     "final_amount_source",
     "tx_detail_available",
     "final_tx_amount",
@@ -105,6 +114,8 @@ BUY_PLAN_HEADERS = [
     "stock_name",
     "plan_amount",
     "reference_price",
+    "post_0920_low_price",
+    "post_0920_low_time",
     "open_pct",
     "final_auction_amount",
     "last10_bid_amount",
@@ -118,6 +129,21 @@ BUY_PLAN_HEADERS = [
     "status",
     "observe_only",
     "real_order_sent",
+]
+MATCHED_CANDIDATE_HEADERS = [
+    "\u6392\u540d",
+    "\u80a1\u7968\u4ee3\u7801",
+    "\u540d\u79f0",
+    "\u7ade\u4ef7\u6da8\u5e45%",
+    "\u6700\u7ec8\u7ade\u4ef7\u6210\u4ea4\u989d(\u4e07)",
+    "9:20\u540e\u4f4e\u70b9",
+    "\u4f4e\u70b9\u65f6\u95f4",
+    "\u6700\u7ec8\u8f83\u4f4e\u70b9\u6da8\u5e45%",
+    "\u5c3e10\u79d2\u7ade\u4e70\u989d(\u4e07)",
+    "\u5c3e20\u79d2\u7ade\u4e70\u989d(\u4e07)",
+    "\u5c3e20\u79d2\u4e70\u5355\u6210\u4ea4\u5360\u6bd4%",
+    "\u5c3e10\u79d2\u4e70\u5355\u6210\u4ea4\u5360\u6bd4%",
+    "\u6da8\u505c\u4ef7\u4e70\u5165\u5360\u6bd4%",
 ]
 
 CODE_COLUMN_CANDIDATES = (
@@ -681,6 +707,22 @@ def _auction_reference_metrics(strategy: OpeningAuctionAttitudeStrategy) -> dict
         return {}
 
 
+def _condition_filter(reference: dict[str, Any]) -> tuple[bool, str]:
+    final_amount = float(reference.get("final_auction_amount", 0.0) or 0.0)
+    final_price = float(reference.get("open_price_0925", 0.0) or 0.0)
+    post_low = float(reference.get("post_0920_low_price", 0.0) or 0.0)
+    open_pct = float(reference.get("open_pct", 0.0) or 0.0)
+    checks = {
+        "final_amount_gt_3000w": final_amount > MIN_FILTER_FINAL_AUCTION_AMOUNT,
+        "final_price_gt_post_0920_low": post_low > 0 and final_price > post_low,
+        "open_pct_gt_3": open_pct > MIN_FILTER_OPEN_PCT,
+    }
+    if all(checks.values()):
+        return True, "condition_filter_matched"
+    failed = [name for name, passed in checks.items() if not passed]
+    return False, "condition_filter_failed:" + ",".join(failed)
+
+
 def build_auction_rankings(
     strategies: Iterable[OpeningAuctionAttitudeStrategy],
     *,
@@ -700,24 +742,29 @@ def build_auction_rankings(
             or evidence.get("has_trade_sell_pressure")
             or evidence.get("has_unmatched_sell_pressure")
         )
-        rank_score = _auction_rank_score(decision)
-        plan_eligible = label in ACTIONABLE_AUCTION_LABELS and rank_score >= float(min_plan_score or 0.0) and not sell_pressure
+        plan_eligible, filter_reason = _condition_filter(reference)
         rows.append(
             {
                 "rank": 0,
                 "stock_code": strategy.stock_code,
                 "stock_name": str(params.get("stock_name") or ""),
                 "auction_label": label,
-                "auction_rank_score": rank_score,
-                "auction_attitude_score": _to_output_float(decision.auction_attitude_score, 3),
-                "auction_speed_score": _to_output_float(decision.auction_speed_score, 3),
+                "auction_rank_score": 0.0,
+                "auction_attitude_score": 0.0,
+                "auction_speed_score": 0.0,
                 "final_gap_pct": _to_output_float(evidence.get("final_gap_pct"), 6),
                 "low_to_final_lift_pct": _to_output_float(evidence.get("low_to_final_lift_pct"), 6),
                 "low_to_final_amount_ratio": _to_output_float(evidence.get("low_to_final_amount_ratio"), 6),
                 "amount_at_final": _to_output_float(evidence.get("amount_at_final"), 2),
                 "open_pct": _to_output_float(reference.get("open_pct"), 2),
                 "open_price_0925": _to_output_float(reference.get("open_price_0925"), 3),
+                "post_0920_low_price": _to_output_float(reference.get("post_0920_low_price"), 3),
+                "post_0920_low_time": str(reference.get("post_0920_low_time") or ""),
+                "final_vs_post_0920_low_pct": _to_output_float(reference.get("final_vs_post_0920_low_pct"), 2),
                 "final_auction_amount": _to_output_float(reference.get("final_auction_amount"), 2),
+                "filter_final_amount_gt_3000w": bool(reference.get("final_amount_gt_3000w")),
+                "filter_final_price_gt_post_0920_low": bool(reference.get("final_price_gt_post_0920_low")),
+                "filter_open_pct_gt_3": bool(reference.get("open_pct_gt_3")),
                 "final_amount_source": str(reference.get("final_amount_source") or ""),
                 "tx_detail_available": bool(reference.get("tx_detail_available")),
                 "final_tx_amount": _to_output_float(reference.get("final_tx_amount"), 2),
@@ -737,17 +784,17 @@ def build_auction_rankings(
                 "has_trade_confirmation": bool(evidence.get("has_trade_confirmation")),
                 "has_sell_pressure": sell_pressure,
                 "plan_eligible": plan_eligible,
-                "reason": str(decision.reason or ""),
-                "reference_price": _to_output_float(evidence.get("auction_final_price"), 3),
+                "reason": filter_reason,
+                "reference_price": _to_output_float(reference.get("open_price_0925"), 3),
             }
         )
 
     rows.sort(
         key=lambda row: (
             not bool(row["plan_eligible"]),
-            -float(row["auction_rank_score"]),
-            -float(row["auction_attitude_score"]),
-            -float(row["auction_speed_score"]),
+            -float(row["final_auction_amount"]),
+            -float(row["open_pct"]),
+            -float(row["final_from_last20_bid_pct"]),
             str(row["stock_code"]),
         )
     )
@@ -762,9 +809,7 @@ def build_buy_plan_rows(
     top_n: int = DEFAULT_BUY_PLAN_TOP_N,
     plan_amount: float = DEFAULT_BUY_PLAN_AMOUNT,
 ) -> list[dict[str, Any]]:
-    limit = max(0, int(top_n or 0))
-    if limit <= 0:
-        return []
+    limit = int(top_n or 0)
     rows: list[dict[str, Any]] = []
     for row in rankings:
         if not bool(row.get("plan_eligible")):
@@ -776,6 +821,8 @@ def build_buy_plan_rows(
                 "stock_name": str(row.get("stock_name") or ""),
                 "plan_amount": _to_output_float(plan_amount, 2),
                 "reference_price": _to_output_float(row.get("reference_price"), 3),
+                "post_0920_low_price": _to_output_float(row.get("post_0920_low_price"), 3),
+                "post_0920_low_time": str(row.get("post_0920_low_time") or ""),
                 "open_pct": _to_output_float(row.get("open_pct"), 2),
                 "final_auction_amount": _to_output_float(row.get("final_auction_amount"), 2),
                 "last10_bid_amount": _to_output_float(row.get("last10_bid_amount"), 2),
@@ -791,9 +838,55 @@ def build_buy_plan_rows(
                 "real_order_sent": False,
             }
         )
-        if len(rows) >= limit:
+        if limit > 0 and len(rows) >= limit:
             break
     return rows
+
+
+def _to_wan(value: Any, digits: int = 1) -> float:
+    try:
+        amount = float(value or 0.0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    return _to_output_float(amount / 10_000.0, digits)
+
+
+def build_matched_candidate_rows(rankings: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for source in rankings:
+        if not bool(source.get("plan_eligible")):
+            continue
+        rows.append(
+            {
+                "\u6392\u540d": len(rows) + 1,
+                "\u80a1\u7968\u4ee3\u7801": str(source.get("stock_code") or ""),
+                "\u540d\u79f0": str(source.get("stock_name") or ""),
+                "\u7ade\u4ef7\u6da8\u5e45%": _to_output_float(source.get("open_pct"), 2),
+                "\u6700\u7ec8\u7ade\u4ef7\u6210\u4ea4\u989d(\u4e07)": _to_wan(source.get("final_auction_amount"), 1),
+                "9:20\u540e\u4f4e\u70b9": _to_output_float(source.get("post_0920_low_price"), 3),
+                "\u4f4e\u70b9\u65f6\u95f4": str(source.get("post_0920_low_time") or ""),
+                "\u6700\u7ec8\u8f83\u4f4e\u70b9\u6da8\u5e45%": _to_output_float(source.get("final_vs_post_0920_low_pct"), 2),
+                "\u5c3e10\u79d2\u7ade\u4e70\u989d(\u4e07)": _to_wan(source.get("last10_bid_amount"), 1),
+                "\u5c3e20\u79d2\u7ade\u4e70\u989d(\u4e07)": _to_wan(source.get("last20_bid_amount"), 1),
+                "\u5c3e20\u79d2\u4e70\u5355\u6210\u4ea4\u5360\u6bd4%": _to_output_float(source.get("final_from_last20_bid_pct"), 2),
+                "\u5c3e10\u79d2\u4e70\u5355\u6210\u4ea4\u5360\u6bd4%": _to_output_float(source.get("final_from_last10_bid_pct"), 2),
+                "\u6da8\u505c\u4ef7\u4e70\u5165\u5360\u6bd4%": _to_output_float(source.get("final_from_limit_up_bid_pct"), 2),
+            }
+        )
+    return rows
+
+
+def render_matched_candidates_markdown(rows: Iterable[dict[str, Any]]) -> str:
+    table_rows = list(rows)
+    lines = [
+        "# Opening Auction Matched Candidates",
+        "",
+        "| " + " | ".join(MATCHED_CANDIDATE_HEADERS) + " |",
+        "| " + " | ".join(["---"] * len(MATCHED_CANDIDATE_HEADERS)) + " |",
+    ]
+    for row in table_rows:
+        lines.append("| " + " | ".join(str(row.get(header, "")) for header in MATCHED_CANDIDATE_HEADERS) + " |")
+    return "\n".join(lines) + "\n"
 
 
 def _write_rows(path: str, rows: Iterable[dict[str, Any]], headers: list[str]) -> str:
@@ -817,12 +910,27 @@ def write_buy_plan(path: str, buy_plan_rows: Iterable[dict[str, Any]]) -> str:
     return _write_rows(path, buy_plan_rows, BUY_PLAN_HEADERS)
 
 
+def write_matched_candidates(path: str, rows: Iterable[dict[str, Any]]) -> str:
+    return _write_rows(path, rows, MATCHED_CANDIDATE_HEADERS)
+
+
+def write_matched_candidates_markdown(path: str, rows: Iterable[dict[str, Any]]) -> str:
+    if not path:
+        return ""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(render_matched_candidates_markdown(rows), encoding="utf-8")
+    return str(output_path)
+
+
 def emit_auction_rankings_and_buy_plan(
     runner,
     *,
     logger=None,
     ranking_output_path: str = "",
     buy_plan_output_path: str = "",
+    matched_candidates_output_path: str = "",
+    matched_candidates_md_output_path: str = "",
     buy_plan_top_n: int = DEFAULT_BUY_PLAN_TOP_N,
     buy_plan_min_score: float = DEFAULT_BUY_PLAN_MIN_SCORE,
     buy_plan_amount: float = DEFAULT_BUY_PLAN_AMOUNT,
@@ -830,8 +938,11 @@ def emit_auction_rankings_and_buy_plan(
     logger = logger or get_logger("system")
     rankings = build_auction_rankings(runner.get_all_strategies(), min_plan_score=buy_plan_min_score)
     buy_plan_rows = build_buy_plan_rows(rankings, top_n=buy_plan_top_n, plan_amount=buy_plan_amount)
+    matched_candidate_rows = build_matched_candidate_rows(rankings)
     ranking_path = write_auction_rankings(ranking_output_path, rankings)
     plan_path = write_buy_plan(buy_plan_output_path, buy_plan_rows)
+    matched_path = write_matched_candidates(matched_candidates_output_path, matched_candidate_rows)
+    matched_md_path = write_matched_candidates_markdown(matched_candidates_md_output_path, matched_candidate_rows)
     logger.info(
         "%s %s",
         RANKING_EVENT_NAME,
@@ -858,6 +969,23 @@ def emit_auction_rankings_and_buy_plan(
                 "min_score": float(buy_plan_min_score or 0.0),
                 "plan_amount": float(buy_plan_amount or 0.0),
                 "output_path": plan_path,
+                "observe_only": True,
+                "real_order_sent": False,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=_json_default,
+        ),
+    )
+    logger.info(
+        "%s %s",
+        MATCHED_CANDIDATES_EVENT_NAME,
+        json.dumps(
+            {
+                "event_name": MATCHED_CANDIDATES_EVENT_NAME,
+                "rows": len(matched_candidate_rows),
+                "output_path": matched_path,
+                "markdown_output_path": matched_md_path,
                 "observe_only": True,
                 "real_order_sent": False,
             },
@@ -911,6 +1039,8 @@ def run_market_only(
     snapshot_record_path: str = "",
     ranking_output_path: str = "",
     buy_plan_output_path: str = "",
+    matched_candidates_output_path: str = "",
+    matched_candidates_md_output_path: str = "",
     preopen_reference_time: str = "09:25:15",
     buy_plan_top_n: int = DEFAULT_BUY_PLAN_TOP_N,
     buy_plan_min_score: float = DEFAULT_BUY_PLAN_MIN_SCORE,
@@ -1082,18 +1212,22 @@ def run_market_only(
                     logger=logger,
                     ranking_output_path=ranking_output_path,
                     buy_plan_output_path=buy_plan_output_path,
+                    matched_candidates_output_path=matched_candidates_output_path,
+                    matched_candidates_md_output_path=matched_candidates_md_output_path,
                     buy_plan_top_n=buy_plan_top_n,
                     buy_plan_min_score=buy_plan_min_score,
                     buy_plan_amount=buy_plan_amount,
                 )
                 logger.info(
-                    "%s preopen_reference_emitted time=%s rows=%d buy_plan_rows=%d ranking_output=%s buy_plan_output=%s observe_only=true real_order_sent=false",
+                    "%s preopen_reference_emitted time=%s rows=%d buy_plan_rows=%d ranking_output=%s buy_plan_output=%s matched_candidates_output=%s matched_candidates_md_output=%s observe_only=true real_order_sent=false",
                     session_event_prefix,
                     preopen_reference_at.strftime("%H:%M:%S"),
                     ranking_rows,
                     buy_plan_rows,
                     ranking_output_path,
                     buy_plan_output_path,
+                    matched_candidates_output_path,
+                    matched_candidates_md_output_path,
                 )
                 preopen_reference_emitted = True
 
@@ -1126,6 +1260,8 @@ def run_market_only(
                 logger=logger,
                 ranking_output_path=ranking_output_path,
                 buy_plan_output_path=buy_plan_output_path,
+                matched_candidates_output_path=matched_candidates_output_path,
+                matched_candidates_md_output_path=matched_candidates_md_output_path,
                 buy_plan_top_n=buy_plan_top_n,
                 buy_plan_min_score=buy_plan_min_score,
                 buy_plan_amount=buy_plan_amount,
@@ -1186,9 +1322,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ranking-output", default="", help="CSV path for 09:25 auction ranking output. Empty uses strategy output dir.")
     parser.add_argument("--buy-plan-output", default="", help="CSV path for plan-only buy-plan output. Empty uses strategy output dir.")
+    parser.add_argument("--matched-candidates-output", default="", help="Human-readable CSV path for matched auction candidates.")
+    parser.add_argument("--matched-candidates-md-output", default="", help="Human-readable Markdown path for matched auction candidates.")
     parser.add_argument("--preopen-reference-time", default="09:25:15", help="Write auction ranking/buy-plan reference once before open.")
-    parser.add_argument("--buy-plan-top-n", type=int, default=DEFAULT_BUY_PLAN_TOP_N, help="Maximum plan-only candidates to output.")
-    parser.add_argument("--buy-plan-min-score", type=float, default=DEFAULT_BUY_PLAN_MIN_SCORE, help="Minimum auction rank score for plan-only candidates.")
+    parser.add_argument("--buy-plan-top-n", type=int, default=DEFAULT_BUY_PLAN_TOP_N, help="Maximum plan-only candidates to output. 0 means all matched rows.")
+    parser.add_argument("--buy-plan-min-score", type=float, default=DEFAULT_BUY_PLAN_MIN_SCORE, help="Deprecated while condition filtering is active.")
     parser.add_argument("--buy-plan-amount", type=float, default=DEFAULT_BUY_PLAN_AMOUNT, help="Reference plan amount; no order is sent.")
     parser.add_argument("--heartbeat-interval-sec", type=int, default=30)
     parser.add_argument("--full-console", action="store_true", help="Disable summary mode and print all console logs.")
@@ -1202,6 +1340,11 @@ def main() -> None:
     stop_at = build_session_time(anchor, str(args.stop_time))
     ranking_output = str(args.ranking_output or default_output_path("auction_rankings", anchor))
     buy_plan_output = str(args.buy_plan_output or default_output_path("auction_buy_plan", anchor))
+    matched_candidates_output = str(args.matched_candidates_output or default_output_path("auction_matched_candidates", anchor))
+    matched_candidates_md_output = str(
+        args.matched_candidates_md_output
+        or str(Path(default_output_path("auction_matched_candidates", anchor)).with_suffix(".md"))
+    )
     run_market_only(
         codes=args.codes,
         pool_path=str(args.pool),
@@ -1216,6 +1359,8 @@ def main() -> None:
         snapshot_record_path=str(args.snapshot_record_path),
         ranking_output_path=ranking_output,
         buy_plan_output_path=buy_plan_output,
+        matched_candidates_output_path=matched_candidates_output,
+        matched_candidates_md_output_path=matched_candidates_md_output,
         preopen_reference_time=str(args.preopen_reference_time),
         buy_plan_top_n=int(args.buy_plan_top_n),
         buy_plan_min_score=float(args.buy_plan_min_score),
