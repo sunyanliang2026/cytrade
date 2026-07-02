@@ -14,7 +14,7 @@ if not exist "%CYTRADE_PYTHON%" (
 )
 
 pushd "%REPO_ROOT%"
-"%CYTRADE_PYTHON%" "scripts\run\run_main_seal_follow_managed_session.py" --pool-output "data\stock_pools\manual\main_seal_follow_manual_pool.csv" --skip-pool-collect %*
+"%CYTRADE_PYTHON%" -m strategies.main_seal_follow.scripts.run_managed_session --pool-output "data\stock_pools\manual\main_seal_follow_manual_pool.csv" --skip-pool-collect %*
 set "EXIT_CODE=%ERRORLEVEL%"
 popd
 

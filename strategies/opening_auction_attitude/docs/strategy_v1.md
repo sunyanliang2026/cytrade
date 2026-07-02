@@ -1065,7 +1065,7 @@ class AuctionSpeedScanner:
 文件：
 
 ```text
-scripts/probe/probe_opening_auction_l2.py
+strategies/opening_auction_attitude/scripts/probe_l2.py
 ```
 
 职责：
@@ -1089,7 +1089,7 @@ data/probe/opening_l2_schema_YYYYMMDD.json
 文件：
 
 ```text
-strategy/opening_auction_attitude_strategy.py
+strategies/opening_auction_attitude/strategy.py
 ```
 
 职责：

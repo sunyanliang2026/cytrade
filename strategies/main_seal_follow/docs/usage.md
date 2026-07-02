@@ -189,7 +189,7 @@ python run_main_seal_follow.py
 
 ```python
 from main import run_scheduler_service
-from strategy.main_seal_follow_strategy import MainSealFollowStrategy
+from strategies.main_seal_follow import MainSealFollowStrategy
 
 run_scheduler_service(strategy_classes=[MainSealFollowStrategy])
 ```
@@ -282,8 +282,8 @@ Level2 订阅采用两层模式：
 
 ## 相关文档
 
-- `docs/MAIN_SEAL_FOLLOW_DESIGN.md`
-- `docs/MAIN_SEAL_FOLLOW_TRIGGER_PARAMS.md`
+- `design.md`
+- `trigger_params.md`
 
 ## Runtime Diagnostics
 
@@ -302,12 +302,12 @@ allowed to continue.
 Market-only dry-run should be started with:
 
 ```powershell
-python scripts\run\run_main_seal_follow_market_only.py
+python -m strategies.main_seal_follow.scripts.run_market_only
 ```
 
-This script has a normal `if __name__ == "__main__"` guard and is intended for
-market data / Level2 / signal validation only. It does not connect the trading
-account.
+The old compatibility wrapper `scripts\run\run_main_seal_follow_market_only.py`
+remains available during migration. The canonical module is intended for market
+data / Level2 / signal validation only. It does not connect the trading account.
 
 Every runtime checks heartbeat state every 30 seconds by default.
 If the key runtime state changes, it logs immediately; if the state stays the

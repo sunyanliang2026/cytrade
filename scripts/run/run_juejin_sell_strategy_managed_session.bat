@@ -4,24 +4,19 @@ setlocal
 cd /d C:\Users\ysun\workspace\cytrade
 
 set PY=C:\Users\ysun\miniconda3\envs\cytrade311\python.exe
-set RUNNER=scripts\run\run_juejin_sell_strategy_managed_session.py
+set RUNNER_MODULE=strategies.juejin_sell_strategy.scripts.run_managed_session
 
 if not exist "%PY%" (
     echo [ERROR] Python not found: %PY%
     exit /b 1
 )
 
-if not exist "%RUNNER%" (
-    echo [ERROR] Runner not found: %RUNNER%
-    exit /b 1
-)
-
 echo Run Juejin sell strategy managed session...
 echo Python: %PY%
-echo Runner: %RUNNER%
+echo Runner module: %RUNNER_MODULE%
 echo Args: %*
 
-"%PY%" "%RUNNER%" %*
+"%PY%" -m %RUNNER_MODULE% %*
 if errorlevel 1 goto failed
 
 echo Done.

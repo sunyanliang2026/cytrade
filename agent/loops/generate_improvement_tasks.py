@@ -82,13 +82,13 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 reason="上午运行没有出现 total > 0 的 MONITOR_SESSION pool_generated 事件，说明股票池生成或复用统计不清楚。",
                 allowed_files=[
                     "scripts/pool/collect_main_seal_pool.py",
-                    "scripts/run/run_main_seal_follow_monitor_session.py",
+                    "strategies/main_seal_follow/scripts/run_monitor_session.py",
                     "tests/test_collect_main_seal_pool.py",
-                    "tests/test_run_main_seal_follow_monitor_session.py",
+                    "strategies/main_seal_follow/tests/test_run_main_seal_follow_monitor_session.py",
                     "docs/NEXT_TRADING_DAY_OBSERVATION_CHECKLIST.md",
                 ],
                 validation=[
-                    "python -m pytest tests/test_collect_main_seal_pool.py tests/test_run_main_seal_follow_monitor_session.py",
+                    "python -m pytest tests/test_collect_main_seal_pool.py strategies/main_seal_follow/tests/test_run_main_seal_follow_monitor_session.py",
                     "python -m agent.gates.quality_gate",
                 ],
             )
@@ -103,12 +103,12 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 task_type="observability",
                 reason="上午运行没有出现 monitor_start 或 session_start 标记，无法确认监测会话是否真正启动。",
                 allowed_files=[
-                    "scripts/run/run_main_seal_follow_monitor_session.py",
-                    "scripts/run/run_main_seal_follow_market_only.py",
-                    "tests/test_run_main_seal_follow_monitor_session.py",
+                    "strategies/main_seal_follow/scripts/run_monitor_session.py",
+                    "strategies/main_seal_follow/scripts/run_market_only.py",
+                    "strategies/main_seal_follow/tests/test_run_main_seal_follow_monitor_session.py",
                 ],
                 validation=[
-                    "python -m pytest tests/test_run_main_seal_follow_monitor_session.py",
+                    "python -m pytest strategies/main_seal_follow/tests/test_run_main_seal_follow_monitor_session.py",
                     "python -m agent.gates.quality_gate",
                 ],
             )
@@ -122,9 +122,9 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 risk="low",
                 task_type="observability",
                 reason="没有发现 Runtime heartbeat 日志，无法区分市场安静和程序卡死。",
-                allowed_files=["main.py", "scripts/run/run_main_seal_follow_market_only.py", "tests/"],
+                allowed_files=["main.py", "strategies/main_seal_follow/scripts/run_market_only.py", "tests/"],
                 validation=[
-                    "python -m py_compile main.py scripts/run/run_main_seal_follow_market_only.py",
+                    "python -m py_compile main.py strategies/main_seal_follow/scripts/run_market_only.py",
                     "python -m agent.gates.quality_gate",
                 ],
             )
@@ -140,12 +140,12 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 reason="心跳存在，但最大策略数量一直是 0，需要说明股票池、选股或策略初始化哪个环节失败。",
                 allowed_files=[
                     "strategy/runner.py",
-                    "scripts/run/run_main_seal_follow_market_only.py",
+                    "strategies/main_seal_follow/scripts/run_market_only.py",
                     "docs/NEXT_TRADING_DAY_OBSERVATION_CHECKLIST.md",
                     "tests/",
                 ],
                 validation=[
-                    "python -m pytest tests/test_run_main_seal_follow_monitor_session.py",
+                    "python -m pytest strategies/main_seal_follow/tests/test_run_main_seal_follow_monitor_session.py",
                     "python -m agent.gates.quality_gate",
                 ],
             )
@@ -183,12 +183,12 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 reason="策略已经激活，但复盘没有观察到 Level2 明细订阅，需要在报告中明确订阅状态。",
                 allowed_files=[
                     "core/data_subscription.py",
-                    "strategy/main_seal_follow/strategy.py",
-                    "tests/test_main_seal_follow_strategy.py",
+                    "strategies/main_seal_follow/strategy.py",
+                    "strategies/main_seal_follow/tests/test_main_seal_follow_strategy.py",
                     "docs/NEXT_TRADING_DAY_OBSERVATION_CHECKLIST.md",
                 ],
                 validation=[
-                    "python -m pytest tests/test_main_seal_follow_strategy.py",
+                    "python -m pytest strategies/main_seal_follow/tests/test_main_seal_follow_strategy.py",
                     "python -m agent.gates.quality_gate",
                 ],
             )
@@ -203,13 +203,13 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 task_type="observability",
                 reason="策略已经激活，但没有 entry_signal_accepted 事件；需要汇总阻断原因，让下一次复盘能直接定位问题。",
                 allowed_files=[
-                    "strategy/main_seal_follow/strategy.py",
+                    "strategies/main_seal_follow/strategy.py",
                     "agent/sensors/parse_monitor_logs.py",
-                    "tests/test_main_seal_follow_strategy.py",
+                    "strategies/main_seal_follow/tests/test_main_seal_follow_strategy.py",
                     "tests/test_agent_monitor_review.py",
                 ],
                 validation=[
-                    "python -m pytest tests/test_main_seal_follow_strategy.py tests/test_agent_monitor_review.py",
+                    "python -m pytest strategies/main_seal_follow/tests/test_main_seal_follow_strategy.py tests/test_agent_monitor_review.py",
                     "python -m agent.gates.quality_gate",
                 ],
             )
@@ -224,12 +224,12 @@ def generate_tasks(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 task_type="replay",
                 reason="出现 entry_signal_accepted，但没有 dry_run_probe_trade_recorded 或模拟成交日志，需要补充回放诊断。",
                 allowed_files=[
-                    "strategy/main_seal_follow/strategy.py",
-                    "tests/test_main_seal_follow_strategy.py",
+                    "strategies/main_seal_follow/strategy.py",
+                    "strategies/main_seal_follow/tests/test_main_seal_follow_strategy.py",
                     "agent/sensors/parse_monitor_logs.py",
                 ],
                 validation=[
-                    "python -m pytest tests/test_main_seal_follow_strategy.py tests/test_agent_monitor_review.py",
+                    "python -m pytest strategies/main_seal_follow/tests/test_main_seal_follow_strategy.py tests/test_agent_monitor_review.py",
                     "python -m agent.gates.quality_gate",
                 ],
             )

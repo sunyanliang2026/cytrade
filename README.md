@@ -104,19 +104,26 @@ Web 控制台当前主要覆盖以下能力：
 
 ```text
 cytrade/
-├── config/                  # 枚举、配置、费率表模板
-├── private/                 # 内部设计、审查、整改与人工审查文档
-├── core/                    # QMT 回调、连接、订阅、历史数据
-├── data/                    # SQLite / 状态文件 / 可选远程同步
-├── monitor/                 # 日志、看门狗
+├── agent/                   # dry-run 复盘、自改进任务生成和质量闸门
+├── config/                  # 枚举、配置、费率表模板、本地配置示例
+├── core/                    # QMT 回调、连接、行情订阅、历史数据、Level2 模型
+├── data/                    # 数据管理代码；运行数据按 .gitignore 留在本地
+├── monitor/                 # 日志与 watchdog
 ├── position/                # 持仓模型与管理器
-├── strategy/                # 策略基类、运行器、示例策略
+├── runtime/                 # 账户启动、会话、心跳、策略解析
+├── scripts/                 # 跨策略工具、股票池脚本、兼容 CLI wrapper
+├── strategies/              # 自包含策略包：实现、脚本、测试、文档、数据/输出占位
+├── strategy/                # 策略框架核心；具体策略旧路径仅保留兼容 wrapper
 ├── trading/                 # 交易执行、订单管理、交易模型
 ├── web/                     # FastAPI 后端 + Vue 前端
-├── tests/                   # pytest 回归测试
+├── tests/                   # 跨模块 pytest 回归测试
+├── docs/                    # 跨策略/项目级文档索引与状态文档
 ├── main.py                  # 主入口
 └── requirements.txt
 ```
+
+当前新策略优先放在 `strategies/<strategy_name>/` 下；旧的 `strategy/<name>/` 和部分 `scripts/*` 路径是迁移期兼容层，后续确认外部调用都迁走后再删除。
+项目级文档入口见 `docs/README.md`。
 
 ---
 

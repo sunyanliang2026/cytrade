@@ -20,7 +20,7 @@
 文件：
 
 ```text
-scripts/probe/probe_opening_auction_l2.py
+strategies/opening_auction_attitude/scripts/probe_l2.py
 ```
 
 作用：
@@ -339,17 +339,17 @@ logs/opening_auction_l2/
 
 ```text
 .gitignore
-scripts/probe/probe_opening_auction_l2.py
+strategies/opening_auction_attitude/scripts/probe_l2.py
 scripts/probe/run_opening_auction_l2_probe.bat
-tests/test_opening_auction_l2_probe.py
-docs/HANDOFF_OPENING_AUCTION_L2_PROBE_20260605.md
+strategies/opening_auction_attitude/tests/test_l2_probe.py
+strategies/opening_auction_attitude/docs/handoff_l2_probe_20260605.md
 ```
 
 工作树里还存在其他未跟踪项，需要新会话继续判断是否提交：
 
 ```text
 data/db/
-docs/opening_auction_attitude_strategy_v1.md
+strategies/opening_auction_attitude/docs/strategy_v1.md
 docs/启动简易说明.txt
 ```
 
@@ -357,7 +357,7 @@ docs/启动简易说明.txt
 
 ```text
 data/db/ 是本地运行数据库，不建议提交。
-docs/opening_auction_attitude_strategy_v1.md 是策略方案文档。
+strategies/opening_auction_attitude/docs/strategy_v1.md 是策略方案文档。
 docs/启动简易说明.txt 是中文启动说明，之前确认不是乱码。
 ```
 

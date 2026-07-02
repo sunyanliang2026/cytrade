@@ -57,9 +57,9 @@ Current default final pool logic:
 
 Implemented files:
 
-- `scripts/run/run_main_seal_follow_market_only.py`
-- `scripts/run/run_main_seal_follow_monitor_session.py`
-- `scripts/ops/start_main_seal_follow_monitor.bat`
+- `strategies/main_seal_follow/scripts/run_market_only.py`
+- `strategies/main_seal_follow/scripts/run_monitor_session.py`
+- `scripts/ops/start_main_seal_follow_monitor.bat`（仍通过兼容 wrapper 启动）
 - `scripts/ops/register_main_seal_follow_monitor_task.ps1`
 
 Current behavior:
@@ -80,7 +80,7 @@ Windows scheduled task status:
 
 Implemented file:
 
-- `strategy/main_seal_follow_strategy.py`
+- `strategies/main_seal_follow/strategy.py`
 
 Current logging coverage includes:
 
@@ -136,7 +136,7 @@ Validated commands:
 
 ```text
 python -m py_compile ...
-python -m pytest tests\test_collect_main_seal_pool.py tests\test_import_iwencai_pool.py tests\test_run_main_seal_follow_monitor_session.py tests\test_main_seal_follow_strategy.py
+python -m pytest tests\test_collect_main_seal_pool.py tests\test_import_iwencai_pool.py strategies\main_seal_follow\tests\test_run_main_seal_follow_monitor_session.py strategies\main_seal_follow\tests\test_main_seal_follow_strategy.py
 ```
 
 Latest result:

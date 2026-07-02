@@ -12,8 +12,8 @@ and _main_seal_ok()
 
 对应代码：
 
-- `strategy/main_seal_follow_strategy.py::_maybe_trigger_entry`
-- `strategy/main_seal_follow_strategy.py::_main_seal_ok`
+- `strategies/main_seal_follow/strategy.py::_maybe_trigger_entry`
+- `strategies/main_seal_follow/strategy.py::_main_seal_ok`
 
 ## 一、触发链路的顺序
 

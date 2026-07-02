@@ -382,10 +382,10 @@ C:\Users\ysun\miniconda3\envs\cytrade311\python.exe -m pytest tests\test_opening
 AGENTS.md 推荐的基础检查：
 
 ```powershell
-python -m py_compile scripts/run/run_main_seal_follow_monitor_session.py scripts/run/run_main_seal_follow_market_only.py strategy/main_seal_follow_strategy.py
+python -m py_compile strategies/main_seal_follow/scripts/run_monitor_session.py strategies/main_seal_follow/scripts/run_market_only.py strategies/main_seal_follow/strategy.py
 python -m py_compile agent/sensors/parse_monitor_logs.py agent/loops/post_morning_review.py agent/loops/generate_improvement_tasks.py agent/gates/quality_gate.py agent/tools/codex_cli_runner.py
 python -m pytest tests/test_agent_monitor_review.py
-python -m pytest tests/test_collect_main_seal_pool.py tests/test_import_iwencai_pool.py tests/test_run_main_seal_follow_monitor_session.py tests/test_main_seal_follow_strategy.py
+python -m pytest tests/test_collect_main_seal_pool.py tests/test_import_iwencai_pool.py strategies/main_seal_follow/tests/test_run_main_seal_follow_monitor_session.py strategies/main_seal_follow/tests/test_main_seal_follow_strategy.py
 ```
 
 注意：实际环境里直接 `python` 可能指向 WindowsApps stub，优先使用 cytrade311 的完整路径。
@@ -414,8 +414,8 @@ d1b3278 Add opening auction attitude observe stack
  M strategy/__init__.py
 ?? docs/启动简易说明.txt
 ?? docs/掘金/
-?? strategy/juejin_sell_strategy/
-?? tests/test_juejin_sell_strategy.py
+?? strategies/juejin_sell_strategy/
+?? strategies/juejin_sell_strategy/tests/test_juejin_sell_strategy.py
 ```
 
 这些看起来不是 OpeningAuctionAttitude 主线的一部分。接手人处理开盘竞价策略时，不要误改或回滚这些未提交内容，除非用户明确要求。

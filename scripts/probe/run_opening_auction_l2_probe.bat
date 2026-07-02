@@ -27,10 +27,10 @@ echo [cytrade] log=%LOG_FILE%
 pushd "%REPO_ROOT%"
 if "%~1"=="" (
   echo [cytrade] args=--early-pool "%DEFAULT_POOL%"
-  "%PYTHON_EXE%" "%REPO_ROOT%\scripts\probe\probe_opening_auction_l2.py" --output-dir "%OUT_DIR%" --log-file "%LOG_FILE%" --early-pool "%DEFAULT_POOL%"
+  "%PYTHON_EXE%" -m strategies.opening_auction_attitude.scripts.probe_l2 --output-dir "%OUT_DIR%" --log-file "%LOG_FILE%" --early-pool "%DEFAULT_POOL%"
 ) else (
   echo [cytrade] args=%*
-  "%PYTHON_EXE%" "%REPO_ROOT%\scripts\probe\probe_opening_auction_l2.py" --output-dir "%OUT_DIR%" --log-file "%LOG_FILE%" %*
+  "%PYTHON_EXE%" -m strategies.opening_auction_attitude.scripts.probe_l2 --output-dir "%OUT_DIR%" --log-file "%LOG_FILE%" %*
 )
 set "RC=%ERRORLEVEL%"
 popd

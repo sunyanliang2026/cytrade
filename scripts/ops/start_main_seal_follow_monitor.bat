@@ -14,7 +14,7 @@ if not exist "%CYTRADE_PYTHON%" (
 )
 
 pushd "%REPO_ROOT%"
-"%CYTRADE_PYTHON%" "scripts\run\run_main_seal_follow_monitor_session.py" %*
+"%CYTRADE_PYTHON%" -m strategies.main_seal_follow.scripts.run_monitor_session %*
 set "EXIT_CODE=%ERRORLEVEL%"
 popd
 

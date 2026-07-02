@@ -4,9 +4,9 @@ allowed_paths:
     - agent/
     - docs/
     - tests/
-    - scripts/run/run_main_seal_follow_monitor_session.py
-    - scripts/run/run_main_seal_follow_market_only.py
-    - strategy/main_seal_follow_strategy.py
+    - strategies/main_seal_follow/scripts/run_monitor_session.py
+    - strategies/main_seal_follow/scripts/run_market_only.py
+    - strategies/main_seal_follow/strategy.py
   replay:
     - agent/
     - tests/
@@ -24,5 +24,5 @@ forbidden_paths:
 requires_human_approval:
   - config/settings.py
   - trading/
-  - strategy/main_seal_follow_strategy.py
+  - strategies/main_seal_follow/strategy.py
   - run_main_seal_follow.py
