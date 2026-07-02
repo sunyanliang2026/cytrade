@@ -3,7 +3,7 @@ setlocal EnableExtensions
 chcp 65001 >nul
 
 set "SCRIPT_DIR=%~dp0"
-set "REPO_ROOT=%SCRIPT_DIR%..\.."
+set "REPO_ROOT=%SCRIPT_DIR%..\..\.."
 set "CONDA_PYTHON=C:\Users\ysun\miniconda3\envs\cytrade311\python.exe"
 set "DEFAULT_POOL=%REPO_ROOT%\data\stock_pools\current\main_seal_follow_pool.csv"
 

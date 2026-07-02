@@ -312,6 +312,16 @@ class TradeExecutor:
                            order_uuid[:8], order.status.value)
             return False
 
+        if not self._live_trading_enabled:
+            logger.warning("cancel_order [MOCK]: uuid=%s xt_id=%d live_enabled=false",
+                           order_uuid[:8], order.xt_order_id)
+            self._order_mgr.mark_order_status(
+                order_uuid,
+                OrderStatus.CANCELED,
+                status_msg=remark or "mock cancel",
+            )
+            return True
+
         readiness_error = self._live_readiness_error()
         if readiness_error:
             logger.error(
@@ -360,6 +370,9 @@ class TradeExecutor:
         order_error = self._validate_order_for_submission(order)
         if order_error:
             return self._reject_order(order, order_error)
+
+        if not self._live_trading_enabled:
+            return self._submit_mock_order(order)
 
         readiness_error = self._live_readiness_error()
         if readiness_error:
@@ -428,6 +441,16 @@ class TradeExecutor:
             self._order_mgr.register_order(order)
             logger.error("TradeExecutor: 下单失败 uuid=%s: %s",
                          order.order_uuid[:8], e, exc_info=True)
+        return order
+
+    def _submit_mock_order(self, order: Order) -> Order:
+        """Register an observe/mock order without touching the live counter."""
+        order.xt_order_id = int(time.time() * 1000) % 2**31
+        order.status = OrderStatus.WAIT_REPORTING
+        self._order_mgr.register_order(order)
+        logger.info("[ORDER] [MOCK] 下单 uuid=%s code=%s dir=%s price=%.3f qty=%d live_enabled=false",
+                    order.order_uuid[:8], order.stock_code,
+                    order.direction.value, order.price, order.quantity)
         return order
 
     def _live_readiness_error(self) -> str:

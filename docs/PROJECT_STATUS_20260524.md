@@ -59,8 +59,8 @@ Implemented files:
 
 - `strategies/main_seal_follow/scripts/run_market_only.py`
 - `strategies/main_seal_follow/scripts/run_monitor_session.py`
-- `scripts/ops/start_main_seal_follow_monitor.bat`（仍通过兼容 wrapper 启动）
-- `scripts/ops/register_main_seal_follow_monitor_task.ps1`
+- `strategies/main_seal_follow/scripts/run_monitor_session.bat`
+- `strategies/main_seal_follow/scripts/register_monitor_task.ps1`
 
 Current behavior:
 
@@ -74,7 +74,7 @@ Windows scheduled task status:
 
 - Task name: `Cytrade MainSealFollow Monitor`
 - Trigger: weekdays at `08:50`
-- Action: run `scripts/ops/start_main_seal_follow_monitor.bat`
+- Action: run `strategies/main_seal_follow/scripts/run_monitor_session.bat`
 
 ### 3. Strategy event logging
 

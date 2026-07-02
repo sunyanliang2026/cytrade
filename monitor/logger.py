@@ -37,7 +37,7 @@ class _SummaryFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         """只允许订单、成交与 MainSealFollow 关键事件通过。"""
         msg = record.getMessage()
-        return "[ORDER]" in msg or "[TRADE]" in msg or "MSF_EVENT" in msg
+        return record.levelno >= logging.WARNING or "[ORDER]" in msg or "[TRADE]" in msg or "MSF_EVENT" in msg
 
 
 class LogManager:
@@ -63,24 +63,28 @@ class LogManager:
                 cls._instance._initialized = False
         return cls._instance
 
-    def __init__(self, log_dir: str = "./logs", max_days: int = 30,
-                 level: str = "INFO", summary_mode: bool = False):
+    def __init__(self, log_dir: str | None = None, max_days: int | None = None,
+                 level: str | None = None, summary_mode: bool | None = None):
         """初始化日志系统配置。"""
         if self._initialized:
-            self._log_dir = log_dir
-            self._max_days = max_days
-            self.set_log_level(level)
-            self.set_summary_mode(summary_mode)
+            if log_dir is not None:
+                self._log_dir = log_dir
+            if max_days is not None:
+                self._max_days = max_days
+            if level is not None:
+                self.set_log_level(level)
+            if summary_mode is not None:
+                self.set_summary_mode(summary_mode)
             return
         self._initialized = True
-        self._log_dir = log_dir
-        self._max_days = max_days
-        self._level = level.upper()
-        self._summary_mode = summary_mode
+        self._log_dir = log_dir or "./logs"
+        self._max_days = 30 if max_days is None else max_days
+        self._level = (level or "INFO").upper()
+        self._summary_mode = bool(summary_mode) if summary_mode is not None else False
         self._loggers: dict[str, logging.Logger] = {}
         self._summary_filter = _SummaryFilter()
         self._pid = os.getpid()
-        os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(self._log_dir, exist_ok=True)
         self.setup_logging()
 
     # ------------------------------------------------------------------
@@ -113,7 +117,7 @@ class LogManager:
         self._summary_mode = enabled
         for lgr in self._loggers.values():
             for hdlr in lgr.handlers:
-                if isinstance(hdlr, logging.StreamHandler):
+                if isinstance(hdlr, logging.StreamHandler) and not isinstance(hdlr, logging.FileHandler):
                     if enabled:
                         hdlr.addFilter(self._summary_filter)
                     else:

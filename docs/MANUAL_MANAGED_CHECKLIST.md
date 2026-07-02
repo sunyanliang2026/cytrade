@@ -7,7 +7,7 @@ monitoring under the full managed runtime.
 Default entrypoint:
 
 ```powershell
-scripts\ops\start_main_seal_follow_manual_managed.bat
+strategies\main_seal_follow\scripts\run_manual_managed.bat
 ```
 
 Default pool file:

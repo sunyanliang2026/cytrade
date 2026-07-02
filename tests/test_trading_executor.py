@@ -132,6 +132,25 @@ def test_trade_executor_dry_run_keeps_mock_order_path(monkeypatch):
     assert order in order_mgr.get_active_orders()
 
 
+def test_trade_executor_dry_run_never_touches_live_counter_when_connected(monkeypatch):
+    monkeypatch.setattr("trading.executor._XT_AVAILABLE", True)
+    trader = _FakeTrader()
+    conn = _FakeConnection(trader=trader, account=_FakeAccount(), ready=True, asset=_FakeAsset(cash=5000))
+    order_mgr = OrderManager()
+    executor = TradeExecutor(conn, order_mgr, live_trading_enabled=False)
+
+    order = executor.sell_limit("s1", "strategy", "603379", 85.12, 200, remark="dry-run safety")
+
+    assert order.status == OrderStatus.WAIT_REPORTING
+    assert order.xt_order_id > 0
+    assert trader.orders == []
+    assert order_mgr.get_order(order.order_uuid) is order
+
+    assert executor.cancel_order(order.order_uuid, remark="dry-run cancel") is True
+    assert trader.cancels == []
+    assert order.status == OrderStatus.CANCELED
+
+
 def test_trade_executor_live_without_xtquant_is_junk_not_mock(monkeypatch):
     monkeypatch.setattr("trading.executor._XT_AVAILABLE", False)
     order_mgr = OrderManager()

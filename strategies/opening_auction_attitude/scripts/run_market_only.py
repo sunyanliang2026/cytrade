@@ -29,6 +29,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings import Settings
+from core.l2_models import L2QuoteEvent
+from core.models import TickData
 from main import _log_runtime_startup_config, _start_runtime_heartbeat, build_app
 from monitor.logger import get_log_file_path, get_logger
 from strategy.models import StrategyConfig
@@ -39,6 +41,7 @@ from strategies.opening_auction_attitude import (
     AUCTION_STRONG_CONFIRMED,
     OpeningAuctionAttitudeStrategy,
 )
+from strategies.opening_auction_attitude.scripts.probe_l2 import OpeningAuctionL2Recorder
 from scripts.pool.common import limit_up_price as calc_limit_up_price
 
 
@@ -66,6 +69,9 @@ DEFAULT_BUY_PLAN_MIN_SCORE = 75.0
 DEFAULT_BUY_PLAN_AMOUNT = 0.0
 MIN_FILTER_FINAL_AUCTION_AMOUNT = 30_000_000.0
 MIN_FILTER_OPEN_PCT = 3.0
+DEFAULT_CANDIDATE_MIN_AUCTION_AMOUNT = 20_000_000.0
+DEFAULT_CANDIDATE_MIN_OPEN_PCT = 0.0
+DYNAMIC_CANDIDATE_L2_KINDS = frozenset({"l2order", "l2transaction"})
 RANKING_HEADERS = [
     "rank",
     "stock_code",
@@ -404,22 +410,32 @@ def resolve_observe_entries(
     return entries
 
 
-def build_strategy_configs(entries: Iterable[PoolEntry]) -> list[StrategyConfig]:
+def build_strategy_configs(
+    entries: Iterable[PoolEntry],
+    *,
+    l2_kinds: Iterable[str] | None = None,
+) -> list[StrategyConfig]:
     configs: list[StrategyConfig] = []
+    normalized_l2_kinds = None
+    if l2_kinds is not None:
+        normalized_l2_kinds = sorted({str(kind or "").strip().lower() for kind in l2_kinds if str(kind or "").strip()})
     for entry in entries:
         code = normalize_stock_code(entry.stock_code)
         if not code:
             continue
+        params = {
+            "instance_key": code,
+            "stock_name": str(entry.stock_name or ""),
+            "observe_only": True,
+            "quote_volume_unit": 100,
+        }
+        if normalized_l2_kinds is not None:
+            params["l2_kinds"] = normalized_l2_kinds
         configs.append(
             StrategyConfig(
                 stock_code=code,
                 max_position_amount=0.0,
-                params={
-                    "instance_key": code,
-                    "stock_name": str(entry.stock_name or ""),
-                    "observe_only": True,
-                    "quote_volume_unit": 100,
-                },
+                params=params,
             )
         )
     return configs
@@ -439,6 +455,35 @@ def install_observe_strategies(
     return installed
 
 
+def snapshot_auction_amount(tick: SnapshotTick) -> float:
+    raw = dict(tick.raw or {})
+    bid_prices = _extract_float_list(raw.get("bidPrice"))
+    ask_prices = _extract_float_list(raw.get("askPrice"))
+    bid_volumes = _extract_float_list(raw.get("bidVol"))
+    ask_volumes = _extract_float_list(raw.get("askVol"))
+    bid0 = bid_prices[0] if bid_prices else 0.0
+    ask0 = ask_prices[0] if ask_prices else 0.0
+    bid_vol0 = bid_volumes[0] if bid_volumes else 0.0
+    ask_vol0 = ask_volumes[0] if ask_volumes else 0.0
+    if bid0 > 0 and ask0 > 0 and abs(bid0 - ask0) < 1e-8:
+        matched_volume = min(bid_vol0, ask_vol0) if bid_vol0 > 0 and ask_vol0 > 0 else max(bid_vol0, ask_vol0)
+        if matched_volume > 0:
+            return bid0 * matched_volume * 100.0
+    return float(tick.amount or 0.0)
+
+
+def _extract_float_list(payload: Any) -> list[float]:
+    if not isinstance(payload, (list, tuple)):
+        return []
+    result = []
+    for item in payload:
+        try:
+            result.append(float(item or 0.0))
+        except (TypeError, ValueError):
+            result.append(0.0)
+    return result
+
+
 class OpeningAuctionLimitUpScanner:
     def __init__(
         self,
@@ -447,6 +492,8 @@ class OpeningAuctionLimitUpScanner:
         snapshot_provider: Callable[[Iterable[str]], dict[str, SnapshotTick]],
         freeze_at: datetime,
         limit_up_tolerance: float = 0.01,
+        min_auction_amount: float = DEFAULT_CANDIDATE_MIN_AUCTION_AMOUNT,
+        min_open_pct: float = DEFAULT_CANDIDATE_MIN_OPEN_PCT,
         snapshot_record_path: str = "",
         logger=None,
     ):
@@ -459,6 +506,8 @@ class OpeningAuctionLimitUpScanner:
         self._snapshot_provider = snapshot_provider
         self._freeze_at = freeze_at
         self._limit_up_tolerance = max(0.0, float(limit_up_tolerance or 0.0))
+        self._min_auction_amount = max(0.0, float(min_auction_amount or 0.0))
+        self._min_open_pct = float(min_open_pct or 0.0)
         self._logger = logger or get_logger("system")
         self._candidate_codes: set[str] = set()
         self._frozen = False
@@ -482,7 +531,7 @@ class OpeningAuctionLimitUpScanner:
             self._snapshot_record_handle = None
 
     def scan_once(self, now: datetime) -> list[PoolEntry]:
-        if self._frozen or now >= self._freeze_at:
+        if self._frozen or now > self._freeze_at:
             self._frozen = True
             return []
 
@@ -502,23 +551,32 @@ class OpeningAuctionLimitUpScanner:
             last_price = float(tick.last_price or 0.0)
             pre_close = float(tick.pre_close or 0.0)
             limit_price = calc_limit_up_price(pre_close)
-            is_hit = limit_price > 0 and last_price > 0 and last_price >= limit_price - self._limit_up_tolerance
-            self._record_snapshot(now, entry, tick, limit_price=limit_price, is_hit=is_hit)
-            if limit_price <= 0 or last_price <= 0:
-                continue
-            if not is_hit:
+            auction_amount = snapshot_auction_amount(tick)
+            open_pct = (last_price / pre_close - 1.0) * 100.0 if pre_close > 0 and last_price > 0 else 0.0
+            is_candidate = auction_amount > self._min_auction_amount and open_pct > self._min_open_pct
+            self._record_snapshot(
+                now,
+                entry,
+                tick,
+                limit_price=limit_price,
+                is_hit=is_candidate,
+                auction_amount=auction_amount,
+                open_pct=open_pct,
+            )
+            if not is_candidate:
                 continue
             self._candidate_codes.add(normalized_code)
             found.append(entry)
             self._logger.info(
-                "%s candidate_found stock=%s name=%s last_price=%.3f pre_close=%.3f limit_up=%.3f amount=%.0f snapshot_time=%s",
+                "%s candidate_found stock=%s name=%s last_price=%.3f pre_close=%.3f open_pct=%.3f auction_amount=%.0f min_auction_amount=%.0f snapshot_time=%s",
                 SESSION_EVENT_PREFIX,
                 normalized_code,
                 entry.stock_name,
                 last_price,
                 pre_close,
-                limit_price,
-                float(tick.amount or 0.0),
+                open_pct,
+                auction_amount,
+                self._min_auction_amount,
                 tick.snapshot_time.strftime("%H:%M:%S") if tick.snapshot_time else "",
             )
         return found
@@ -531,6 +589,8 @@ class OpeningAuctionLimitUpScanner:
         *,
         limit_price: float,
         is_hit: bool,
+        auction_amount: float = 0.0,
+        open_pct: float = 0.0,
     ) -> None:
         if self._snapshot_record_handle is None:
             return
@@ -542,6 +602,10 @@ class OpeningAuctionLimitUpScanner:
             is_hit=is_hit,
             record_mode="dynamic_candidates",
         )
+        row["candidate_auction_amount"] = float(auction_amount or 0.0)
+        row["candidate_open_pct"] = float(open_pct or 0.0)
+        row["candidate_min_auction_amount"] = float(self._min_auction_amount or 0.0)
+        row["candidate_min_open_pct"] = float(self._min_open_pct or 0.0)
         self._snapshot_record_handle.write(
             json.dumps(row, ensure_ascii=False, sort_keys=True, default=_json_default) + "\n"
         )
@@ -563,6 +627,8 @@ class FullPoolSnapshotRecorder:
         snapshot_provider: Callable[[Iterable[str]], dict[str, SnapshotTick]],
         snapshot_record_path: str = "",
         limit_up_tolerance: float = 0.01,
+        market_data_consumer: Callable[[dict[str, TickData]], None] | None = None,
+        l2_quote_consumer: Callable[[dict[str, L2QuoteEvent]], None] | None = None,
     ):
         self._entries = [
             PoolEntry(normalize_stock_code(entry.stock_code), entry.stock_name)
@@ -572,6 +638,8 @@ class FullPoolSnapshotRecorder:
         self._entries_by_code = {entry.stock_code: entry for entry in self._entries}
         self._snapshot_provider = snapshot_provider
         self._limit_up_tolerance = max(0.0, float(limit_up_tolerance or 0.0))
+        self._market_data_consumer = market_data_consumer
+        self._l2_quote_consumer = l2_quote_consumer
         self._rows_written = 0
         self._snapshot_record_handle = None
         if snapshot_record_path:
@@ -597,6 +665,8 @@ class FullPoolSnapshotRecorder:
             return 0
         snapshots = self._snapshot_provider([entry.stock_code for entry in self._entries])
         written = 0
+        tick_events: dict[str, TickData] = {}
+        quote_events: dict[str, L2QuoteEvent] = {}
         for code, tick in snapshots.items():
             normalized_code = normalize_stock_code(code)
             entry = self._entries_by_code.get(normalized_code)
@@ -617,11 +687,82 @@ class FullPoolSnapshotRecorder:
             self._snapshot_record_handle.write(
                 json.dumps(row, ensure_ascii=False, sort_keys=True, default=_json_default) + "\n"
             )
+            tick_events[normalized_code] = snapshot_tick_to_tick_data(normalized_code, tick, recv_time=now)
+            quote_events[normalized_code] = snapshot_tick_to_l2_quote_event(
+                normalized_code,
+                tick,
+                limit_price=limit_price,
+                recv_time=now,
+            )
             written += 1
         if written:
             self._snapshot_record_handle.flush()
             self._rows_written += written
+            if self._market_data_consumer:
+                self._market_data_consumer(tick_events)
+            if self._l2_quote_consumer:
+                self._l2_quote_consumer(quote_events)
         return written
+
+
+def _payload_float_list(payload: Any) -> list[float]:
+    if not isinstance(payload, (list, tuple)):
+        return []
+    result: list[float] = []
+    for item in payload:
+        result.append(_to_float(item))
+    return result
+
+
+def _payload_int_list(payload: Any) -> list[int]:
+    return [int(value or 0) for value in _payload_float_list(payload)]
+
+
+def snapshot_tick_to_tick_data(stock_code: str, tick: SnapshotTick, *, recv_time: datetime) -> TickData:
+    raw = dict(tick.raw or {})
+    return TickData(
+        stock_code=normalize_stock_code(stock_code),
+        last_price=float(tick.last_price or 0.0),
+        open=_to_float(raw.get("open")),
+        high=_to_float(raw.get("high")),
+        low=_to_float(raw.get("low")),
+        pre_close=float(tick.pre_close or 0.0),
+        volume=int(float(tick.volume or 0.0)),
+        amount=float(tick.amount or 0.0),
+        bid_prices=_payload_float_list(raw.get("bidPrice")),
+        bid_volumes=_payload_int_list(raw.get("bidVol")),
+        ask_prices=_payload_float_list(raw.get("askPrice")),
+        ask_volumes=_payload_int_list(raw.get("askVol")),
+        data_time=tick.snapshot_time,
+        recv_time=recv_time,
+    )
+
+
+def snapshot_tick_to_l2_quote_event(
+    stock_code: str,
+    tick: SnapshotTick,
+    *,
+    limit_price: float,
+    recv_time: datetime,
+) -> L2QuoteEvent:
+    raw = dict(tick.raw or {})
+    bid_prices = _payload_float_list(raw.get("bidPrice"))
+    ask_prices = _payload_float_list(raw.get("askPrice"))
+    bid_volumes = _payload_int_list(raw.get("bidVol"))
+    ask_volumes = _payload_int_list(raw.get("askVol"))
+    return L2QuoteEvent(
+        stock_code=normalize_stock_code(stock_code),
+        last_price=float(tick.last_price or 0.0),
+        pre_close=float(tick.pre_close or 0.0),
+        bid1=bid_prices[0] if bid_prices else 0.0,
+        ask1=ask_prices[0] if ask_prices else 0.0,
+        bid1_volume=bid_volumes[0] if bid_volumes else 0,
+        ask1_volume=ask_volumes[0] if ask_volumes else 0,
+        limit_up_price=float(limit_price or 0.0),
+        event_time=tick.snapshot_time,
+        recv_time=recv_time,
+        raw_xt_fields=raw,
+    )
 
 
 def build_snapshot_record_row(
@@ -919,7 +1060,7 @@ def write_matched_candidates_markdown(path: str, rows: Iterable[dict[str, Any]])
         return ""
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(render_matched_candidates_markdown(rows), encoding="utf-8")
+    output_path.write_text(render_matched_candidates_markdown(rows), encoding="utf-8-sig")
     return str(output_path)
 
 
@@ -1036,7 +1177,10 @@ def run_market_only(
     candidate_freeze_time: str = "09:24:30",
     snapshot_interval_sec: float = 2.0,
     limit_up_tolerance: float = 0.01,
+    candidate_min_auction_amount: float = DEFAULT_CANDIDATE_MIN_AUCTION_AMOUNT,
+    candidate_min_open_pct: float = DEFAULT_CANDIDATE_MIN_OPEN_PCT,
     snapshot_record_path: str = "",
+    small_pool_l2_record_dir: str = "",
     ranking_output_path: str = "",
     buy_plan_output_path: str = "",
     matched_candidates_output_path: str = "",
@@ -1082,6 +1226,8 @@ def run_market_only(
             snapshot_provider=snapshot_provider,
             freeze_at=freeze_at,
             limit_up_tolerance=limit_up_tolerance,
+            min_auction_amount=candidate_min_auction_amount,
+            min_open_pct=candidate_min_open_pct,
             snapshot_record_path=snapshot_record_path,
             logger=logger,
         )
@@ -1094,8 +1240,15 @@ def run_market_only(
             snapshot_provider=snapshot_provider,
             snapshot_record_path=snapshot_record_path,
             limit_up_tolerance=limit_up_tolerance,
+            market_data_consumer=runner.on_market_data,
+            l2_quote_consumer=runner.on_l2_quote_data,
         )
         if (not dynamic_candidates and snapshot_record_path)
+        else None
+    )
+    small_pool_l2_recorder = (
+        OpeningAuctionL2Recorder(Path(small_pool_l2_record_dir))
+        if dynamic_candidates and str(small_pool_l2_record_dir or "").strip()
         else None
     )
     last_full_snapshot_at: datetime | None = None
@@ -1123,6 +1276,24 @@ def run_market_only(
     preopen_reference_emitted = False
     try:
         runner.start()
+        if small_pool_l2_recorder:
+            def _record_l2_order_data(events_by_code):
+                small_pool_l2_recorder.record_many("l2order", "dynamic_small_pool", events_by_code)
+                runner.on_l2_order_data(events_by_code)
+
+            def _record_l2_transaction_data(events_by_code):
+                small_pool_l2_recorder.record_many("l2transaction", "dynamic_small_pool", events_by_code)
+                runner.on_l2_transaction_data(events_by_code)
+
+            data_sub.set_l2_order_callback(_record_l2_order_data)
+            data_sub.set_l2_transaction_callback(_record_l2_transaction_data)
+            logger.info(
+                "%s small_pool_l2_record_start raw=%s summary=%s schema=%s kinds=l2order,l2transaction",
+                session_event_prefix,
+                small_pool_l2_recorder.raw_path,
+                small_pool_l2_recorder.summary_path,
+                small_pool_l2_recorder.schema_path,
+            )
         installed = 0
         if scanner:
             logger.info(
@@ -1133,6 +1304,12 @@ def run_market_only(
                 freeze_at.strftime("%H:%M:%S"),
                 snapshot_interval_sec,
                 float(limit_up_tolerance or 0.0),
+            )
+            logger.info(
+                "%s scanner_candidate_filter min_auction_amount=%.0f min_open_pct=%.3f",
+                session_event_prefix,
+                float(candidate_min_auction_amount or 0.0),
+                float(candidate_min_open_pct or 0.0),
             )
             if snapshot_record_path:
                 logger.info("%s snapshot_record_path=%s", session_event_prefix, snapshot_record_path)
@@ -1174,7 +1351,7 @@ def run_market_only(
                     for candidate in scanner.scan_once(now):
                         installed += install_observe_strategies(
                             runner,
-                            build_strategy_configs([candidate]),
+                            build_strategy_configs([candidate], l2_kinds=DYNAMIC_CANDIDATE_L2_KINDS),
                             trade_executor=trade_exec,
                             position_manager=pos_mgr,
                         )
@@ -1286,6 +1463,18 @@ def run_market_only(
             runner.stop()
         finally:
             data_sub.stop()
+        if small_pool_l2_recorder:
+            try:
+                small_pool_l2_recorder.write_outputs()
+                logger.info(
+                    "%s small_pool_l2_record_stop raw=%s summary=%s schema=%s",
+                    session_event_prefix,
+                    small_pool_l2_recorder.raw_path,
+                    small_pool_l2_recorder.summary_path,
+                    small_pool_l2_recorder.schema_path,
+                )
+            finally:
+                small_pool_l2_recorder.close()
         logger.info(
             "%s stopped system_log=%s trade_log=%s dry_run=%s real_order_sent=false",
             session_event_prefix,
@@ -1304,8 +1493,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scan-start-time", default="09:15:00", help="Snapshot scan start time.")
     parser.add_argument("--candidate-freeze-time", default="09:24:30", help="Legacy --dynamic-candidates only: stop adding candidates after this time.")
     parser.add_argument("--snapshot-interval-sec", type=float, default=2.0, help="Full-tick snapshot polling interval in seconds.")
-    parser.add_argument("--limit-up-tolerance", type=float, default=0.01, help="Price tolerance for limit-up snapshot hit.")
+    parser.add_argument("--limit-up-tolerance", type=float, default=0.01, help="Legacy tolerance kept for compatibility.")
+    parser.add_argument("--candidate-min-auction-amount", type=float, default=DEFAULT_CANDIDATE_MIN_AUCTION_AMOUNT, help="Dynamic candidate minimum auction matched amount.")
+    parser.add_argument("--candidate-min-open-pct", type=float, default=DEFAULT_CANDIDATE_MIN_OPEN_PCT, help="Dynamic candidate minimum auction gain percent.")
     parser.add_argument("--snapshot-record-path", default="", help="Optional JSONL path. In default install-all mode records full-pool snapshots; in --dynamic-candidates mode records legacy scanner snapshots.")
+    parser.add_argument("--small-pool-l2-record-dir", default="", help="Optional output directory for dynamic small-pool l2order/l2transaction raw records.")
     candidate_mode = parser.add_mutually_exclusive_group()
     candidate_mode.add_argument(
         "--install-all",
@@ -1318,7 +1510,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dynamic-candidates",
         dest="install_all",
         action="store_false",
-        help="Use legacy snapshot scanner and install only symbols that hit the limit-up condition before freeze.",
+        help="Use snapshot scanner and install only symbols matching the dynamic candidate filter before freeze.",
     )
     parser.add_argument("--ranking-output", default="", help="CSV path for 09:25 auction ranking output. Empty uses strategy output dir.")
     parser.add_argument("--buy-plan-output", default="", help="CSV path for plan-only buy-plan output. Empty uses strategy output dir.")
@@ -1356,7 +1548,10 @@ def main() -> None:
         candidate_freeze_time=str(args.candidate_freeze_time),
         snapshot_interval_sec=float(args.snapshot_interval_sec),
         limit_up_tolerance=float(args.limit_up_tolerance),
+        candidate_min_auction_amount=float(args.candidate_min_auction_amount),
+        candidate_min_open_pct=float(args.candidate_min_open_pct),
         snapshot_record_path=str(args.snapshot_record_path),
+        small_pool_l2_record_dir=str(args.small_pool_l2_record_dir),
         ranking_output_path=ranking_output,
         buy_plan_output_path=buy_plan_output,
         matched_candidates_output_path=matched_candidates_output,

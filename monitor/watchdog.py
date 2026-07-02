@@ -293,7 +293,7 @@ class Watchdog:
             bool: 当前时间位于设定的早盘或午盘区间时返回 `True`。
         """
         t = datetime.now().strftime("%H:%M")
-        return ("09:25" <= t <= "11:35") or ("12:55" <= t <= "15:05")
+        return ("09:30" <= t <= "11:30") or ("13:00" <= t <= "15:00")
 
 
 __all__ = ["Watchdog"]

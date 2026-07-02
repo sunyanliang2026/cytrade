@@ -176,6 +176,16 @@ def test_data_subscription_mock_callbacks_cover_tick_and_l2():
     assert manager.get_latest_data_status()["last_recv_time"] is not None
 
 
+def test_data_subscription_can_disable_latest_status_console_print(monkeypatch):
+    calls = []
+    monkeypatch.setattr(DataSubscriptionManager, "_print_latest_data_status", lambda *args: calls.append(args))
+
+    manager = DataSubscriptionManager(print_latest_status=False)
+    manager.push_mock_tick("000001", 10.0)
+
+    assert calls == []
+
+
 def test_connection_manager_exposes_startup_diagnostics_without_secrets():
     conn = ConnectionManager(
         qmt_path=r"C:\QMT\userdata_mini",

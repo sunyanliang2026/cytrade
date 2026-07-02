@@ -18,11 +18,11 @@ __all__ = [
 
 def __getattr__(name):
     if name == "JuejinSellStrategy":
-        from .juejin_sell_strategy import JuejinSellStrategy as _JuejinSellStrategy
+        from strategies.juejin_sell_strategy import JuejinSellStrategy as _JuejinSellStrategy
 
         return _JuejinSellStrategy
     if name == "MainSealFollowStrategy":
-        from .main_seal_follow_strategy import MainSealFollowStrategy as _MainSealFollowStrategy
+        from strategies.main_seal_follow import MainSealFollowStrategy as _MainSealFollowStrategy
 
         return _MainSealFollowStrategy
     raise AttributeError(name)

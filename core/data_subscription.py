@@ -40,6 +40,7 @@ class DataSubscriptionManager:
         self,
         latency_threshold_sec: float = 10.0,
         default_period: SubscriptionPeriod | str = SubscriptionPeriod.TICK,
+        print_latest_status: bool = True,
     ):
         self._subscriptions: Dict[str, str] = {}
         self._subscription_ids: Dict[str, int] = {}
@@ -64,6 +65,7 @@ class DataSubscriptionManager:
         self._latest_data_time: Optional[datetime] = None
         self._latest_latency_ms: float = 0.0
         self._xtdata_connected = False
+        self._print_latest_status = bool(print_latest_status)
 
     # ------------------------------------------------------------------ Public
 
@@ -570,7 +572,8 @@ class DataSubscriptionManager:
         last_recv_time = tick.recv_time or datetime.now()
         latency_ms = float(tick.latency_ms or 0.0)
         self._set_latest_data_status(latest_data_time, last_recv_time, latency_ms)
-        self._print_latest_data_status(latest_data_time, latency_ms)
+        if self._print_latest_status:
+            self._print_latest_data_status(latest_data_time, latency_ms)
 
     def _update_latest_data_status_from_times(self, latest_data_time: datetime, recv_time: datetime) -> None:
         latency_ms = max(0.0, (recv_time - latest_data_time).total_seconds() * 1000)

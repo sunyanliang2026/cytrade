@@ -2,7 +2,7 @@
 setlocal
 
 set "SCRIPT_DIR=%~dp0"
-for %%I in ("%SCRIPT_DIR%..\..") do set "REPO_ROOT=%%~fI"
+for %%I in ("%SCRIPT_DIR%..\..\..") do set "REPO_ROOT=%%~fI"
 
 if not defined CYTRADE_PYTHON (
     set "CYTRADE_PYTHON=C:\Users\ysun\miniconda3\envs\cytrade311\python.exe"
@@ -14,7 +14,7 @@ if not exist "%CYTRADE_PYTHON%" (
 )
 
 pushd "%REPO_ROOT%"
-"%CYTRADE_PYTHON%" -m strategies.main_seal_follow.scripts.run_monitor_session --pool-output "data\stock_pools\manual\main_seal_follow_manual_pool.csv" --skip-pool-collect %*
+"%CYTRADE_PYTHON%" -m strategies.main_seal_follow.scripts.run_monitor_session %*
 set "EXIT_CODE=%ERRORLEVEL%"
 popd
 

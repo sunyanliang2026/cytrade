@@ -199,6 +199,7 @@ def build_app(strategy_classes=None, settings: Settings = None):
     data_sub = DataSubscriptionManager(
         latency_threshold_sec=settings.DATA_LATENCY_THRESHOLD_SEC,
         default_period=settings.SUBSCRIPTION_PERIOD,
+        print_latest_status=not bool(settings.LOG_SUMMARY_MODE),
     )
 
     # ---- 绛栫暐杩愯 ----

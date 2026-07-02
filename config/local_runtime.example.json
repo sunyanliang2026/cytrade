@@ -6,6 +6,7 @@
   "ACCOUNT_PASSWORD": "",
   "CYTRADE_MAIN_SEAL_FOLLOW_CSV_PATH": "C:\\path\\to\\cytrade\\data\\stock_pools\\current\\main_seal_follow_pool.csv",
   "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN": true,
+  "CYTRADE_JUEJIN_SELL_DRY_RUN": true,
   "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION": false,
   "CYTRADE_MAIN_SEAL_FOLLOW_L2_CALIBRATION_DIR": "",
   "RUNTIME_HEARTBEAT_INTERVAL_SEC": 30,

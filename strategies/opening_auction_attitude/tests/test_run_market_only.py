@@ -119,6 +119,7 @@ def test_runner_default_stop_time_covers_open_verify_window():
     assert args.snapshot_interval_sec == 2.0
     assert args.preopen_reference_time == "09:25:15"
     assert args.buy_plan_top_n == 0
+    assert args.small_pool_l2_record_dir == ""
     assert args.install_all is True
 
 
@@ -130,13 +131,21 @@ def test_runner_can_opt_into_dynamic_candidate_scanner():
 
 def test_morning_batch_uses_all_candidate_entry_and_run_artifact_paths():
     repo_root = Path(__file__).resolve().parents[3]
-    text = (repo_root / "scripts" / "run" / "run_opening_auction_attitude_morning.bat").read_text(
-        encoding="utf-8"
-    )
+    canonical = repo_root / "strategies" / "opening_auction_attitude" / "scripts" / "run_morning.bat"
+    text = canonical.read_text(encoding="utf-8")
 
-    assert "--install-all" in text
-    assert "--candidate-freeze-time" not in text
+    assert "--dynamic-candidates" in text
+    assert "--install-all" not in text
+    assert "probe_opening_auction_l2.py" not in text
+    assert "--candidate-freeze-time %CANDIDATE_FREEZE_TIME%" in text
+    assert "set CANDIDATE_MIN_AUCTION_AMOUNT=20000000" in text
+    assert "set CANDIDATE_MIN_OPEN_PCT=0" in text
+    assert "set SMALL_POOL_L2_KINDS=l2order,l2transaction" in text
+    assert '--small-pool-l2-record-dir "%PROBE_DIR%"' in text
     assert "snapshot_full_pool.jsonl" in text
+    assert "opening_l2_raw.jsonl" in text
+    assert "opening_l2_summary.csv" in text
+    assert "opening_l2_schema.json" in text
     assert "auction_rankings.csv" in text
     assert "auction_buy_plan.csv" in text
     assert "--preopen-reference-time 09:25:15" in text
@@ -183,7 +192,19 @@ def test_limit_up_scanner_finds_snapshot_hit_once():
 
     def provider(codes):
         calls.append(list(codes))
-        return {"000700": SnapshotTick("000700", last_price=11.0, pre_close=10.0, amount=2_000_000)}
+        return {
+            "000700": SnapshotTick(
+                "000700",
+                last_price=10.1,
+                pre_close=10.0,
+                raw={
+                    "bidPrice": [10.1, 0, 0],
+                    "askPrice": [10.1, 0, 0],
+                    "bidVol": [20_000, 0, 0],
+                    "askVol": [20_000, 0, 0],
+                },
+            )
+        }
 
     scanner = OpeningAuctionLimitUpScanner(
         [PoolEntry("000700", "\u6a21\u5851\u79d1\u6280")],
@@ -201,7 +222,17 @@ def test_limit_up_scanner_ignores_non_hit_snapshot():
     scanner = OpeningAuctionLimitUpScanner(
         [PoolEntry("000700", "\u6a21\u5851\u79d1\u6280")],
         snapshot_provider=lambda codes: {
-            "000700": SnapshotTick("000700", last_price=10.98, pre_close=10.0, amount=2_000_000)
+            "000700": SnapshotTick(
+                "000700",
+                last_price=10.1,
+                pre_close=10.0,
+                raw={
+                    "bidPrice": [10.1, 0, 0],
+                    "askPrice": [10.1, 0, 0],
+                    "bidVol": [1_000, 0, 0],
+                    "askVol": [1_000, 0, 0],
+                },
+            )
         },
         freeze_at=_ts("09:24:30"),
     )
@@ -210,18 +241,51 @@ def test_limit_up_scanner_ignores_non_hit_snapshot():
     assert scanner.candidate_count == 0
 
 
-def test_limit_up_scanner_does_not_add_after_freeze():
+def test_limit_up_scanner_requires_positive_open_pct():
     scanner = OpeningAuctionLimitUpScanner(
         [PoolEntry("000700", "\u6a21\u5851\u79d1\u6280")],
         snapshot_provider=lambda codes: {
-            "000700": SnapshotTick("000700", last_price=11.0, pre_close=10.0, amount=2_000_000)
+            "000700": SnapshotTick(
+                "000700",
+                last_price=10.0,
+                pre_close=10.0,
+                raw={
+                    "bidPrice": [10.0, 0, 0],
+                    "askPrice": [10.0, 0, 0],
+                    "bidVol": [30_000, 0, 0],
+                    "askVol": [30_000, 0, 0],
+                },
+            )
         },
         freeze_at=_ts("09:24:30"),
     )
 
-    assert scanner.scan_once(_ts("09:24:30")) == []
-    assert scanner.scan_once(_ts("09:24:31")) == []
+    assert scanner.scan_once(_ts("09:20:00")) == []
     assert scanner.candidate_count == 0
+
+
+def test_limit_up_scanner_allows_freeze_instant_but_not_after():
+    scanner = OpeningAuctionLimitUpScanner(
+        [PoolEntry("000700", "\u6a21\u5851\u79d1\u6280")],
+        snapshot_provider=lambda codes: {
+            "000700": SnapshotTick(
+                "000700",
+                last_price=10.1,
+                pre_close=10.0,
+                raw={
+                    "bidPrice": [10.1, 0, 0],
+                    "askPrice": [10.1, 0, 0],
+                    "bidVol": [20_000, 0, 0],
+                    "askVol": [20_000, 0, 0],
+                },
+            )
+        },
+        freeze_at=_ts("09:24:30"),
+    )
+
+    assert scanner.scan_once(_ts("09:24:30")) == [PoolEntry("000700", "\u6a21\u5851\u79d1\u6280")]
+    assert scanner.scan_once(_ts("09:24:31")) == []
+    assert scanner.candidate_count == 1
 
 
 def test_limit_up_scanner_records_snapshot_jsonl(tmp_path: Path):
@@ -231,10 +295,16 @@ def test_limit_up_scanner_records_snapshot_jsonl(tmp_path: Path):
         snapshot_provider=lambda codes: {
             "000700": SnapshotTick(
                 "000700",
-                last_price=11.0,
+                last_price=10.1,
                 pre_close=10.0,
-                amount=2_000_000,
-                raw={"lastPrice": 11.0, "lastClose": 10.0},
+                raw={
+                    "lastPrice": 10.1,
+                    "lastClose": 10.0,
+                    "bidPrice": [10.1, 0, 0],
+                    "askPrice": [10.1, 0, 0],
+                    "bidVol": [20_000, 0, 0],
+                    "askVol": [20_000, 0, 0],
+                },
             )
         },
         freeze_at=_ts("09:24:30"),
@@ -248,15 +318,19 @@ def test_limit_up_scanner_records_snapshot_jsonl(tmp_path: Path):
     assert len(rows) == 1
     assert rows[0]["stock"] == "000700"
     assert rows[0]["stock_name"] == "\u6a21\u5851\u79d1\u6280"
-    assert rows[0]["last_price"] == 11.0
+    assert rows[0]["last_price"] == 10.1
     assert rows[0]["limit_up_price"] == 11.0
     assert rows[0]["is_hit"] is True
-    assert rows[0]["raw"]["lastPrice"] == 11.0
+    assert rows[0]["candidate_auction_amount"] == 20_200_000
+    assert round(rows[0]["candidate_open_pct"], 3) == 1.0
+    assert rows[0]["raw"]["lastPrice"] == 10.1
 
 
 def test_full_pool_snapshot_recorder_records_all_returned_candidate_snapshots(tmp_path: Path):
     snapshot_path = tmp_path / "snapshot_scan.jsonl"
     calls = []
+    market_batches = []
+    l2_quote_batches = []
 
     def provider(codes):
         calls.append(list(codes))
@@ -266,13 +340,22 @@ def test_full_pool_snapshot_recorder_records_all_returned_candidate_snapshots(tm
                 last_price=11.0,
                 pre_close=10.0,
                 amount=2_000_000,
-                raw={"lastPrice": 11.0, "lastClose": 10.0},
+                snapshot_time=_ts("09:24:59"),
+                raw={
+                    "lastPrice": 11.0,
+                    "lastClose": 10.0,
+                    "bidPrice": [11.0, 0, 0, 0, 0],
+                    "askPrice": [11.0, 0, 0, 0, 0],
+                    "bidVol": [1000, 200, 0, 0, 0],
+                    "askVol": [1000, 0, 0, 0, 0],
+                },
             ),
             "600000": SnapshotTick(
                 "600000",
                 last_price=9.8,
                 pre_close=10.0,
                 amount=1_000_000,
+                snapshot_time=_ts("09:24:58"),
                 raw={"lastPrice": 9.8, "lastClose": 10.0},
             ),
         }
@@ -281,6 +364,8 @@ def test_full_pool_snapshot_recorder_records_all_returned_candidate_snapshots(tm
         [PoolEntry("000700", "强势股"), PoolEntry("600000", "弱势股")],
         snapshot_provider=provider,
         snapshot_record_path=str(snapshot_path),
+        market_data_consumer=market_batches.append,
+        l2_quote_consumer=l2_quote_batches.append,
     )
 
     assert recorder.record_once(_ts("09:20:00")) == 2
@@ -293,6 +378,13 @@ def test_full_pool_snapshot_recorder_records_all_returned_candidate_snapshots(tm
     assert rows[0]["is_hit"] is True
     assert rows[1]["is_hit"] is False
     assert recorder.rows_written == 2
+    assert set(market_batches[0]) == {"000700", "600000"}
+    assert isinstance(market_batches[0]["000700"], TickData)
+    assert market_batches[0]["000700"].data_time == _ts("09:24:59")
+    assert isinstance(l2_quote_batches[0]["000700"], L2QuoteEvent)
+    assert l2_quote_batches[0]["000700"].bid1 == 11.0
+    assert l2_quote_batches[0]["000700"].ask1 == 11.0
+    assert l2_quote_batches[0]["000700"].bid1_volume == 1000
 
 
 def test_install_observe_strategies_adds_opening_auction_strategy_instances():
@@ -312,6 +404,17 @@ def test_install_observe_strategies_adds_opening_auction_strategy_instances():
     assert isinstance(runner.strategies[0], OpeningAuctionAttitudeStrategy)
     assert runner.strategies[0].stock_code == "000700"
     assert runner.strategies[0].config.params["stock_name"] == "\u6a21\u5851\u79d1\u6280"
+
+
+def test_build_strategy_configs_can_limit_l2_kinds_for_dynamic_candidates():
+    configs = build_strategy_configs(
+        [PoolEntry("000700", "\u6a21\u5851\u79d1\u6280")],
+        l2_kinds={"l2transaction", "l2order"},
+    )
+    strategy = OpeningAuctionAttitudeStrategy(configs[0])
+
+    assert configs[0].params["l2_kinds"] == ["l2order", "l2transaction"]
+    assert strategy.current_data_kinds() == {"tick", "l2order", "l2transaction"}
 
 
 def test_emit_auction_decisions_logs_stock_name_and_observe_only_payload():

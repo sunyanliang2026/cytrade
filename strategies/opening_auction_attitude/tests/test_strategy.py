@@ -33,6 +33,12 @@ def test_required_data_kinds_declares_tick_and_all_l2_channels():
     }
 
 
+def test_current_data_kinds_can_limit_l2_channels_for_dynamic_candidates():
+    strategy = _strategy(l2_kinds=["l2order", "l2transaction"])
+
+    assert strategy.current_data_kinds() == {"tick", "l2order", "l2transaction"}
+
+
 def test_on_tick_is_observe_only_and_records_window_price_point():
     strategy = _strategy()
 
@@ -258,6 +264,33 @@ def test_l2_quote_uses_auction_book_matched_and_unmatched_volumes():
     assert point.unmatched_sell_volume == 301
     assert point.matched_amount == 15.38 * 978 * 100
     assert point.unmatched_sell_amount == 15.38 * 301 * 100
+
+
+def test_reference_metrics_fallback_to_latest_auction_quote_before_0925():
+    strategy = _strategy()
+
+    strategy.on_l2_quote(
+        L2QuoteEvent(
+            stock_code="000001",
+            last_price=10.4,
+            pre_close=10.0,
+            event_time=_ts("09:24:59"),
+            raw_xt_fields={
+                "bidPrice": [10.4, 0.0, 0.0],
+                "askPrice": [10.4, 0.0, 0.0],
+                "bidVol": [30_000, 0, 0],
+                "askVol": [30_000, 100, 0],
+                "amount": 0.0,
+            },
+        )
+    )
+
+    metrics = strategy.build_auction_reference_metrics()
+
+    assert metrics["open_price_0925"] == 10.4
+    assert round(metrics["open_pct"], 2) == 4.0
+    assert metrics["final_auction_amount"] == 10.4 * 30_000 * 100
+    assert metrics["final_amount_source"] == "quote_latest_auction"
 
 
 def test_classify_auction_builds_event_payload_without_trade_signal():

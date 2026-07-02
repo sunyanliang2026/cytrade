@@ -7,11 +7,18 @@ Contents:
 - `strategy.py`: cytrade/QMT strategy implementation. Orders are routed through the shared `TradeExecutor` and existing execution gates.
 - `data/sell_10.csv`: default stock/quantity input copied from the original Juejin strategy.
 - `scripts/run_managed_session.py`: managed-session entry point for running only this strategy from CSV.
+- `scripts/run_managed_session.bat`: one-command Windows entry point for this strategy.
 - `docs/original_juejin_main.py`: original Juejin/GM source for reference only; do not run it inside cytrade.
 - `tests/`: strategy-specific regression tests.
 - `output/`: strategy-owned run artifacts placeholder.
 
-Compatibility wrappers remain under `strategy.juejin_sell_strategy` during migration.
+Canonical one-command entry:
+
+```bat
+strategies\juejin_sell_strategy\scripts\run_managed_session.bat
+```
+
+Strategy-specific files should stay in this package. Root-level compatibility wrappers for this strategy have been removed.
 
 Behavior notes:
 

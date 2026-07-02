@@ -19,10 +19,10 @@ function Resolve-HhMm {
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
-    $RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir "..\.."))
+    $RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir "..\..\.."))
 }
 if ([string]::IsNullOrWhiteSpace($BatchPath)) {
-    $BatchPath = Join-Path $scriptDir "start_main_seal_follow_monitor.bat"
+    $BatchPath = Join-Path $scriptDir "run_monitor_session.bat"
 }
 if (-not (Test-Path -LiteralPath $BatchPath)) {
     throw "Batch launcher not found: $BatchPath"

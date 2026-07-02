@@ -53,7 +53,7 @@ capture_end   = 09:35:00
 文件：
 
 ```text
-scripts/probe/run_opening_auction_l2_probe.bat
+strategies/opening_auction_attitude/scripts/run_l2_probe.bat
 ```
 
 作用：
@@ -221,7 +221,7 @@ cancel_sell_order_amount_10s
 直接运行：
 
 ```powershell
-C:\Users\ysun\workspace\cytrade\scripts\probe\run_opening_auction_l2_probe.bat
+C:\Users\ysun\workspace\cytrade\strategies\opening_auction_attitude\scripts\run_l2_probe.bat
 ```
 
 默认读取：
@@ -240,7 +240,7 @@ data/stock_pools/current/main_seal_follow_pool.csv
 ### 4.2 指定股票运行
 
 ```powershell
-C:\Users\ysun\workspace\cytrade\scripts\probe\run_opening_auction_l2_probe.bat --early-codes 000001,600000
+C:\Users\ysun\workspace\cytrade\strategies\opening_auction_attitude\scripts\run_l2_probe.bat --early-codes 000001,600000
 ```
 
 ### 4.3 立即 smoke test
@@ -248,7 +248,7 @@ C:\Users\ysun\workspace\cytrade\scripts\probe\run_opening_auction_l2_probe.bat -
 不等待交易时间，只验证程序能否启动、连接 xtdata、订阅并生成文件：
 
 ```powershell
-C:\Users\ysun\workspace\cytrade\scripts\probe\run_opening_auction_l2_probe.bat --early-codes 000001 --immediate --seconds 0
+C:\Users\ysun\workspace\cytrade\strategies\opening_auction_attitude\scripts\run_l2_probe.bat --early-codes 000001 --immediate --seconds 0
 ```
 
 ## 5. 已验证结果
@@ -272,7 +272,7 @@ C:\Users\ysun\miniconda3\envs\cytrade311\python.exe -m pytest tests\test_opening
 使用命令：
 
 ```powershell
-cmd /d /c "echo. | C:\Users\ysun\workspace\cytrade\scripts\probe\run_opening_auction_l2_probe.bat --early-codes 000001 --immediate --seconds 0"
+cmd /d /c "echo. | C:\Users\ysun\workspace\cytrade\strategies\opening_auction_attitude\scripts\run_l2_probe.bat --early-codes 000001 --immediate --seconds 0"
 ```
 
 结果：
@@ -340,7 +340,7 @@ logs/opening_auction_l2/
 ```text
 .gitignore
 strategies/opening_auction_attitude/scripts/probe_l2.py
-scripts/probe/run_opening_auction_l2_probe.bat
+strategies/opening_auction_attitude/scripts/run_l2_probe.bat
 strategies/opening_auction_attitude/tests/test_l2_probe.py
 strategies/opening_auction_attitude/docs/handoff_l2_probe_20260605.md
 ```

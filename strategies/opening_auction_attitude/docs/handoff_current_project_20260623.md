@@ -25,7 +25,7 @@ OpeningAuctionAttitude
 一键入口：
 
 ```bat
-scripts\run\run_opening_auction_attitude_morning.bat
+strategies\opening_auction_attitude\scripts\run_morning.bat
 ```
 
 这个 bat 做 4 步：
@@ -95,7 +95,7 @@ source_cache:
 策略代码目录：
 
 ```text
-strategy\opening_auction_attitude\
+strategies\opening_auction_attitude\
   __init__.py
   models.py
   score.py
@@ -105,7 +105,7 @@ strategy\opening_auction_attitude\
 运行脚本：
 
 ```text
-scripts\run\run_opening_auction_attitude_market_only.py
+python -m strategies.opening_auction_attitude.scripts.run_market_only
 ```
 
 当前不是全市场订阅。实现方式是：
@@ -358,13 +358,13 @@ record_many/record_event 如果 closed=True 直接 return。
 一键早盘运行：
 
 ```bat
-scripts\run\run_opening_auction_attitude_morning.bat
+strategies\opening_auction_attitude\scripts\run_morning.bat
 ```
 
 只跑 market-only scanner：
 
 ```powershell
-C:\Users\ysun\miniconda3\envs\cytrade311\python.exe scripts\run\run_opening_auction_attitude_market_only.py --pool data\stock_pools\current\opening_auction_universe.csv --scan-start-time 09:15:00 --candidate-freeze-time 09:24:30 --snapshot-interval-sec 2 --stop-time 09:35:00 --heartbeat-interval-sec 10
+C:\Users\ysun\miniconda3\envs\cytrade311\python.exe -m strategies.opening_auction_attitude.scripts.run_market_only --pool data\stock_pools\current\opening_auction_universe.csv --scan-start-time 09:15:00 --candidate-freeze-time 09:24:30 --snapshot-interval-sec 2 --stop-time 09:35:00 --heartbeat-interval-sec 10
 ```
 
 构建开盘竞价大池：

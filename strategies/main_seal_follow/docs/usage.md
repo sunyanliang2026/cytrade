@@ -200,7 +200,7 @@ run_scheduler_service(strategy_classes=[MainSealFollowStrategy])
 `09:15` 再启动策略运行，可以使用专用会话入口：
 
 ```powershell
-scripts\ops\start_main_seal_follow_managed_session.bat --pool-time 08:50 --strategy-start-time 09:15 --stop-time 23:00
+strategies\main_seal_follow\scripts\run_managed_session.bat --pool-time 08:50 --strategy-start-time 09:15 --stop-time 23:00
 ```
 
 这个入口会：
@@ -213,7 +213,7 @@ scripts\ops\start_main_seal_follow_managed_session.bat --pool-time 08:50 --strat
 如果只想复用一份现成的手工股票池，不走盘前自动生成，可以直接运行：
 
 ```powershell
-scripts\ops\start_main_seal_follow_manual_monitor.bat
+strategies\main_seal_follow\scripts\run_manual_monitor.bat
 ```
 
 这个入口默认：
@@ -226,7 +226,7 @@ scripts\ops\start_main_seal_follow_manual_monitor.bat
 如果账户里已经真实有委托或持仓，想让系统接管并继续检测同一份手工池，可以运行：
 
 ```powershell
-scripts\ops\start_main_seal_follow_manual_managed.bat
+strategies\main_seal_follow\scripts\run_manual_managed.bat
 ```
 
 这个入口默认：
@@ -305,9 +305,8 @@ Market-only dry-run should be started with:
 python -m strategies.main_seal_follow.scripts.run_market_only
 ```
 
-The old compatibility wrapper `scripts\run\run_main_seal_follow_market_only.py`
-remains available during migration. The canonical module is intended for market
-data / Level2 / signal validation only. It does not connect the trading account.
+The canonical module is intended for market data / Level2 / signal validation
+only. It does not connect the trading account.
 
 Every runtime checks heartbeat state every 30 seconds by default.
 If the key runtime state changes, it logs immediately; if the state stays the

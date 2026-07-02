@@ -14,6 +14,31 @@ def format_dt(value) -> str:
     return str(value)
 
 
+def _build_heartbeat_signature(
+    settings,
+    runner_status: dict,
+    subscription_count: int,
+    l2_map: dict,
+    *,
+    connected: bool,
+    trading_ready: bool,
+    conn_last_error: dict,
+) -> tuple:
+    """Build a status signature without volatile per-tick timestamps."""
+    return (
+        bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True)),
+        connected,
+        trading_ready,
+        conn_last_error.get("stage", ""),
+        conn_last_error.get("return_code", ""),
+        runner_status.get("strategy_count", ""),
+        subscription_count,
+        len(l2_map),
+        sum(len(kinds) for kinds in l2_map.values()),
+        runner_status.get("last_strategy_event", ""),
+    )
+
+
 def start_runtime_heartbeat(ctx: dict, stop_event: threading.Event, mode: str) -> threading.Thread:
     """Log operational heartbeats so quiet markets are distinguishable from hangs."""
     logger = get_logger("system")
@@ -21,6 +46,7 @@ def start_runtime_heartbeat(ctx: dict, stop_event: threading.Event, mode: str) -
     runner = ctx["runner"]
     data_sub = ctx["data_sub"]
     conn_mgr = ctx.get("conn_mgr")
+    watchdog = ctx.get("watchdog")
     interval = max(5, int(getattr(settings, "RUNTIME_HEARTBEAT_INTERVAL_SEC", 30) or 30))
     stable_repeat = max(1, int(getattr(settings, "RUNTIME_HEARTBEAT_STABLE_REPEAT", 4) or 4))
 
@@ -29,26 +55,23 @@ def start_runtime_heartbeat(ctx: dict, stop_event: threading.Event, mode: str) -
         unchanged_count = 0
         while not stop_event.wait(interval):
             try:
+                if watchdog and hasattr(watchdog, "register_heartbeat"):
+                    watchdog.register_heartbeat("strategy_runner")
                 l2_map = data_sub.get_l2_subscription_map()
                 data_status = data_sub.get_latest_data_status()
                 runner_status = runner.get_runtime_status() if hasattr(runner, "get_runtime_status") else {}
                 conn_last_error = conn_mgr.get_last_error() if conn_mgr and hasattr(conn_mgr, "get_last_error") else {}
                 trading_ready = bool(conn_mgr.is_trading_ready()) if conn_mgr and hasattr(conn_mgr, "is_trading_ready") else False
-                signature = (
-                    bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True)),
-                    bool(conn_mgr.is_connected()) if conn_mgr else False,
-                    trading_ready,
-                    conn_last_error.get("stage", ""),
-                    conn_last_error.get("return_code", ""),
-                    runner_status.get("strategy_count", ""),
-                    len(data_sub.get_subscription_list()),
-                    len(l2_map),
-                    sum(len(kinds) for kinds in l2_map.values()),
-                    format_dt(data_status.get("latest_data_time")),
-                    format_dt(data_status.get("last_recv_time")),
-                    round(float(data_status.get("data_delay_ms", 0.0) or 0.0), 0),
-                    runner_status.get("last_strategy_event", ""),
-                    format_dt(runner_status.get("last_strategy_event_time")),
+                connected = bool(conn_mgr.is_connected()) if conn_mgr else False
+                subscription_count = len(data_sub.get_subscription_list())
+                signature = _build_heartbeat_signature(
+                    settings,
+                    runner_status,
+                    subscription_count,
+                    l2_map,
+                    connected=connected,
+                    trading_ready=trading_ready,
+                    conn_last_error=conn_last_error,
                 )
                 changed = signature != last_signature
                 if changed:
@@ -73,12 +96,12 @@ def start_runtime_heartbeat(ctx: dict, stop_event: threading.Event, mode: str) -
                     heartbeat_reason,
                     stable_for_sec,
                     bool(getattr(settings, "CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN", True)),
-                    bool(conn_mgr.is_connected()) if conn_mgr else False,
+                    connected,
                     trading_ready,
                     conn_last_error.get("stage", ""),
                     conn_last_error.get("return_code", ""),
                     runner_status.get("strategy_count", ""),
-                    len(data_sub.get_subscription_list()),
+                    subscription_count,
                     len(l2_map),
                     sum(len(kinds) for kinds in l2_map.values()),
                     format_dt(data_status.get("latest_data_time")),

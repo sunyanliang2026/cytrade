@@ -1,6 +1,7 @@
 """Observe-only opening auction attitude strategy."""
 from __future__ import annotations
 
+import re
 from datetime import datetime, time
 from typing import Any
 
@@ -108,10 +109,27 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         self._last_open_decision: OpenVerifyDecision | None = None
         self._last_event_payload: dict[str, Any] | None = None
         self._quote_volume_unit = float(params.get("quote_volume_unit", 100) or 100)
+        self._current_data_kinds = self._parse_current_data_kinds(params.get("l2_kinds"))
 
     @classmethod
     def required_data_kinds(cls) -> set[str]:
         return {"tick", "l2quote", "l2transaction", "l2order", "l2orderqueue"}
+
+    @staticmethod
+    def _parse_current_data_kinds(raw_l2_kinds: Any) -> set[str] | None:
+        if raw_l2_kinds is None:
+            return None
+        if isinstance(raw_l2_kinds, str):
+            values = re.split(r"[,;\s]+", raw_l2_kinds)
+        else:
+            values = list(raw_l2_kinds or [])
+        supported_l2 = {"l2quote", "l2transaction", "l2order", "l2orderqueue"}
+        l2_kinds = {str(value or "").strip().lower() for value in values}
+        l2_kinds = {value for value in l2_kinds if value in supported_l2}
+        return {"tick", *l2_kinds}
+
+    def current_data_kinds(self) -> set[str]:
+        return set(self._current_data_kinds or self.required_data_kinds())
 
     def on_tick(self, tick: TickData) -> None:
         if tick.stock_code != self.stock_code:
@@ -396,23 +414,29 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         return self._score_config.window_start <= clock <= self._score_config.window_end
 
     def build_auction_reference_metrics(self) -> dict[str, Any]:
-        final_amount = self._final_auction_quote_amount or self._final_tx_amount
+        latest_auction_point = self._latest_auction_point()
+        fallback_final_price = float(latest_auction_point.price or 0.0) if latest_auction_point else 0.0
+        fallback_final_amount = float(latest_auction_point.matched_amount or 0.0) if latest_auction_point else 0.0
+        final_price = float(self._open_price_0925 or fallback_final_price or 0.0)
+        final_amount = self._final_auction_quote_amount or fallback_final_amount or self._final_tx_amount
         open_pct = 0.0
-        if self._pre_close > 0 and self._open_price_0925 > 0:
-            open_pct = (self._open_price_0925 / self._pre_close - 1.0) * 100.0
+        if self._pre_close > 0 and final_price > 0:
+            open_pct = (final_price / self._pre_close - 1.0) * 100.0
         final_vs_low_pct = 0.0
-        if self._post_0920_low_price > 0 and self._open_price_0925 > 0:
-            final_vs_low_pct = (self._open_price_0925 / self._post_0920_low_price - 1.0) * 100.0
+        if self._post_0920_low_price > 0 and final_price > 0:
+            final_vs_low_pct = (final_price / self._post_0920_low_price - 1.0) * 100.0
         tx_detail_available = self._final_tx_amount > 0 and self._final_tx_count > 0
         if self._final_auction_quote_amount > 0:
             final_amount_source = "quote_0925"
+        elif fallback_final_amount > 0:
+            final_amount_source = "quote_latest_auction"
         elif self._final_tx_amount > 0:
             final_amount_source = "l2transaction_sum"
         else:
             final_amount_source = ""
         return {
             "pre_close": float(self._pre_close or 0.0),
-            "open_price_0925": float(self._open_price_0925 or 0.0),
+            "open_price_0925": final_price,
             "open_pct": open_pct,
             "post_0920_low_price": float(self._post_0920_low_price or 0.0),
             "post_0920_low_time": self._post_0920_low_time.strftime("%H:%M:%S") if self._post_0920_low_time else "",
@@ -420,7 +444,7 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
             "final_auction_amount": float(final_amount or 0.0),
             "final_amount_gt_3000w": final_amount > 30_000_000,
             "final_price_gt_post_0920_low": (
-                self._post_0920_low_price > 0 and self._open_price_0925 > self._post_0920_low_price
+                self._post_0920_low_price > 0 and final_price > self._post_0920_low_price
             ),
             "open_pct_gt_3": open_pct > 3.0,
             "final_amount_source": final_amount_source,
@@ -439,6 +463,17 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
             "final_from_limit_up_bid_amount": float(self._final_from_limit_up_bid_amount or 0.0),
             "final_from_limit_up_bid_pct": self._amount_pct(self._final_from_limit_up_bid_amount, self._final_tx_amount),
         }
+
+    def _latest_auction_point(self) -> AuctionPricePoint | None:
+        auction_points = [
+            point
+            for point in self._price_points
+            if point.event_time is None or self._in_auction_window(point.event_time)
+        ]
+        if not auction_points:
+            return None
+        auction_points.sort(key=lambda item: (item.event_time is None, item.event_time or datetime.min))
+        return auction_points[-1]
 
     def _in_final_auction_result_window(self, event_time: datetime | None) -> bool:
         if event_time is None:
