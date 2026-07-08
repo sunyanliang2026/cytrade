@@ -1,5 +1,6 @@
 from datetime import datetime
 
+import core.data_subscription as data_subscription_module
 from core.connection import ConnectionManager
 from core.data_subscription import DataSubscriptionManager
 from core.l2_models import L2OrderEvent, L2OrderQueueEvent, L2QuoteEvent, L2TransactionEvent
@@ -184,6 +185,42 @@ def test_data_subscription_can_disable_latest_status_console_print(monkeypatch):
     manager.push_mock_tick("000001", 10.0)
 
     assert calls == []
+
+
+def test_l2_subscription_diagnostics_record_sub_ids(monkeypatch):
+    class FakeXtData:
+        def __init__(self):
+            self.calls = []
+
+        def connect(self):
+            return object()
+
+        def get_data_dir(self):
+            return "fake-data-dir"
+
+        def subscribe_quote(self, xt_code, period, count, callback):
+            self.calls.append((xt_code, period, count, callback))
+            if period == "l2transaction":
+                return None
+            return 123
+
+    fake_xtdata = FakeXtData()
+    monkeypatch.setattr(data_subscription_module, "_XT_AVAILABLE", True)
+    monkeypatch.setattr(data_subscription_module, "xtdata", fake_xtdata)
+
+    manager = DataSubscriptionManager()
+    manager.subscribe_l2_stocks(["000001"], kinds=["l2order", "l2transaction"])
+
+    diagnostics = {
+        item["kind"]: item
+        for item in manager.get_l2_subscription_diagnostics()
+        if item["stock"] == "000001"
+    }
+    assert diagnostics["l2order"]["xt_code"] == "000001.SZ"
+    assert diagnostics["l2order"]["sub_id"] == 123
+    assert diagnostics["l2order"]["status"] == "SUBSCRIBED"
+    assert diagnostics["l2transaction"]["sub_id"] == -1
+    assert diagnostics["l2transaction"]["status"] == "INVALID_SUB_ID"
 
 
 def test_connection_manager_exposes_startup_diagnostics_without_secrets():

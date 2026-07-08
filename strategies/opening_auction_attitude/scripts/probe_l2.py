@@ -167,6 +167,7 @@ class OpeningAuctionL2Recorder:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.raw_path = output_dir / "opening_l2_raw.jsonl"
         self.summary_path = output_dir / "opening_l2_summary.csv"
+        self.health_path = output_dir / "l2_subscription_health.csv"
         self.schema_path = output_dir / "opening_l2_schema.json"
         self.capture_start = parse_clock(capture_start)
         self.capture_end = parse_clock(capture_end)
@@ -179,12 +180,32 @@ class OpeningAuctionL2Recorder:
         self._raw_handle = self.raw_path.open("a", encoding="utf-8", newline="")
         self._rows: list[dict[str, Any]] = []
         self._schema: dict[str, Counter[str]] = defaultdict(Counter)
+        self._closed = False
+        self._expected_codes: dict[str, str] = {}
+        self._subscription_diagnostics: list[dict[str, Any]] = []
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._raw_handle.close()
 
+    def set_expected_codes(self, codes: Iterable[str], *, mode: str = "dynamic_small_pool") -> None:
+        with self._lock:
+            for code in codes:
+                normalized = normalize_stock_code(code)
+                if normalized:
+                    self._expected_codes[normalized] = mode
+
+    def set_subscription_diagnostics(self, diagnostics: Iterable[dict[str, Any]]) -> None:
+        with self._lock:
+            self._subscription_diagnostics = [dict(item) for item in diagnostics]
+
     def record_many(self, kind: str, mode: str, events_by_code: dict[str, Any]) -> None:
+        with self._lock:
+            if self._closed:
+                return
         for code, payload in events_by_code.items():
             if isinstance(payload, list):
                 for event in payload:
@@ -215,6 +236,8 @@ class OpeningAuctionL2Recorder:
             "raw": to_jsonable(raw_fields),
         }
         with self._lock:
+            if self._closed:
+                return
             self._rows.append(row)
             self._schema[kind].update(str(key) for key in raw_fields.keys())
             self._raw_handle.write(json.dumps(to_jsonable(row), ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -264,6 +287,14 @@ class OpeningAuctionL2Recorder:
             for row in summary_rows:
                 writer.writerow({key: row.get(key, "") for key in fieldnames})
 
+        health_rows = self.build_health_rows(summary_rows)
+        with self.health_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            fieldnames = self.health_fieldnames()
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in health_rows:
+                writer.writerow({key: row.get(key, "") for key in fieldnames})
+
         schema_payload = {
             kind: [{"field": field, "count": count} for field, count in counter.most_common()]
             for kind, counter in sorted(self._schema.items())
@@ -274,6 +305,7 @@ class OpeningAuctionL2Recorder:
         grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         with self._lock:
             rows = list(self._rows)
+            expected_codes = dict(self._expected_codes)
         for row in rows:
             grouped[(str(row["stock"]), str(row["subscribe_mode"]))].append(row)
 
@@ -305,6 +337,113 @@ class OpeningAuctionL2Recorder:
 
             self._fill_big_trade_metrics(row, group_rows)
             result.append(row)
+        existing = {(str(row["stock"]), str(row["l2_subscribe_mode"])) for row in result}
+        for stock, mode in sorted(expected_codes.items()):
+            key = (stock, mode)
+            if key in existing:
+                continue
+            row = {
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "stock": stock,
+                "l2_subscribe_mode": mode,
+                "has_l2_capture": False,
+                "has_l2_auction": False,
+                "has_l2_2450_2500": False,
+                "has_l2_open_5m": False,
+            }
+            for kind in DEFAULT_KINDS:
+                row[f"{kind}_count_total"] = 0
+                row[f"{kind}_count_capture"] = 0
+                row[f"{kind}_count_auction"] = 0
+                row[f"{kind}_count_10s"] = 0
+                row[f"{kind}_count_open_5m"] = 0
+            self._fill_big_trade_metrics(row, [])
+            result.append(row)
+        return result
+
+    def build_health_rows(self, summary_rows: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        summary_rows = summary_rows if summary_rows is not None else self.build_summary_rows()
+        with self._lock:
+            diagnostics = [dict(item) for item in self._subscription_diagnostics]
+            rows = list(self._rows)
+            expected_codes = dict(self._expected_codes)
+
+        diag_by_key = {
+            (normalize_stock_code(item.get("stock")), str(item.get("kind") or "").strip().lower()): item
+            for item in diagnostics
+        }
+        first_event: dict[tuple[str, str], datetime] = {}
+        last_event: dict[tuple[str, str], datetime] = {}
+        for row in rows:
+            stock = str(row.get("stock") or "")
+            kind = str(row.get("kind") or "")
+            event_time = row.get("event_time") or row.get("recv_time")
+            if not isinstance(event_time, datetime):
+                continue
+            key = (stock, kind)
+            if key not in first_event or event_time < first_event[key]:
+                first_event[key] = event_time
+            if key not in last_event or event_time > last_event[key]:
+                last_event[key] = event_time
+
+        summary_by_stock = {str(row.get("stock") or ""): row for row in summary_rows}
+        stocks = sorted(set(expected_codes) | set(summary_by_stock))
+        result = []
+        for stock in stocks:
+            summary = summary_by_stock.get(stock, {})
+            order_diag = diag_by_key.get((stock, "l2order"), {})
+            tx_diag = diag_by_key.get((stock, "l2transaction"), {})
+            order_count = int(summary.get("l2order_count_total") or 0)
+            tx_count = int(summary.get("l2transaction_count_total") or 0)
+            order_status = str(order_diag.get("status") or "")
+            tx_status = str(tx_diag.get("status") or "")
+            has_events = order_count > 0 or tx_count > 0
+            invalid_sub_id = order_status == "INVALID_SUB_ID" or tx_status == "INVALID_SUB_ID"
+            subscribe_exception = order_status == "SUBSCRIBE_EXCEPTION" or tx_status == "SUBSCRIBE_EXCEPTION"
+            xt_unavailable = order_status == "XT_UNAVAILABLE" or tx_status == "XT_UNAVAILABLE"
+            if subscribe_exception:
+                status = "SUBSCRIBE_EXCEPTION"
+            elif xt_unavailable:
+                status = "XT_UNAVAILABLE"
+            elif invalid_sub_id:
+                status = "INVALID_SUB_ID"
+            elif has_events:
+                status = "SUBSCRIBED_WITH_EVENTS"
+            else:
+                status = "SUBSCRIBED_NO_EVENTS"
+            result.append(
+                {
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "stock": stock,
+                    "l2_subscribe_mode": summary.get("l2_subscribe_mode") or expected_codes.get(stock, ""),
+                    "status": status,
+                    "l2order_sub_id": order_diag.get("sub_id", ""),
+                    "l2transaction_sub_id": tx_diag.get("sub_id", ""),
+                    "l2order_subscribe_start": self._format_dt(order_diag.get("subscribe_start")),
+                    "l2transaction_subscribe_start": self._format_dt(tx_diag.get("subscribe_start")),
+                    "l2order_duration_ms": order_diag.get("duration_ms", ""),
+                    "l2transaction_duration_ms": tx_diag.get("duration_ms", ""),
+                    "first_l2order_time": self._format_dt(first_event.get((stock, "l2order"))),
+                    "first_l2transaction_time": self._format_dt(first_event.get((stock, "l2transaction"))),
+                    "last_l2_event_time": self._format_dt(
+                        max(
+                            [
+                                value
+                                for value in (
+                                    last_event.get((stock, "l2order")),
+                                    last_event.get((stock, "l2transaction")),
+                                )
+                                if value is not None
+                            ],
+                            default=None,
+                        )
+                    ),
+                    "l2order_count": order_count,
+                    "l2transaction_count": tx_count,
+                    "l2order_error": order_diag.get("error", ""),
+                    "l2transaction_error": tx_diag.get("error", ""),
+                }
+            )
         return result
 
     def _fill_big_trade_metrics(self, row: dict[str, Any], group_rows: list[dict[str, Any]]) -> None:
@@ -403,6 +542,34 @@ class OpeningAuctionL2Recorder:
             ]
         )
         return fields
+
+    @staticmethod
+    def health_fieldnames() -> list[str]:
+        return [
+            "date",
+            "stock",
+            "l2_subscribe_mode",
+            "status",
+            "l2order_sub_id",
+            "l2transaction_sub_id",
+            "l2order_subscribe_start",
+            "l2transaction_subscribe_start",
+            "l2order_duration_ms",
+            "l2transaction_duration_ms",
+            "first_l2order_time",
+            "first_l2transaction_time",
+            "last_l2_event_time",
+            "l2order_count",
+            "l2transaction_count",
+            "l2order_error",
+            "l2transaction_error",
+        ]
+
+    @staticmethod
+    def _format_dt(value: Any) -> str:
+        if isinstance(value, datetime):
+            return value.isoformat(sep=" ", timespec="milliseconds")
+        return ""
 
 
 def infer_side_from_mapping(item: dict[str, Any]) -> str:

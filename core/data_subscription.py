@@ -46,6 +46,7 @@ class DataSubscriptionManager:
         self._subscription_ids: Dict[str, int] = {}
         self._l2_subscriptions: Dict[str, set[str]] = {}
         self._l2_subscription_ids: Dict[tuple[str, str], int] = {}
+        self._l2_subscription_diagnostics: Dict[tuple[str, str], dict] = {}
 
         self._data_callback: Optional[Callable[[Dict[str, TickData]], None]] = None
         self._l2_quote_callback: Optional[Callable[[Dict[str, L2QuoteEvent]], None]] = None
@@ -126,28 +127,106 @@ class DataSubscriptionManager:
                 self._l2_subscriptions.setdefault(code, set()).update(requested_kinds)
 
         if not _XT_AVAILABLE:
+            now = datetime.now()
+            with self._lock:
+                for code, xt_code in zip(stock_codes, xt_codes):
+                    for kind in requested_kinds:
+                        self._l2_subscription_diagnostics[(code, kind)] = {
+                            "stock": code,
+                            "kind": kind,
+                            "xt_code": xt_code,
+                            "subscribe_start": now,
+                            "subscribe_end": now,
+                            "duration_ms": 0.0,
+                            "sub_id": "",
+                            "status": "XT_UNAVAILABLE",
+                            "error": "xtquant not installed",
+                        }
             logger.warning("DataSubscription: xtquant not installed, skip real Level2 subscribe")
             return
 
         try:
             self._ensure_xtdata_connected()
-            for code, xt_code in zip(stock_codes, xt_codes):
-                for kind in requested_kinds:
-                    self._subscribe_xt_quote(
+        except Exception as e:
+            now = datetime.now()
+            with self._lock:
+                for code, xt_code in zip(stock_codes, xt_codes):
+                    for kind in requested_kinds:
+                        self._l2_subscription_diagnostics[(code, kind)] = {
+                            "stock": code,
+                            "kind": kind,
+                            "xt_code": xt_code,
+                            "subscribe_start": now,
+                            "subscribe_end": now,
+                            "duration_ms": 0.0,
+                            "sub_id": "",
+                            "status": "SUBSCRIBE_EXCEPTION",
+                            "error": str(e),
+                        }
+            logger.error("DataSubscription: subscribe_l2_stocks connect failed: %s", e, exc_info=True)
+            return
+
+        subscribed = 0
+        for code, xt_code in zip(stock_codes, xt_codes):
+            for kind in requested_kinds:
+                start = datetime.now()
+                diagnostic = {
+                    "stock": code,
+                    "kind": kind,
+                    "xt_code": xt_code,
+                    "subscribe_start": start,
+                    "subscribe_end": None,
+                    "duration_ms": 0.0,
+                    "sub_id": "",
+                    "status": "SUBSCRIBE_EXCEPTION",
+                    "error": "",
+                }
+                try:
+                    sub_id = self._subscribe_xt_quote(
                         subscribe_key=(code, kind),
                         xt_code=xt_code,
                         period=kind,
                         callback=self._get_l2_callback(kind),
                         subscription_ids=self._l2_subscription_ids,
                     )
-            logger.info(
-                "DataSubscription: subscribed %d stocks for Level2 kinds=%s stocks=%s",
-                len(stock_codes),
-                ",".join(sorted(requested_kinds)),
-                ",".join(stock_codes),
-            )
-        except Exception as e:
-            logger.error("DataSubscription: subscribe_l2_stocks failed: %s", e, exc_info=True)
+                    end = datetime.now()
+                    diagnostic.update(
+                        {
+                            "subscribe_end": end,
+                            "duration_ms": round((end - start).total_seconds() * 1000, 3),
+                            "sub_id": sub_id,
+                            "status": "SUBSCRIBED" if int(sub_id or 0) > 0 else "INVALID_SUB_ID",
+                        }
+                    )
+                    subscribed += 1
+                except Exception as e:
+                    end = datetime.now()
+                    diagnostic.update(
+                        {
+                            "subscribe_end": end,
+                            "duration_ms": round((end - start).total_seconds() * 1000, 3),
+                            "error": str(e),
+                        }
+                    )
+                    logger.error(
+                        "DataSubscription: subscribe_l2_stocks failed stock=%s kind=%s xt_code=%s error=%s",
+                        code,
+                        kind,
+                        xt_code,
+                        e,
+                        exc_info=True,
+                    )
+                finally:
+                    with self._lock:
+                        self._l2_subscription_diagnostics[(code, kind)] = diagnostic
+
+        logger.info(
+            "DataSubscription: subscribed %d/%d Level2 streams kinds=%s stocks=%s",
+            subscribed,
+            len(stock_codes) * len(requested_kinds),
+            ",".join(sorted(requested_kinds)),
+            ",".join(stock_codes),
+        )
 
     def unsubscribe_l2_stocks(
         self,
@@ -214,6 +293,11 @@ class DataSubscriptionManager:
                 for code, kinds in self._l2_subscriptions.items()
                 if kinds
             }
+
+    def get_l2_subscription_diagnostics(self) -> List[dict]:
+        """Return per-stock/per-kind Level2 subscribe diagnostics."""
+        with self._lock:
+            return [dict(item) for item in self._l2_subscription_diagnostics.values()]
 
     def set_data_callback(self, callback: Callable[[Dict[str, TickData]], None]) -> None:
         self._data_callback = callback
@@ -530,7 +614,7 @@ class DataSubscriptionManager:
         period: str,
         callback,
         subscription_ids: dict,
-    ) -> None:
+    ) -> int:
         old_sub_id = subscription_ids.get(subscribe_key)
         if old_sub_id is not None:
             try:
@@ -543,7 +627,9 @@ class DataSubscriptionManager:
             count=-1,
             callback=callback,
         )
-        subscription_ids[subscribe_key] = int(sub_id) if sub_id is not None else -1
+        normalized_sub_id = int(sub_id) if sub_id is not None else -1
+        subscription_ids[subscribe_key] = normalized_sub_id
+        return normalized_sub_id
 
     def _get_l2_callback(self, kind: str):
         callback_map = {

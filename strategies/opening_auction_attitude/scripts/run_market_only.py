@@ -45,7 +45,7 @@ from strategies.opening_auction_attitude.scripts.probe_l2 import OpeningAuctionL
 from scripts.pool.common import limit_up_price as calc_limit_up_price
 
 
-DEFAULT_POOL = "data/stock_pools/current/opening_auction_universe.csv"
+DEFAULT_POOL = "strategies/opening_auction_attitude/data/opening_auction_universe.csv"
 SESSION_EVENT_PREFIX = "OPENING_AUCTION_ATTITUDE_SESSION"
 EVENT_NAME = "MSF_AUCTION_ATTITUDE"
 RANKING_EVENT_NAME = "MSF_AUCTION_RANKING"
@@ -67,10 +67,10 @@ AUCTION_LABEL_BONUS = {
 DEFAULT_BUY_PLAN_TOP_N = 0
 DEFAULT_BUY_PLAN_MIN_SCORE = 75.0
 DEFAULT_BUY_PLAN_AMOUNT = 0.0
-MIN_FILTER_FINAL_AUCTION_AMOUNT = 30_000_000.0
-MIN_FILTER_OPEN_PCT = 3.0
-DEFAULT_CANDIDATE_MIN_AUCTION_AMOUNT = 20_000_000.0
-DEFAULT_CANDIDATE_MIN_OPEN_PCT = 0.0
+MIN_FILTER_FINAL_AUCTION_AMOUNT = 15_000_000.0
+MIN_FILTER_OPEN_PCT = 4.0
+DEFAULT_CANDIDATE_MIN_AUCTION_AMOUNT = 5_000_000.0
+DEFAULT_CANDIDATE_MIN_OPEN_PCT = 1.0
 DYNAMIC_CANDIDATE_L2_KINDS = frozenset({"l2order", "l2transaction"})
 RANKING_HEADERS = [
     "rank",
@@ -90,17 +90,15 @@ RANKING_HEADERS = [
     "post_0920_low_time",
     "final_vs_post_0920_low_pct",
     "final_auction_amount",
-    "filter_final_amount_gt_3000w",
+    "filter_final_amount_gt_1500w",
     "filter_final_price_gt_post_0920_low",
-    "filter_open_pct_gt_3",
+    "filter_open_pct_gt_4",
     "final_amount_source",
     "tx_detail_available",
+    "l2_detail_status",
     "final_tx_amount",
     "final_tx_count",
     "last10_bid_amount",
-    "last20_bid_amount",
-    "final_from_last20_bid_amount",
-    "final_from_last20_bid_pct",
     "final_from_last10_bid_amount",
     "final_from_last10_bid_pct",
     "limit_up_price",
@@ -124,9 +122,9 @@ BUY_PLAN_HEADERS = [
     "post_0920_low_time",
     "open_pct",
     "final_auction_amount",
+    "tx_detail_available",
+    "l2_detail_status",
     "last10_bid_amount",
-    "last20_bid_amount",
-    "final_from_last20_bid_pct",
     "final_from_last10_bid_pct",
     "final_from_limit_up_bid_pct",
     "auction_rank_score",
@@ -145,9 +143,8 @@ MATCHED_CANDIDATE_HEADERS = [
     "9:20\u540e\u4f4e\u70b9",
     "\u4f4e\u70b9\u65f6\u95f4",
     "\u6700\u7ec8\u8f83\u4f4e\u70b9\u6da8\u5e45%",
+    "L2\u660e\u7ec6\u72b6\u6001",
     "\u5c3e10\u79d2\u7ade\u4e70\u989d(\u4e07)",
-    "\u5c3e20\u79d2\u7ade\u4e70\u989d(\u4e07)",
-    "\u5c3e20\u79d2\u4e70\u5355\u6210\u4ea4\u5360\u6bd4%",
     "\u5c3e10\u79d2\u4e70\u5355\u6210\u4ea4\u5360\u6bd4%",
     "\u6da8\u505c\u4ef7\u4e70\u5165\u5360\u6bd4%",
 ]
@@ -522,6 +519,10 @@ class OpeningAuctionLimitUpScanner:
         return len(self._candidate_codes)
 
     @property
+    def candidate_codes(self) -> list[str]:
+        return sorted(self._candidate_codes)
+
+    @property
     def universe_count(self) -> int:
         return len(self._entries)
 
@@ -854,14 +855,25 @@ def _condition_filter(reference: dict[str, Any]) -> tuple[bool, str]:
     post_low = float(reference.get("post_0920_low_price", 0.0) or 0.0)
     open_pct = float(reference.get("open_pct", 0.0) or 0.0)
     checks = {
-        "final_amount_gt_3000w": final_amount > MIN_FILTER_FINAL_AUCTION_AMOUNT,
+        "final_amount_gt_1500w": final_amount > MIN_FILTER_FINAL_AUCTION_AMOUNT,
         "final_price_gt_post_0920_low": post_low > 0 and final_price > post_low,
-        "open_pct_gt_3": open_pct > MIN_FILTER_OPEN_PCT,
+        "open_pct_gt_4": open_pct > MIN_FILTER_OPEN_PCT,
+        "tx_detail_available": bool(reference.get("tx_detail_available")),
     }
     if all(checks.values()):
         return True, "condition_filter_matched"
     failed = [name for name, passed in checks.items() if not passed]
     return False, "condition_filter_failed:" + ",".join(failed)
+
+
+def _l2_detail_status(strategy: OpeningAuctionAttitudeStrategy, reference: dict[str, Any]) -> str:
+    if bool(reference.get("tx_detail_available")):
+        return "TX_DETAIL_AVAILABLE"
+    l2order_count = int(getattr(strategy, "_l2order_count", 0) or 0)
+    l2transaction_count = int(getattr(strategy, "_l2transaction_count", 0) or 0)
+    if l2order_count <= 0 and l2transaction_count <= 0:
+        return "L2_MISSING"
+    return "TX_DETAIL_MISSING"
 
 
 def build_auction_rankings(
@@ -884,6 +896,8 @@ def build_auction_rankings(
             or evidence.get("has_unmatched_sell_pressure")
         )
         plan_eligible, filter_reason = _condition_filter(reference)
+        tx_detail_available = bool(reference.get("tx_detail_available"))
+        l2_detail_status = _l2_detail_status(strategy, reference)
         rows.append(
             {
                 "rank": 0,
@@ -903,22 +917,28 @@ def build_auction_rankings(
                 "post_0920_low_time": str(reference.get("post_0920_low_time") or ""),
                 "final_vs_post_0920_low_pct": _to_output_float(reference.get("final_vs_post_0920_low_pct"), 2),
                 "final_auction_amount": _to_output_float(reference.get("final_auction_amount"), 2),
-                "filter_final_amount_gt_3000w": bool(reference.get("final_amount_gt_3000w")),
+                "filter_final_amount_gt_1500w": bool(reference.get("final_amount_gt_1500w")),
                 "filter_final_price_gt_post_0920_low": bool(reference.get("final_price_gt_post_0920_low")),
-                "filter_open_pct_gt_3": bool(reference.get("open_pct_gt_3")),
+                "filter_open_pct_gt_4": bool(reference.get("open_pct_gt_4")),
                 "final_amount_source": str(reference.get("final_amount_source") or ""),
-                "tx_detail_available": bool(reference.get("tx_detail_available")),
-                "final_tx_amount": _to_output_float(reference.get("final_tx_amount"), 2),
-                "final_tx_count": int(reference.get("final_tx_count", 0) or 0),
-                "last10_bid_amount": _to_output_float(reference.get("last10_bid_amount"), 2),
-                "last20_bid_amount": _to_output_float(reference.get("last20_bid_amount"), 2),
-                "final_from_last20_bid_amount": _to_output_float(reference.get("final_from_last20_bid_amount"), 2),
-                "final_from_last20_bid_pct": _to_output_float(reference.get("final_from_last20_bid_pct"), 2),
-                "final_from_last10_bid_amount": _to_output_float(reference.get("final_from_last10_bid_amount"), 2),
-                "final_from_last10_bid_pct": _to_output_float(reference.get("final_from_last10_bid_pct"), 2),
+                "tx_detail_available": tx_detail_available,
+                "l2_detail_status": l2_detail_status,
+                "final_tx_amount": _to_output_float(reference.get("final_tx_amount"), 2) if tx_detail_available else "",
+                "final_tx_count": int(reference.get("final_tx_count", 0) or 0) if tx_detail_available else "",
+                "last10_bid_amount": _to_output_float(reference.get("last10_bid_amount"), 2) if tx_detail_available else "",
+                "final_from_last10_bid_amount": (
+                    _to_output_float(reference.get("final_from_last10_bid_amount"), 2) if tx_detail_available else ""
+                ),
+                "final_from_last10_bid_pct": (
+                    _to_output_float(reference.get("final_from_last10_bid_pct"), 2) if tx_detail_available else ""
+                ),
                 "limit_up_price": _to_output_float(reference.get("limit_up_price"), 3),
-                "final_from_limit_up_bid_amount": _to_output_float(reference.get("final_from_limit_up_bid_amount"), 2),
-                "final_from_limit_up_bid_pct": _to_output_float(reference.get("final_from_limit_up_bid_pct"), 2),
+                "final_from_limit_up_bid_amount": (
+                    _to_output_float(reference.get("final_from_limit_up_bid_amount"), 2) if tx_detail_available else ""
+                ),
+                "final_from_limit_up_bid_pct": (
+                    _to_output_float(reference.get("final_from_limit_up_bid_pct"), 2) if tx_detail_available else ""
+                ),
                 "big_order_buy_ratio": _to_output_float(evidence.get("big_order_buy_ratio"), 6),
                 "big_trade_buy_ratio": _to_output_float(evidence.get("big_trade_buy_ratio"), 6),
                 "has_order_confirmation": bool(evidence.get("has_order_confirmation")),
@@ -933,9 +953,9 @@ def build_auction_rankings(
     rows.sort(
         key=lambda row: (
             not bool(row["plan_eligible"]),
+            -float(row["final_from_last10_bid_pct"] or 0.0),
             -float(row["final_auction_amount"]),
             -float(row["open_pct"]),
-            -float(row["final_from_last20_bid_pct"]),
             str(row["stock_code"]),
         )
     )
@@ -966,9 +986,9 @@ def build_buy_plan_rows(
                 "post_0920_low_time": str(row.get("post_0920_low_time") or ""),
                 "open_pct": _to_output_float(row.get("open_pct"), 2),
                 "final_auction_amount": _to_output_float(row.get("final_auction_amount"), 2),
+                "tx_detail_available": bool(row.get("tx_detail_available")),
+                "l2_detail_status": str(row.get("l2_detail_status") or ""),
                 "last10_bid_amount": _to_output_float(row.get("last10_bid_amount"), 2),
-                "last20_bid_amount": _to_output_float(row.get("last20_bid_amount"), 2),
-                "final_from_last20_bid_pct": _to_output_float(row.get("final_from_last20_bid_pct"), 2),
                 "final_from_last10_bid_pct": _to_output_float(row.get("final_from_last10_bid_pct"), 2),
                 "final_from_limit_up_bid_pct": _to_output_float(row.get("final_from_limit_up_bid_pct"), 2),
                 "auction_rank_score": _to_output_float(row.get("auction_rank_score"), 3),
@@ -1007,11 +1027,20 @@ def build_matched_candidate_rows(rankings: Iterable[dict[str, Any]]) -> list[dic
                 "9:20\u540e\u4f4e\u70b9": _to_output_float(source.get("post_0920_low_price"), 3),
                 "\u4f4e\u70b9\u65f6\u95f4": str(source.get("post_0920_low_time") or ""),
                 "\u6700\u7ec8\u8f83\u4f4e\u70b9\u6da8\u5e45%": _to_output_float(source.get("final_vs_post_0920_low_pct"), 2),
-                "\u5c3e10\u79d2\u7ade\u4e70\u989d(\u4e07)": _to_wan(source.get("last10_bid_amount"), 1),
-                "\u5c3e20\u79d2\u7ade\u4e70\u989d(\u4e07)": _to_wan(source.get("last20_bid_amount"), 1),
-                "\u5c3e20\u79d2\u4e70\u5355\u6210\u4ea4\u5360\u6bd4%": _to_output_float(source.get("final_from_last20_bid_pct"), 2),
-                "\u5c3e10\u79d2\u4e70\u5355\u6210\u4ea4\u5360\u6bd4%": _to_output_float(source.get("final_from_last10_bid_pct"), 2),
-                "\u6da8\u505c\u4ef7\u4e70\u5165\u5360\u6bd4%": _to_output_float(source.get("final_from_limit_up_bid_pct"), 2),
+                "L2\u660e\u7ec6\u72b6\u6001": str(source.get("l2_detail_status") or ""),
+                "\u5c3e10\u79d2\u7ade\u4e70\u989d(\u4e07)": (
+                    _to_wan(source.get("last10_bid_amount"), 1) if bool(source.get("tx_detail_available")) else "N/A"
+                ),
+                "\u5c3e10\u79d2\u4e70\u5355\u6210\u4ea4\u5360\u6bd4%": (
+                    _to_output_float(source.get("final_from_last10_bid_pct"), 2)
+                    if bool(source.get("tx_detail_available"))
+                    else "N/A"
+                ),
+                "\u6da8\u505c\u4ef7\u4e70\u5165\u5360\u6bd4%": (
+                    _to_output_float(source.get("final_from_limit_up_bid_pct"), 2)
+                    if bool(source.get("tx_detail_available"))
+                    else "N/A"
+                ),
             }
         )
     return rows
@@ -1174,7 +1203,7 @@ def run_market_only(
     dynamic_candidates: bool = False,
     snapshot_provider: Callable[[Iterable[str]], dict[str, SnapshotTick]] = fetch_full_tick_snapshots,
     scan_start_time: str = "09:15:00",
-    candidate_freeze_time: str = "09:24:30",
+    candidate_freeze_time: str = "09:24:45",
     snapshot_interval_sec: float = 2.0,
     limit_up_tolerance: float = 0.01,
     candidate_min_auction_amount: float = DEFAULT_CANDIDATE_MIN_AUCTION_AMOUNT,
@@ -1355,6 +1384,8 @@ def run_market_only(
                             trade_executor=trade_exec,
                             position_manager=pos_mgr,
                         )
+                        if small_pool_l2_recorder:
+                            small_pool_l2_recorder.set_expected_codes([candidate.stock_code])
                 except Exception as exc:
                     logger.error("%s snapshot_scan_failed error=%s", session_event_prefix, exc, exc_info=True)
 
@@ -1373,6 +1404,8 @@ def run_market_only(
 
             if scanner and not freeze_logged and now >= freeze_at:
                 scanner.scan_once(now)
+                if small_pool_l2_recorder:
+                    small_pool_l2_recorder.set_expected_codes(scanner.candidate_codes)
                 logger.info(
                     "%s candidate_freeze candidates=%d universe=%d freeze_time=%s installed=%d",
                     session_event_prefix,
@@ -1465,12 +1498,16 @@ def run_market_only(
             data_sub.stop()
         if small_pool_l2_recorder:
             try:
+                get_l2_diagnostics = getattr(data_sub, "get_l2_subscription_diagnostics", None)
+                if callable(get_l2_diagnostics):
+                    small_pool_l2_recorder.set_subscription_diagnostics(get_l2_diagnostics())
                 small_pool_l2_recorder.write_outputs()
                 logger.info(
-                    "%s small_pool_l2_record_stop raw=%s summary=%s schema=%s",
+                    "%s small_pool_l2_record_stop raw=%s summary=%s health=%s schema=%s",
                     session_event_prefix,
                     small_pool_l2_recorder.raw_path,
                     small_pool_l2_recorder.summary_path,
+                    small_pool_l2_recorder.health_path,
                     small_pool_l2_recorder.schema_path,
                 )
             finally:
@@ -1489,9 +1526,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codes", action="append", default=[], help="Comma/space separated stock codes.")
     parser.add_argument("--pool", default=DEFAULT_POOL, help="CSV stock pool path used when --codes is empty.")
     parser.add_argument("--max-count", type=int, default=0, help="Limit observed symbols, 0 means unlimited.")
-    parser.add_argument("--stop-time", default="09:35:00", help="Auto stop time in HH:MM or HH:MM:SS.")
+    parser.add_argument("--stop-time", default="09:30:30", help="Auto stop time in HH:MM or HH:MM:SS.")
     parser.add_argument("--scan-start-time", default="09:15:00", help="Snapshot scan start time.")
-    parser.add_argument("--candidate-freeze-time", default="09:24:30", help="Legacy --dynamic-candidates only: stop adding candidates after this time.")
+    parser.add_argument("--candidate-freeze-time", default="09:24:45", help="Legacy --dynamic-candidates only: stop adding candidates after this time.")
     parser.add_argument("--snapshot-interval-sec", type=float, default=2.0, help="Full-tick snapshot polling interval in seconds.")
     parser.add_argument("--limit-up-tolerance", type=float, default=0.01, help="Legacy tolerance kept for compatibility.")
     parser.add_argument("--candidate-min-auction-amount", type=float, default=DEFAULT_CANDIDATE_MIN_AUCTION_AMOUNT, help="Dynamic candidate minimum auction matched amount.")

@@ -137,6 +137,57 @@ def test_opening_auction_l2_record_with_modes_splits_early_and_delayed(tmp_path)
     }
 
 
+def test_opening_auction_l2_recorder_writes_health_for_expected_codes(tmp_path):
+    recorder = OpeningAuctionL2Recorder(tmp_path)
+    event_time = datetime(2026, 6, 4, 9, 24, 59)
+    recorder.set_expected_codes(["000001", "000002"])
+    recorder.set_subscription_diagnostics(
+        [
+            {"stock": "000001", "kind": "l2order", "sub_id": 101, "status": "SUBSCRIBED"},
+            {"stock": "000001", "kind": "l2transaction", "sub_id": 102, "status": "SUBSCRIBED"},
+            {"stock": "000002", "kind": "l2order", "sub_id": 201, "status": "SUBSCRIBED"},
+            {"stock": "000002", "kind": "l2transaction", "sub_id": 202, "status": "SUBSCRIBED"},
+        ]
+    )
+    recorder.record_many(
+        "l2order",
+        "dynamic_small_pool",
+        {
+            "000001": [
+                L2OrderEvent(
+                    stock_code="000001",
+                    price=10.1,
+                    volume=1000,
+                    amount=10_100,
+                    side="BUY",
+                    event_time=event_time,
+                    recv_time=event_time,
+                )
+            ]
+        },
+    )
+
+    recorder.write_outputs()
+    recorder.close()
+    recorder.record_many(
+        "l2order",
+        "dynamic_small_pool",
+        {"000002": [L2OrderEvent(stock_code="000002", event_time=event_time, recv_time=event_time)]},
+    )
+
+    with recorder.summary_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        summary_rows = list(csv.DictReader(handle))
+    assert {row["stock"] for row in summary_rows} == {"000001", "000002"}
+    assert next(row for row in summary_rows if row["stock"] == "000002")["l2order_count_total"] == "0"
+
+    with recorder.health_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        health_rows = list(csv.DictReader(handle))
+    by_stock = {row["stock"]: row for row in health_rows}
+    assert by_stock["000001"]["status"] == "SUBSCRIBED_WITH_EVENTS"
+    assert by_stock["000002"]["status"] == "SUBSCRIBED_NO_EVENTS"
+    assert by_stock["000002"]["l2order_sub_id"] == "201"
+
+
 def test_opening_auction_l2_load_codes_from_text_and_csv(tmp_path):
     csv_path = tmp_path / "pool.csv"
     csv_path.write_text("股票代码,名称\n600000.SH,浦发银行\n000001,平安银行\n", encoding="utf-8-sig")
