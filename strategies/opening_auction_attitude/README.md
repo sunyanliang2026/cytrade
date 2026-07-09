@@ -18,8 +18,8 @@ strategies\opening_auction_attitude\scripts\run_morning.bat
 
 It runs the opening-auction observation pipeline end to end:
 
-1. collect source caches from `config/main_seal_pool_sources.json`;
-2. build strict all-candidate universe `data/stock_pools/current/opening_auction_universe.csv`;
+1. collect source caches from `strategies/opening_auction_attitude/config/opening_auction_pool_sources.json`;
+2. build strict all-candidate universe `strategies/opening_auction_attitude/data/opening_auction_universe.csv`;
 3. run the full-pool snapshot scanner and dynamically select the small Level2 pool;
 4. subscribe only small-pool `l2order,l2transaction` detail data;
 5. archive run artifacts under `data/probe/opening_auction_l2/YYYYMMDD_HHMMSS/`:

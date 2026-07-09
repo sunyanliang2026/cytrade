@@ -2,18 +2,16 @@
 setlocal
 
 cd /d "%~dp0..\..\.."
+set "REPO_ROOT=%CD%"
 
-set PY=C:\Users\ysun\miniconda3\envs\cytrade311\python.exe
+call "%REPO_ROOT%\scripts\run\load_runtime_env.bat"
+if errorlevel 1 exit /b 1
+
 set RUNNER_MODULE=strategies.juejin_sell_strategy.scripts.run_managed_session
 set RUN_ARGS=%*
 
 if /I "%~1"=="live" (
     set RUN_ARGS=--require-live --confirm-live
-)
-
-if not exist "%PY%" (
-    echo [ERROR] Python not found: %PY%
-    exit /b 1
 )
 
 echo Run Juejin sell strategy managed session...

@@ -1,32 +1,6 @@
-﻿"""cytrade 涓荤▼搴忓叆鍙ｃ€?
+"""cytrade main entry point.
 
-鏈枃浠朵笉璐熻矗鎵胯浇鍏蜂綋浜ゆ槗绛栫暐閫昏緫锛岃€屾槸璐熻矗鎶婄郴缁熸寜鈥滃彲杩愯鈥濈殑鏂瑰紡缁勮璧锋潵銆?
-褰撳墠涓荤▼搴忛噰鐢ㄢ€滀袱灞傝繍琛屾ā鍨嬧€濓細
-
-1. 鐖惰繘绋嬶細
-    - 甯搁┗杩愯銆?
-    - 浣跨敤 `BlockingScheduler` 缁存姢鏃ョ骇璁″垝浠诲姟銆?
-    - 鍒拌揪璁惧畾鏃跺埢鍚庯紝閫氳繃 `ProcessPoolExecutor` 鍚姩鐙珛瀛愯繘绋嬨€?
-
-2. 瀛愯繘绋嬶細
-    - 鎵挎媴涓€娆″畬鏁寸殑浜ゆ槗鏃ヤ細璇濄€?
-    - 鍦ㄨ杩涚▼鍐呭畬鎴?QMT 杩炴帴銆佽鎯呰闃呫€佺瓥鐣ユ仮澶嶄笌杩愯銆乄eb 鏈嶅姟銆佺湅闂ㄧ嫍绛夊叏閮ㄥ伐浣溿€?
-    - 鏀剁洏鍚庝繚瀛樼姸鎬佸苟涓诲姩閫€鍑猴紝浠庤€岄噴鏀捐繘绋嬭祫婧愩€?
-
-涔嬫墍浠ヤ娇鐢ㄨ繖绉嶇粨鏋勶紝鏄负浜嗘妸鈥滈暱鏈熷父椹昏皟搴︹€濅笌鈥滄棩鍐呬氦鏄撲細璇濃€濊В鑰︼細
-
-- 鐖惰繘绋嬪彧鍋氳交閲忚皟搴︼紝涓嶆寔鏈変氦鏄撹繛鎺ュ拰琛屾儏璧勬簮銆?
-- 瀛愯繘绋嬪彧璐熻矗鍗曟浜ゆ槗鏃ヤ細璇濓紝缁撴潫鍚庢暣浣撻€€鍑猴紝閬垮厤娈嬬暀绾跨▼銆佽繛鎺ユ垨鍐呭瓨鐘舵€佽法澶╃疮绉€?
-- 鑻ュ瓙杩涚▼鍥犲紓甯搁€€鍑猴紝涓嶄細鐩存帴姹℃煋鐖惰繘绋嬭皟搴﹀櫒锛屽彲鍦ㄤ笅涓€娆¤鍒掍换鍔℃椂閲嶆柊鎷夎捣銆?
-
-闃呰鏈枃浠舵椂锛屽缓璁寜濡備笅椤哄簭鐞嗚В锛?
-
-1. `build_app()`锛氱悊瑙ｅ瓙杩涚▼鍐呴儴鏈夊摢浜涙ā鍧椼€佸浣曡閰嶃€?
-2. `_run_managed_session()`锛氱悊瑙ｅ崟娆′氦鏄撴棩浼氳瘽鍦ㄥ瓙杩涚▼涓浣曞畬鏁磋繍琛屻€?
-3. `run_daily_session()`锛氱悊瑙ｄ竴娆′細璇濈殑鏃ュ巻涓庢椂闂存帶鍒躲€?
-4. `_launch_session_in_process()`锛氱悊瑙ｇ埗杩涚▼濡備綍涓哄崟娆′細璇濆垱寤虹嫭绔嬪瓙杩涚▼銆?
-5. `run_scheduler_service()`锛氱悊瑙ｇ埗杩涚▼濡備綍闀挎湡璋冨害鏁翠釜绯荤粺銆?
-"""
+This module assembles the runtime container and delegates session lifecycle work to the runtime package. The parent process keeps only the scheduler alive; each trading-day session runs in a child process so QMT connections, subscriptions, strategies, web services, and watchdog state can be released cleanly after the session exits."""
 import sys
 import os
 import signal
@@ -35,7 +9,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 
-# 纭繚椤圭洰鏍圭洰褰曞湪 sys.path
+# Ensure the project root is importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config.xtquant_bootstrap import bootstrap_xtquant_sys_path
@@ -92,40 +66,14 @@ def _resolve_strategy_specs(strategy_specs) -> list[type]:
 
 
 def build_app(strategy_classes=None, settings: Settings = None):
-    """鏋勫缓骞惰繛鎺ユ墍鏈夋牳蹇冩ā鍧椼€?
+    """Build and wire the core runtime objects.
 
-    杩欐槸鏁翠釜绋嬪簭鐨勨€滆閰嶅嚱鏁扳€濓紝鍙礋璐ｄ緷璧栨敞鍏ュ拰瀵硅薄杩炴帴锛?
-    涓嶈礋璐ｇ湡姝ｈ繘鍏ヨ繍琛屽惊鐜€?
-
-    Args:
-        strategy_classes: 闇€瑕佹墭绠＄殑绛栫暐绫诲垪琛ㄣ€?
-        settings: 鍙€夐厤缃璞★紱涓嶄紶鏃朵娇鐢ㄩ粯璁ら厤缃€?
-
-    Returns:
-        涓€涓寘鍚墍鏈夋牳蹇冩ā鍧楀疄渚嬬殑瀛楀吀锛屼究浜庢祴璇曞拰涓荤▼搴忓鐢ㄣ€?
-
-    杩愯璇存槑锛?
-        杩欎釜鍑芥暟鍙互鐞嗚В涓衡€滀氦鏄撳瓙杩涚▼鍐呴儴鐨勫鍣ㄨ閰嶉樁娈碘€濄€傚畠浼氫緷娆″畬鎴愶細
-
-        1. 鍒濆鍖栨棩蹇楃郴缁燂紝纭繚鍚庣画杩愯鏃ュ織鏈夌ǔ瀹氳緭鍑恒€?
-        2. 鍒濆鍖栨暟鎹鐞嗗櫒锛屽噯澶?SQLite銆佺姸鎬佸揩鐓х洰褰曞拰鍙€夎繙绋嬪悓姝ヨ兘鍔涖€?
-        3. 鍒濆鍖栬垂鐜囬厤缃紝缁熶竴浜ゆ槗璐圭敤璁＄畻瑙勫垯銆?
-        4. 鍒濆鍖栬繛鎺ョ鐞嗗櫒锛屼负鍚庣画 QMT 杩炴帴鍜岄噸杩炴彁渚涚粺涓€鍏ュ彛銆?
-        5. 鍒濆鍖栬鍗曠鐞嗗櫒銆佹寔浠撶鐞嗗櫒銆佷氦鏄撴墽琛屽櫒銆?
-        6. 寤虹珛鍥炶皟閾捐矾锛氭煖鍙板洖鎶?-> 璁㈠崟 -> 鎸佷粨/绛栫暐銆?
-        7. 鍒濆鍖栬鎯呰闃呯鐞嗗櫒銆?
-        8. 鍒濆鍖栫瓥鐣ヨ繍琛屽櫒锛屽苟娉ㄥ叆鐘舵€佹仮澶嶃€佽处鎴烽妫€鏌ュ拰寤惰繜鐩戞帶鑳藉姏銆?
-        9. 鍒濆鍖栫湅闂ㄧ嫍锛屽苟鎶婂績璺充笌鍛婅鍥炶皟鎸傚埌绛栫暐杩愯鍣ㄤ笂銆?
-
-        娉ㄦ剰锛?
-        - 杩欓噷鍙畬鎴愨€滃璞¤閰嶁€濓紝涓嶄細鐪熸杩炴帴 QMT锛屼篃涓嶄細鍚姩璁㈤槄鍜岀瓥鐣ヨ繍琛屻€?
-        - 鐪熸鐨勫惎鍔ㄥ姩浣滃彂鐢熷湪 `_run_managed_session()` 涓€?
-    """
+    The function performs dependency wiring only. It does not connect to QMT, subscribe market data, or start strategy execution. The returned context is reused by live sessions and tests."""
     settings = settings or Settings()
-    # 鍏堝噯澶囪繍琛岀洰褰曪紝閬垮厤鍚庣画鏃ュ織銆佹暟鎹簱銆佺姸鎬佹枃浠跺啓鍏ュけ璐ャ€?
+    # Prepare runtime directories before logs, SQLite, and state files are written.
     settings.ensure_dirs()
 
-    # ---- 鏃ュ織 ----
+    # ---- Logging ----
     log_mgr = LogManager(
         log_dir=settings.LOG_DIR,
         max_days=settings.LOG_MAX_DAYS,
@@ -134,11 +82,11 @@ def build_app(strategy_classes=None, settings: Settings = None):
     )
     logger = get_logger("system")
     logger.info("=" * 50)
-    logger.info("cytrade 鍚姩")
+    logger.info("cytrade 启动")
     if XTQUANT_BOOTSTRAP_ROOT:
         logger.info("cytrade: xtquant root=%s", XTQUANT_BOOTSTRAP_ROOT)
 
-    # ---- 鏁版嵁绠＄悊 ----
+    # ---- Data manager ----
     data_mgr = DataManager(
         db_path=settings.SQLITE_DB_PATH,
         state_dir=settings.STATE_SAVE_DIR,
@@ -147,7 +95,7 @@ def build_app(strategy_classes=None, settings: Settings = None):
     if settings.ENABLE_REMOTE_DB:
         data_mgr.set_remote_enabled(True)
 
-    # ``fee_schedule`` 缁熶竴灏佽涔板崠浣ｉ噾銆佸嵃鑺辩◣鍜?T+0 灞炴€у垽鏂€?
+    # FeeSchedule centralizes commission, stamp tax, and T+0 rules.
     fee_schedule = FeeSchedule(
         file_path=settings.FEE_TABLE_PATH,
         default_buy_fee_rate=settings.DEFAULT_BUY_FEE_RATE,
@@ -155,7 +103,7 @@ def build_app(strategy_classes=None, settings: Settings = None):
         default_stamp_tax_rate=settings.DEFAULT_STAMP_TAX_RATE,
     )
 
-    # ---- 浜ゆ槗杩炴帴 ----
+    # ---- Trading connection ----
     conn_mgr = ConnectionManager(
         qmt_path=settings.QMT_PATH,
         account_id=settings.ACCOUNT_ID,
@@ -166,20 +114,20 @@ def build_app(strategy_classes=None, settings: Settings = None):
                      if settings.RECONNECT_MAX_RETRIES > 0 else None),
     )
 
-    # ---- 璁㈠崟绠＄悊 ----
+    # ---- Order manager ----
     order_mgr = OrderManager(data_manager=data_mgr, fee_schedule=fee_schedule)
 
-    # ---- 鎸佷粨绠＄悊 ----
+    # ---- Position manager ----
     pos_mgr = PositionManager(
         cost_method=settings.COST_METHOD,
         data_manager=data_mgr,
         fee_schedule=fee_schedule,
     )
 
-    # ---- 娉ㄥ唽鍥炶皟閾撅細鎴愪氦 鈫?鎸佷粨 ----
+    # ---- Register callback chain: trades -> positions ----
     order_mgr.set_position_callback(pos_mgr.on_trade_callback)
 
-    # ---- 浜ゆ槗鎵ц鍣?----
+    # ---- Trade executor ----
     trade_exec = TradeExecutor(
         conn_mgr,
         order_mgr,
@@ -187,22 +135,22 @@ def build_app(strategy_classes=None, settings: Settings = None):
         live_trading_enabled=not bool(settings.CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN),
     )
 
-    # ---- XtQuant 鍥炶皟 ----
+    # ---- XtQuant callback ----
     callback = MyXtQuantTraderCallback(
         order_manager=order_mgr,
         connection_manager=conn_mgr,
     )
     conn_mgr.register_callback(callback)
 
-    # ---- 鏁版嵁璁㈤槄 ----
-    # 琛屾儏璁㈤槄妯″潡涓庝氦鏄撹繛鎺ユā鍧楄В鑰︼紝渚夸簬閲嶈繛鍚庣嫭绔嬫仮澶嶈闃呫€?
+    # ---- Data subscription ----
+    # Keep market data subscription independent from the trading connection for reconnect recovery.
     data_sub = DataSubscriptionManager(
         latency_threshold_sec=settings.DATA_LATENCY_THRESHOLD_SEC,
         default_period=settings.SUBSCRIPTION_PERIOD,
         print_latest_status=not bool(settings.LOG_SUMMARY_MODE),
     )
 
-    # ---- 绛栫暐杩愯 ----
+    # ---- Strategy runner ----
     runner = StrategyRunner(
         data_subscription=data_sub,
         trade_executor=trade_exec,
@@ -217,15 +165,15 @@ def build_app(strategy_classes=None, settings: Settings = None):
         selection_runtime_overrides=_build_strategy_selection_overrides(settings),
     )
 
-    # 娉ㄥ唽鈥滆鍗曠姸鎬佸彉鍖?-> 绛栫暐瀵硅薄鈥濈殑鍥炶皟銆?
-    # 杩欐牱绛栫暐鎵嶈兘鍦ㄦ垚浜ゃ€佹挙鍗曘€佸簾鍗曞悗鍙婃椂鏇存柊鑷繁鐨勫唴閮ㄧ姸鎬併€?
+    # Forward order status changes to the owning strategy instance.
+    # Strategies use this to update internal state after fills, cancels, and rejects.
     order_mgr.set_strategy_callback(runner.dispatch_order_update)
 
-    # 缃戠粶鏂紑鍚庯紝杩炴帴妯″潡浼氳礋璐ｉ噸杩烇紱
-    # 杩欓噷鍐嶆妸鈥滈噸杩炴垚鍔熷悗鐨勮ˉ鍋垮姩浣溾€濇寕杩涘幓锛岃嚜鍔ㄦ仮澶嶈鎯呰闃呫€?
+    # ConnectionManager handles reconnects after network interruptions.
+    # Resubscribe market data after reconnect succeeds.
     conn_mgr.register_reconnect_callback(data_sub.resubscribe_all)
 
-    # ---- 鐪嬮棬鐙?----
+    # ---- Watchdog ----
     watchdog = Watchdog(
         interval_sec=settings.WATCHDOG_INTERVAL_SEC,
         dingtalk_webhook=settings.DINGTALK_WEBHOOK_URL,
@@ -238,13 +186,13 @@ def build_app(strategy_classes=None, settings: Settings = None):
         data_subscription=data_sub,
     )
 
-    # 琛屾儏鍒拌揪鏃跺埛鏂扮湅闂ㄧ嫍蹇冭烦
+    # Refresh watchdog heartbeat whenever market data reaches the runner.
     runner.set_heartbeat_callback(watchdog.register_heartbeat)
     runner.set_alert_callback(watchdog.send_dingtalk_alert)
 
-    # 杩斿洖瑁呴厤濂界殑涓婁笅鏂囷紝鏂逛究锛?
-    # 1. `run()` 鐩存帴澶嶇敤銆?
-    # 2. 娴嬭瘯浠ｇ爜绮剧‘鏂█妯″潡瑁呴厤鍏崇郴銆?
+    # Return the wired runtime context for live sessions and tests.
+    # 1. Reused directly by run().
+    # 2. Lets tests assert module wiring precisely.
     return {
         "settings": settings,
         "log_mgr": log_mgr,

@@ -17,10 +17,11 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.pool.collect_main_seal_pool import DEFAULT_SOURCE_CACHE_DIR, read_candidates_trace
+from scripts.pool.collect_main_seal_pool import read_candidates_trace
 from scripts.pool.common import normalize_stock_code
 
-DEFAULT_OUTPUT = Path("data/stock_pools/current/opening_auction_universe.csv")
+DEFAULT_SOURCE_CACHE_DIR = Path("strategies/opening_auction_attitude/data/source_cache")
+DEFAULT_OUTPUT = Path("strategies/opening_auction_attitude/data/opening_auction_universe.csv")
 OUTPUT_HEADERS = ["股票代码", "名称", "来源"]
 
 

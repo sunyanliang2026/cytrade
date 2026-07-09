@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-DEFAULT_OUTPUT = Path("data/stock_pools/current/main_seal_follow_pool.csv")
-DEFAULT_TRACE_DIR = Path("data/stock_pools/runs")
+DEFAULT_OUTPUT = Path("strategies/main_seal_follow/data/main_seal_follow_pool.csv")
+DEFAULT_TRACE_DIR = Path("strategies/main_seal_follow/output/stock_pool_runs")
 LOCAL_RUNTIME_CONFIG_PATH = Path("config/local_runtime.json")
-DEFAULT_SOURCE_CONFIG = Path("config/main_seal_pool_sources.json")
+DEFAULT_SOURCE_CONFIG = Path("strategies/main_seal_follow/config/main_seal_pool_sources.json")
 DEFAULT_IWENCAI_QUERY_FILE = Path("config/iwencai_pool_queries.json")
 OUTPUT_HEADERS = ["股票代码", "名称", "计划买入金额"]
 DEFAULT_SECTOR = "沪深A股"

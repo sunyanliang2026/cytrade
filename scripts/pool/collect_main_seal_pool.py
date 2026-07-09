@@ -88,8 +88,7 @@ from scripts.pool.source_config import (
     resolve_jiuyangongshe_config,
 )
 
-DEFAULT_SOURCE_CACHE_DIR = Path("data/stock_pools/source_cache")
-IWENCAI_COLLECT_CUTOFF_HOUR = 9
+DEFAULT_SOURCE_CACHE_DIR = Path("strategies/main_seal_follow/data/source_cache")
 JIUYANGONGSHE_READY_HOUR = 8
 JIUYANGONGSHE_READY_MINUTE = 30
 
@@ -217,7 +216,44 @@ def read_iwencai_cache_after_cutoff(
 
 
 def should_collect_iwencai(now: datetime) -> bool:
-    return now.hour < IWENCAI_COLLECT_CUTOFF_HOUR
+    return (now.hour, now.minute) < (9, 0)
+
+
+def find_latest_source_cache_before(args, now: datetime, source_set_name: str) -> Path | None:
+    base = Path(str(getattr(args, "source_cache_dir", DEFAULT_SOURCE_CACHE_DIR) or DEFAULT_SOURCE_CACHE_DIR))
+    if not base.is_dir():
+        return None
+    current_label = now.strftime("%Y-%m-%d")
+    filename = f"{_safe_filename(source_set_name)}.csv"
+    candidates: list[Path] = []
+    for day_dir in base.iterdir():
+        if not day_dir.is_dir() or day_dir.name >= current_label:
+            continue
+        path = day_dir / filename
+        if path.is_file():
+            candidates.append(path)
+    return sorted(candidates, key=lambda item: item.parent.name, reverse=True)[0] if candidates else None
+
+
+def read_latest_iwencai_cache(
+    args,
+    now: datetime,
+    source_set_name: str,
+) -> tuple[list[PoolCandidate], Path, str]:
+    today_path = source_cache_path(args, now, source_set_name)
+    if today_path.is_file():
+        candidates = read_candidates_trace(today_path)
+        if candidates or bool(getattr(args, "allow_empty_iwencai_cache_after_cutoff", False)):
+            return candidates, today_path, "hit"
+
+    latest_path = find_latest_source_cache_before(args, now, source_set_name)
+    if latest_path is not None:
+        candidates = read_candidates_trace(latest_path)
+        copied_path = write_source_cache(args, now, source_set_name, candidates)
+        suffix = "" if candidates else ":empty"
+        return candidates, copied_path, f"reused_previous:{latest_path.parent.name}{suffix}"
+
+    return read_iwencai_cache_after_cutoff(args, now, source_set_name)
 
 
 def should_collect_jiuyangongshe(now: datetime) -> bool:
@@ -242,18 +278,35 @@ def collect_configured_source_sets(args, now: datetime) -> tuple[dict[str, list[
     if should_collect_iwencai(now):
         cookie = resolve_iwencai_cookie(str(args.iwencai_cookie or ""))
         for source_set in iwencai_sets:
-            candidates = collect_from_iwencai(
-                query=source_set.query,
-                cookie=cookie,
-                query_type=str(args.iwencai_query_type),
-                loop=not bool(args.no_iwencai_loop),
-            )
+            try:
+                candidates = collect_from_iwencai(
+                    query=source_set.query,
+                    cookie=cookie,
+                    query_type=str(args.iwencai_query_type),
+                    loop=not bool(args.no_iwencai_loop),
+                )
+                cache_status = "collected"
+            except RuntimeError as exc:
+                if args.strict_sources:
+                    raise
+                candidates, cache_path, cache_status = read_latest_iwencai_cache(args, now, source_set.name)
+                named_sets[source_set.name] = candidates
+                print(
+                    f"WARNING iWenCai collect failed; reused_cache={cache_path} raw={len(candidates)} "
+                    f"set={source_set.name} cache_status={cache_status} error={exc}",
+                    flush=True,
+                )
+                continue
             named_sets[source_set.name] = candidates
             cache_path = write_source_cache(args, now, source_set.name, candidates)
-            print(f"SET {source_set.name} source=iwencai raw={len(candidates)} cache={cache_path}", flush=True)
+            print(
+                f"SET {source_set.name} source=iwencai raw={len(candidates)} "
+                f"cache={cache_path} cache_status={cache_status}",
+                flush=True,
+            )
     else:
         for source_set in iwencai_sets:
-            candidates, cache_path, cache_status = read_iwencai_cache_after_cutoff(args, now, source_set.name)
+            candidates, cache_path, cache_status = read_latest_iwencai_cache(args, now, source_set.name)
             named_sets[source_set.name] = candidates
             print(
                 f"SET {source_set.name} source=iwencai reused_cache={cache_path} raw={len(candidates)} "

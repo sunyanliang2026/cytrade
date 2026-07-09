@@ -1,15 +1,24 @@
 # 股票池目录结构
 
-股票池运行产物不再放在 `config/` 下。`config/` 只保留配置文件，例如来源配置 `main_seal_pool_sources.json`。
+股票池运行产物和策略股票池配置不再放在公共 `config/` 下。需要股票池的策略在自己的策略目录下维护配置和默认池文件。
 
 ## 目录
 
-- `data/stock_pools/current/main_seal_follow_pool.csv`
-  - 自动选股生成的当前最终股票池。
+- `strategies/main_seal_follow/config/main_seal_pool_sources.json`
+  - MainSealFollow 的股票池来源配置。
+
+- `strategies/main_seal_follow/data/main_seal_follow_pool.csv`
+  - MainSealFollow 自动选股生成的当前最终股票池。
   - 策略自动流程默认读取这个文件。
 
-- `data/stock_pools/manual/main_seal_follow_manual_pool.csv`
-  - 手工测试股票池。
+- `strategies/main_seal_follow/data/main_seal_follow_manual_pool.csv`
+  - MainSealFollow 手工测试股票池。
+
+- `strategies/opening_auction_attitude/config/opening_auction_pool_sources.json`
+  - OpeningAuctionAttitude 的股票池来源配置。
+
+- `strategies/opening_auction_attitude/data/opening_auction_universe.csv`
+  - OpeningAuctionAttitude 竞价扫描大池。
   - 临时指定一只或几只股票时使用。
 
 - `data/stock_pools/runs/YYYY-MM-DD/HHMMSS/`
@@ -34,7 +43,7 @@ C:\Users\ysun\miniconda3\envs\cytrade311\python.exe -m scripts.pool.collect_main
 
 生成后：
 
-- 当前最终池：`data/stock_pools/current/main_seal_follow_pool.csv`
+- 当前最终池：`strategies/main_seal_follow/data/main_seal_follow_pool.csv`
 - 当次留痕：`data/stock_pools/runs/YYYY-MM-DD/HHMMSS/`
 
 ## 手工测试股票池
@@ -42,7 +51,7 @@ C:\Users\ysun\miniconda3\envs\cytrade311\python.exe -m scripts.pool.collect_main
 手工池文件：
 
 ```text
-data/stock_pools/manual/main_seal_follow_manual_pool.csv
+strategies/main_seal_follow/data/main_seal_follow_manual_pool.csv
 ```
 
 手工启动脚本会读取这个文件，不会重新生成股票池。

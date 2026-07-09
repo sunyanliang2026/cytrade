@@ -1,8 +1,6 @@
-"""绛栫暐杩愯妯″潡銆?
+"""Strategy runner orchestration.
 
-鏈ā鍧楁槸椤圭洰涓繛鎺モ€滆鎯呫€佺瓥鐣ャ€佽鍗曘€佹寔浠撱€佺姸鎬佹仮澶嶁€濈殑璋冨害涓績銆?
-瀹冧笉鍏冲績鍏蜂綋绛栫暐閫昏緫鏈韩锛岃€屾槸璐熻矗璁╁涓瓥鐣ュ疄渚嬪湪缁熶竴瑙勫垯涓嬭繍琛屻€?
-"""
+This module coordinates market data, strategy instances, order state, position state, persistence, and account synchronization. Strategy-specific decision logic stays inside each strategy class."""
 import json
 import threading
 import time
@@ -37,21 +35,14 @@ def _apply_selection_runtime_overrides(overrides: dict | None) -> None:
 
 
 def _select_configs_in_subprocess(strategy_class, runtime_overrides: dict | None = None):
-    """鍦ㄥ瓙杩涚▼涓墽琛岄€夎偂閫昏緫骞惰繑鍥為厤缃垪琛ㄣ€?
-
-    杩欐牱鍋氱殑涓昏鐩殑鏄妸娼滃湪鑰楁椂杈冮暱銆佷笖鍙兘渚濊禆澶栭儴璁＄畻鐨勯€夎偂閫昏緫
-    涓庝富杩涚▼闅旂寮€锛岄檷浣庨樆濉炰富娴佺▼鐨勯闄┿€?
-    """
+    """Run stock selection in an isolated subprocess and return strategy configs."""
     _apply_selection_runtime_overrides(runtime_overrides)
     strategy = strategy_class(StrategyConfig(), None, None)
     return strategy.select_stocks()
 
 
 class StrategyRunner:
-    """绛栫暐杩愯绠＄悊鍣ㄣ€?
-
-    瀹冭礋璐ｇ粺涓€璋冨害鎵€鏈夌瓥鐣ュ璞★紝鏄瓥鐣ュ眰鐨勬€绘帶涓績銆?
-    """
+    """Coordinates strategy lifecycle, subscriptions, persistence, and account synchronization."""
 
     def __init__(self, data_subscription=None, trade_executor=None,
                  order_manager=None,
@@ -64,107 +55,90 @@ class StrategyRunner:
                  latency_threshold_sec: float = 10.0,
                  process_threshold_ms: float = 200.0,
                  selection_runtime_overrides: dict | None = None):
-        """鍒濆鍖栫瓥鐣ヨ繍琛屽櫒銆?
-
-        Args:
-            data_subscription: 琛屾儏璁㈤槄绠＄悊鍣ㄣ€?
-            trade_executor: 浜ゆ槗鎵ц鍣ㄣ€?
-            position_manager: 鎸佷粨绠＄悊鍣ㄣ€?
-            data_manager: 鏁版嵁鎸佷箙鍖栫鐞嗗櫒銆?
-            connection_manager: 浜ゆ槗杩炴帴绠＄悊鍣紝鐢ㄤ簬鍚姩鍓嶈处鎴锋牎楠屻€?
-            strategy_classes: 闇€瑕佹墭绠＄殑绛栫暐绫诲垪琛ㄣ€?
-            load_previous_state_on_start: 褰撴棩鐘舵€佷笉瀛樺湪鏃讹紝鏄惁鍥為€€鍔犺浇涓婁竴浜ゆ槗鏃ョ姸鎬併€?
-            state_autosave_interval_sec: 鐩樹腑鑷姩淇濆瓨鐘舵€佺殑鍛ㄦ湡锛屽崟浣嶇锛沗`0`` 琛ㄧず鍏抽棴銆?
-            state_realtime_persist_min_interval_sec: 鐩樹腑瀹炴椂鐘舵€佷繚瀛樼殑鏈€灏忛棿闅旓紝鍗曚綅绉掋€?
-            latency_threshold_sec: 琛屾儏寤惰繜鍛婅闃堝€硷紝鍗曚綅绉掋€?
-            process_threshold_ms: 鍗曟绛栫暐澶勭悊鑰楁椂鍛婅闃堝€硷紝鍗曚綅姣銆?
-        """
-        # ``_data_sub`` 璐熻矗鍚戣繍琛屽櫒鎺ㄩ€佹渶鏂拌鎯呮暟鎹€?
+        """Initialize the strategy runner and its shared runtime dependencies."""
+        # Receives market data and forwards it into the runner.
         self._data_sub = data_subscription
-        # ``_trade_exec`` 璐熻矗鎶婄瓥鐣ヤ俊鍙风炕璇戞垚鐪熷疄涓嬪崟鍔ㄤ綔銆?
+        # Translates strategy signals into order actions.
         self._trade_exec = trade_executor
-        # ``_order_mgr`` 鐢ㄤ簬鍦ㄩ噸鍚椂鎶婃椿鍔ㄨ鍗曚粠鎸佷箙鍖栧眰閲嶆柊瑁呰浇鍥炲唴瀛樸€?
+        # Reloads active orders from persistence during restart.
         self._order_mgr = order_manager
-        # ``_position_mgr`` 璐熻矗鏌ヨ鍜岀淮鎶ょ瓥鐣ユ寔浠撱€?
+        # Maintains strategy positions.
         self._position_mgr = position_manager
-        # ``_data_mgr`` 鐢ㄤ簬淇濆瓨鍜屾仮澶嶇瓥鐣ョ姸鎬佸揩鐓с€?
+        # Persists and restores strategy snapshots.
         self._data_mgr = data_manager
-        # ``_connection_mgr`` 鐢ㄤ簬鍦ㄥ惎鍔ㄥ墠鏌ヨ璐︽埛璧勪骇涓庢寔浠撱€?
+
         self._connection_mgr = connection_manager
-        # ``_strategy_classes`` 淇濆瓨鎵€鏈夊彲鍙備笌鑷姩閫夎偂/鎭㈠鐨勭瓥鐣ョ被銆?
+        # Registered strategy classes available for selection and recovery.
         self._strategy_classes = strategy_classes or []
-        # ``_load_previous_state_on_start`` 鎺у埗鏄惁鍥為€€鍒颁笂涓€浜ゆ槗鏃ョ姸鎬佹枃浠躲€?
+        # Controls fallback loading from the previous trading day.
         self._load_previous_state_on_start = load_previous_state_on_start
-        # ``_state_autosave_interval_sec`` 鎺у埗鐩樹腑鐘舵€佽嚜鍔ㄤ繚瀛橀鐜囥€?
+        # Periodic state autosave interval.
         self._state_autosave_interval_sec = max(0, int(state_autosave_interval_sec or 0))
-        # ``_state_realtime_persist_min_interval_sec`` 鎺у埗绾鎯呮€佷笅鏈€灏忎繚瀛橀棿闅旓紝閬垮厤姣忎釜 tick 閮藉啓蹇収銆?
+        # Minimum interval for event-driven state persistence.
         self._state_realtime_persist_min_interval_sec = max(0.0, float(state_realtime_persist_min_interval_sec or 0.0))
-        # ``_strategies`` 淇濆瓨褰撳墠姝ｅ湪鎵樼鐨勭瓥鐣ュ疄渚嬪垪琛ㄣ€?
+
         self._strategies: List[BaseStrategy] = []
-        # ``_lock`` 淇濇姢绛栫暐鍒楄〃鍦ㄥ绾跨▼鐜涓嬬殑澧炲垹鏀规煡銆?
+        # Protects the strategy list in multi-threaded callbacks.
         self._lock = threading.Lock()
-        # ``_latency_threshold`` 鏄鎯呭欢杩熷憡璀﹂槇鍊硷紝鍗曚綅绉掋€?
+        # Market data latency warning threshold in seconds.
         self._latency_threshold = latency_threshold_sec
-        # ``_process_threshold_ms`` 鏄崟娆＄瓥鐣ュ鐞嗚€楁椂闃堝€硷紝鍗曚綅姣銆?
+        # Per-strategy processing warning threshold in milliseconds.
         self._process_threshold_ms = process_threshold_ms
-        # ``_last_round_total_process_ms`` 璁板綍鏈€杩戜竴杞鎯呮帹閫佸搴旂殑绛栫暐鎬诲鐞嗚€楁椂銆?
+        # Last total processing duration for one market-data round.
         self._last_round_total_process_ms = 0.0
         self._last_strategy_event_time: Optional[datetime] = None
         self._last_strategy_event: str = ""
-        # ``_running`` 鏍囪杩愯鍣ㄦ槸鍚﹀凡杩涘叆宸ヤ綔鐘舵€併€?
+        # Whether the runner is currently active.
         self._running = False
-        # ``_scheduler`` 鏄?APScheduler 瀹炰緥锛岀敤浜庡畾鏃堕€夎偂涓庝繚瀛樼姸鎬併€?
+        # APScheduler instance for selection and state persistence jobs.
         self._scheduler = None
-        # ``_state_save_lock`` 鐢ㄤ簬涓茶鍖栦簨浠堕┍鍔ㄥ揩鐓т繚瀛橈紝閬垮厤澶氱嚎绋嬪苟鍙戝啓 pickle銆?
+        # Serializes event-driven snapshot writes.
         self._state_save_lock = threading.RLock()
-        # ``_last_state_save_monotonic`` 璁板綍鏈€杩戜竴娆℃垚鍔熶繚瀛樼殑鍗曡皟鏃堕挓鏃堕棿銆?
+        # Last successful state-save monotonic timestamp.
         self._last_state_save_monotonic = 0.0
-        # ``_scheduler_thread`` 鏄皟搴﹀櫒鎵€鍦ㄧ嚎绋嬨€?
+
         self._scheduler_thread = None
-        # ``_heartbeat_callback`` 鐢ㄤ簬鍚戠湅闂ㄧ嫍鎶ュ憡涓诲惊鐜椿璺冪姸鎬併€?
+        # Reports main loop activity to the watchdog.
         self._heartbeat_callback = None
-        # ``_alert_callback`` 鐢ㄤ簬鍙戦€佸惎鍔ㄥ墠璐︽埛鏍￠獙鍛婅銆?
+        # Sends startup preflight warnings.
         self._alert_callback = None
-        # ``_known_trade_ids`` 缂撳瓨宸插鐞嗘垚浜わ紝閬垮厤涓诲姩鍚屾閲嶅鍥炴斁鍚屼竴绗旀垚浜ゃ€?
+        # Caches processed trade ids to avoid duplicate replay.
         self._known_trade_ids: Optional[set[str]] = None
         self._selection_runtime_overrides = dict(selection_runtime_overrides or {})
 
     def set_heartbeat_callback(self, callback) -> None:
-        """娉ㄥ唽蹇冭烦鍥炶皟锛屼緵鐪嬮棬鐙楁劅鐭ョ瓥鐣ヤ富寰幆鏄惁浠嶅湪宸ヤ綔銆?"""
+        """Register the heartbeat callback used by the watchdog."""
         self._heartbeat_callback = callback
 
     def set_alert_callback(self, callback) -> None:
-        """娉ㄥ唽棰勬鏌ュ憡璀﹀洖璋冦€?
-
-        褰撳墠涓昏鐢ㄤ簬鎶婂惎鍔ㄥ墠鐨勮处鎴锋牎楠岀粨鏋滆浆鍙戝埌閽夐拤銆?
-        """
+        """Register the alert callback used for startup and safety warnings."""
         self._alert_callback = callback
 
-    # ------------------------------------------------------------------ 鍚姩/鍋滄
+    # ------------------------------------------------------------------ Lifecycle
 
     def start(self) -> None:
-        """鍚姩绛栫暐杩愯鍣ㄣ€?"""
+        """Start the strategy runner."""
         self._running = True
         logger.info("StrategyRunner: 启动")
 
-        # 灏濊瘯鎭㈠鐘舵€?
+        # Load persisted state first.
         self._load_state()
 
-        # 鏃犺鏄惁鎭㈠鍑哄揩鐓э紝閮藉啀鎸夊綋鏃?CSV 琛ラ綈涓€娆＄己澶卞疄渚嬨€?
-        # add_strategy 浼氭寜 instance_key 鍘婚噸锛屽洜姝や笉浼氳鐩栧凡鎭㈠鐨勫疄渚嬨€?
+
+        # add_strategy de-duplicates by instance_key, preserving restored instances.
         self.run_stock_selection()
 
-        # 鎶婂揩鐓ч噷璁板綍鐨勬椿鍔ㄨ鍗?UUID 閲嶆柊瑁呰浇鍥炲唴瀛橈紝
-        # 閬垮厤寮傚父閲嶅惎鍚庣瓥鐣ュ繕璁拌嚜宸变粛鏈夋寕鍗曟湭瀹岀粨銆?
+
+        # Avoid carrying stale pending-order assumptions across abnormal restarts.
         self._restore_pending_orders_from_storage()
         self._cleanup_orphaned_pending_orders_from_storage()
 
-        # 鍦ㄧ湡姝ｅ紑濮嬬洴鐩樺墠锛屽厛鏍稿璐︽埛璧勪骇鍜岃处鎴锋寔浠擄紝
-        # 闃叉绛栫暐鍐呴儴鐘舵€佷笌鐪熷疄璐︽埛鐘舵€佹槑鏄句笉涓€鑷淬€?
+        # Verify account cash and positions before live monitoring starts.
+        # This detects obvious divergence between strategy state and account state.
         self._validate_account_constraints()
         self.sync_orders_and_trades_once(reason="startup")
 
-        # 娉ㄥ唽鏁版嵁鍥炶皟
+        # Register market-data callbacks.
         if self._data_sub:
             self._data_sub.set_data_callback(self.on_market_data)
             self._data_sub.set_l2_quote_callback(self.on_l2_quote_data)
@@ -172,17 +146,17 @@ class StrategyRunner:
             self._data_sub.set_l2_order_callback(self.on_l2_order_data)
             self._data_sub.set_l2_orderqueue_callback(self.on_l2_orderqueue_data)
 
-        # 鍚姩璋冨害鍣?
+        # Start scheduled jobs.
         self._start_scheduler()
 
-        # 浠呭湪浜ゆ槗鏃ユ縺娲荤瓥鐣?
+        # Activate strategies only on trading days.
         self._activate_for_trading_day(reason="startup")
 
         logger.info("StrategyRunner: 已启动 %d 个策略", len(self._strategies))
         self.request_state_persist("runner_started")
 
     def stop(self) -> None:
-        """鍋滄杩愯鍣紝骞朵繚瀛樺綋鍓嶇瓥鐣ョ姸鎬併€?"""
+        """Stop the runner and persist current strategy state."""
         self._running = False
         self.save_state()
         with self._lock:
@@ -196,14 +170,10 @@ class StrategyRunner:
                 pass
         logger.info("StrategyRunner: 已停止")
 
-    # ------------------------------------------------------------------ 鏁版嵁鍒嗗彂
+    # ------------------------------------------------------------------ Data Dispatch
 
     def on_market_data(self, tick_data: Dict[str, TickData]) -> None:
-        """澶勭悊涓€鎵规渶鏂拌鎯呮暟鎹€?
-
-        Args:
-            tick_data: 浠ヨ瘉鍒镐唬鐮佷负閿殑琛屾儏瀛楀吀銆?
-        """
+        """Process the latest batch of tick data."""
         if not self._running:
             return
         try:
@@ -217,7 +187,7 @@ class StrategyRunner:
                 if first_tick and getattr(first_tick, "data_time", None):
                     self._position_mgr.unlock_available_quantities(first_tick.data_time.strftime("%Y%m%d"))
 
-            # 鍏堝仛缁熶竴鐨勫欢杩熸娴嬶紝閬垮厤绛栫暐鍐呴儴鍚勮嚜閲嶅鍒ゆ柇銆?
+            # Run centralized latency checks before strategy-specific processing.
             for code, tick in tick_data.items():
                 if tick.latency_ms > self._latency_threshold * 1000:
                     print(f"[WARNING] 数据延迟 {tick.latency_ms/1000:.1f}s > "
@@ -254,14 +224,14 @@ class StrategyRunner:
 
             self._last_round_total_process_ms = round_total_elapsed_ms
 
-            # 姣忚疆琛屾儏缁撴潫鍚庨『鎵嬫竻鐞嗗凡鍋滄绛栫暐锛?
-            # 鍙互閬垮厤绛栫暐鍒楄〃鎸佺画鑶ㄨ儉銆?
+            # Remove stopped strategies after each market-data round.
+            # This prevents the strategy list from growing indefinitely.
             self._cleanup_stopped()
 
         except Exception as e:
             logger.error("StrategyRunner: on_market_data 异常: %s", e, exc_info=True)
 
-    # ------------------------------------------------------------------ 绛栫暐绠＄悊
+    # ------------------------------------------------------------------ Strategy Management
 
     def on_l2_quote_data(self, events_by_code: Dict[str, L2QuoteEvent]) -> None:
         """Dispatch Level2 quote events to matching strategies."""
@@ -285,7 +255,7 @@ class StrategyRunner:
         self._dispatch_l2_batch(events_by_code, "on_l2_order")
 
     def on_l2_orderqueue_data(self, events_by_code: Dict[str, L2OrderQueueEvent]) -> None:
-        """Dispatch Level2 order-queue events to matching strategies."""
+        """Dispatch Level2 order queue events to matching strategies."""
         if events_by_code:
             self._mark_strategy_event(f"l2orderqueue:{len(events_by_code)}")
         self._dispatch_l2_single(events_by_code, "on_l2_orderqueue")
@@ -341,17 +311,17 @@ class StrategyRunner:
 
     @staticmethod
     def _strategy_instance_key(strategy: BaseStrategy) -> tuple[str, str]:
-        """杩斿洖鐢ㄤ簬鍒ゆ柇绛栫暐瀹炰緥鏄惁閲嶅鐨勫敮涓€閿€?"""
+        """Return the unique key used to de-duplicate strategy instances."""
         params = getattr(strategy.config, "params", {}) or {}
         instance_key = str(params.get("instance_key") or strategy.stock_code)
         return strategy.strategy_name, instance_key
 
     def get_last_round_total_process_ms(self) -> float:
-        """杩斿洖鏈€杩戜竴杞鎯呮帹閫佸搴旂殑绛栫暐鎬诲鐞嗚€楁椂锛屽崟浣嶆绉掋€?"""
+        """Return the last market-data processing duration in milliseconds."""
         return float(self._last_round_total_process_ms or 0.0)
 
     def get_runtime_status(self) -> dict:
-        """Return compact runtime status for heartbeat logs."""
+        """Return a compact runtime status snapshot."""
         with self._lock:
             strategy_count = len(self._strategies)
             last_event_time = self._last_strategy_event_time
@@ -364,7 +334,7 @@ class StrategyRunner:
         }
 
     def add_strategy(self, strategy: BaseStrategy) -> None:
-        """鍚戣繍琛屽櫒涓坊鍔犱竴涓瓥鐣ュ疄渚嬨€?"""
+        """Add a strategy instance to the runner."""
         strategy.bind_persistence(self._data_mgr, self.request_state_persist)
         strategy_key = self._strategy_instance_key(strategy)
         with self._lock:
@@ -378,7 +348,7 @@ class StrategyRunner:
             )
             if exists:
                 logger.info(
-                    "StrategyRunner: 璺宠繃閲嶅绛栫暐 %s stock=%s key=%s",
+                    "StrategyRunner: 跳过重复策略 %s stock=%s key=%s",
                     strategy.strategy_name,
                     strategy.stock_code,
                     strategy_key[1],
@@ -398,14 +368,14 @@ class StrategyRunner:
         with self._lock:
             should_subscribe = is_trading_day
 
-        # 璁㈤槄璇ユ爣鐨?
+        # Subscribe market data for this strategy.
         if self._data_sub and is_trading_day:
             self._sync_subscriptions()
         if self._running:
             self.request_state_persist(f"add_strategy:{strategy.strategy_id}")
 
     def remove_strategy(self, strategy_id: str) -> None:
-        """鎸夌瓥鐣?ID 绉婚櫎绛栫暐瀹炰緥銆?"""
+        """Remove a strategy instance by strategy id."""
         with self._lock:
             self._strategies = [s for s in self._strategies
                                  if s.strategy_id != strategy_id]
@@ -415,7 +385,7 @@ class StrategyRunner:
             self._sync_subscriptions()
 
     def get_strategy(self, strategy_id: str) -> Optional[BaseStrategy]:
-        """鎸夌瓥鐣?ID 鑾峰彇绛栫暐瀵硅薄銆?"""
+        """Return a strategy instance by strategy id."""
         with self._lock:
             for s in self._strategies:
                 if s.strategy_id == strategy_id:
@@ -423,12 +393,12 @@ class StrategyRunner:
         return None
 
     def get_all_strategies(self) -> List[BaseStrategy]:
-        """杩斿洖褰撳墠鍏ㄩ儴绛栫暐瀵硅薄鐨勫壇鏈垪琛ㄣ€?"""
+        """Return a copy of all current strategy instances."""
         with self._lock:
             return list(self._strategies)
 
     def get_paused_strategy_reconciliation(self) -> List[dict]:
-        """杩斿洖鏆傚仠绛栫暐鐨勬寔浠撳璐﹁鍥俱€?"""
+        """Return reconciliation details for paused strategies."""
         account_position_map = self._build_account_position_map()
         rows: List[dict] = []
 
@@ -456,10 +426,10 @@ class StrategyRunner:
         rows.sort(key=lambda item: (item["stock_code"], item["strategy_name"], item["strategy_id"]))
         return rows
 
-    # ------------------------------------------------------------------ 閫夎偂
+    # ------------------------------------------------------------------ Stock Selection
 
     def run_stock_selection(self) -> None:
-        """鎵ц閫夎偂锛屽苟涓烘瘡涓厤缃垱寤轰竴涓瓥鐣ュ疄渚嬨€?"""
+        """Run stock selection and create strategy instances from the returned configs."""
         if not self.is_trading_day():
             logger.info("StrategyRunner: 今日非交易日，跳过选股")
             return
@@ -513,10 +483,10 @@ class StrategyRunner:
 
         self._activate_for_trading_day(reason="stock_selection")
 
-    # ------------------------------------------------------------------ 鎸佷箙鍖?
+    # ------------------------------------------------------------------ Persistence
 
     def save_state(self) -> None:
-        """淇濆瓨鍏ㄩ儴绛栫暐鐨勫揩鐓х姸鎬併€?"""
+        """Persist snapshots for all strategies."""
         if not self._data_mgr:
             return
         with self._state_save_lock:
@@ -553,7 +523,7 @@ class StrategyRunner:
                 logger.error("StrategyRunner: 保存状态失败: %s", e, exc_info=True)
 
     def rebuild_runtime_state(self) -> dict:
-        """娓呯┖ SQLite 杩愯鎬佸苟绔嬪嵆鎸夊綋鍓嶅唴瀛樼瓥鐣ラ噸寤恒€?"""
+        """Clear SQLite runtime state and rebuild it from current in-memory strategies."""
         if not self._data_mgr:
             return {"removed": 0, "persisted": 0}
 
@@ -569,7 +539,7 @@ class StrategyRunner:
         return {"removed": removed, "persisted": persisted}
 
     def request_state_persist(self, reason: str = "", min_interval_sec: float = 0.0) -> None:
-        """鍦ㄥ叧閿繍琛屼簨浠跺悗绔嬪嵆淇濆瓨绛栫暐蹇収銆?"""
+        """Persist strategy snapshots after important runtime events."""
         if not self._data_mgr:
             return
         interval_limit = max(0.0, float(min_interval_sec or 0.0))
@@ -582,11 +552,7 @@ class StrategyRunner:
         self.save_state()
 
     def _load_state(self) -> bool:
-        """鍔犺浇鍘嗗彶绛栫暐鐘舵€併€?
-
-        Returns:
-            鏄惁鎴愬姛鎭㈠鍑鸿嚦灏戜竴涓瓥鐣ュ疄渚嬨€?
-        """
+        """Load historical strategy state from storage."""
         if not self._data_mgr:
             return False
         runtime_bundle = self._data_mgr.load_strategy_runtime_states(
@@ -639,8 +605,8 @@ class StrategyRunner:
             current_trade_day = minus_one_market_day(current_trade_day)
         if self._position_mgr and loaded_trade_day:
             if loaded_trade_day == current_trade_day:
-                # 鍚屼竴浜ゆ槗鏃ュ唴閲嶅惎鏃讹紝蹇収涓殑 available_quantity 宸茬粡浠ｈ〃褰撴棩鐪熷疄鐘舵€侊紝
-                # 涓嶅簲鍦ㄩ涓?tick 鍒版潵鏃跺啀娆℃墽琛屸€滄柊浜ゆ槗鏃ヨВ閿佲€濄€?
+                # On same-day restart, snapshot available_quantity already reflects current state.
+                # Do not run the new-trading-day unlock again on the first tick.
                 self._position_mgr.mark_trade_day_processed(current_trade_day)
             else:
                 self._position_mgr.unlock_available_quantities(current_trade_day)
@@ -650,11 +616,11 @@ class StrategyRunner:
 
     @staticmethod
     def _has_open_position(position: Optional[PositionInfo]) -> bool:
-        """鍒ゆ柇鎸佷粨瀵硅薄鏄惁浠ｈ〃闈為浂鎸佷粨銆?"""
+        """Return whether the position object represents a non-zero holding."""
         return bool(position and int(getattr(position, "total_quantity", 0) or 0) > 0)
 
     def _restore_position_from_storage_if_needed(self, strategy: BaseStrategy, snapshot: StrategySnapshot) -> None:
-        """褰撳揩鐓т腑鐨勬寔浠撲负绌烘椂锛屼娇鐢?SQLite 鎸佷粨蹇収鍏滃簳鎭㈠銆?"""
+        """Restore position from SQLite when the strategy snapshot has no position."""
         if not self._position_mgr or not self._data_mgr:
             return
         live_position = self._position_mgr.get_position(strategy.strategy_id)
@@ -674,14 +640,14 @@ class StrategyRunner:
 
         self._position_mgr.restore_position(strategy.strategy_id, position)
         logger.info(
-            "StrategyRunner: Strategy[%s] 浣跨敤 SQLite 鎸佷粨鍏滃簳鎭㈠ qty=%d price=%.3f",
+            "StrategyRunner: Strategy[%s] 使用 SQLite 持仓兜底恢复 qty=%d price=%.3f",
             strategy.strategy_id[:8],
             position.total_quantity,
             position.current_price,
         )
 
     def _restore_position_from_trades_if_available(self, strategy: BaseStrategy) -> None:
-        """褰撶瓥鐣ュ瓨鍦ㄦ垚浜ゅ巻鍙叉椂锛屾寜鎴愪氦鍥炴斁閲嶅缓鎸佷粨涓庡彲鍗栨暟閲忋€?"""
+        """Rebuild position and sellable quantity by replaying strategy trades."""
         if not self._position_mgr or not self._data_mgr:
             return
 
@@ -698,14 +664,14 @@ class StrategyRunner:
         rebuilt.stock_code = strategy.stock_code
         self._position_mgr.restore_position(strategy.strategy_id, rebuilt)
         logger.info(
-            "StrategyRunner: Strategy[%s] 浣跨敤鎴愪氦鍥炴斁鎭㈠鎸佷粨 qty=%d available=%d",
+            "StrategyRunner: Strategy[%s] 使用成交回放恢复持仓 qty=%d available=%d",
             strategy.strategy_id[:8],
             rebuilt.total_quantity,
             rebuilt.available_quantity,
         )
 
     def _rebuild_position_from_trade_rows(self, rows: List[dict]) -> Optional[PositionInfo]:
-        """鎸夊崟绛栫暐鎴愪氦璁板綍鍥炴斁閲嶅缓鎸佷粨銆?"""
+        """Replay one strategy trade history into position state."""
         rows = self._dedupe_trade_rows(rows)
         if not rows:
             return None
@@ -739,7 +705,7 @@ class StrategyRunner:
 
     @staticmethod
     def _dedupe_trade_rows(rows: List[dict]) -> List[dict]:
-        """鎸?trade_id 鍘婚噸鎴愪氦璁板綍锛岄伩鍏嶉噸澶嶅洖鏀惧悓涓€绗旀垚浜ゃ€?"""
+        """De-duplicate trade rows by trade id."""
         deduped: List[dict] = []
         seen_trade_ids: set[str] = set()
         for row in rows or []:
@@ -753,7 +719,7 @@ class StrategyRunner:
 
     @staticmethod
     def _trade_day_from_row(row: dict) -> str:
-        """浠庢垚浜よ褰曚腑鎻愬彇浜ゆ槗鏃ワ紝缁熶竴鎴?YYYYMMDD銆?"""
+        """Extract and normalize the trade date as YYYYMMDD."""
         for field in ("traded_time", "trade_time"):
             digits = "".join(ch for ch in str(row.get(field, "") or "") if ch.isdigit())
             if len(digits) < 8:
@@ -773,7 +739,7 @@ class StrategyRunner:
 
     @staticmethod
     def _trade_from_storage_row(row: dict) -> TradeRecord:
-        """鎶婃暟鎹簱鎴愪氦璁板綍鍙嶅簭鍒楀寲涓?TradeRecord銆?"""
+        """Convert a SQLite trade row into a TradeRecord."""
         direction = OrderDirection(str(row.get("direction", OrderDirection.BUY.value) or OrderDirection.BUY.value))
         trade_time = StrategyRunner._parse_db_datetime(row.get("trade_time"))
         return TradeRecord(
@@ -808,7 +774,7 @@ class StrategyRunner:
 
     @staticmethod
     def _position_from_storage_row(row: dict) -> PositionInfo:
-        """鎶?SQLite 鎸佷粨璁板綍杞崲鎴?PositionInfo銆?"""
+        """Convert a SQLite position row into a PositionInfo."""
         fifo_lots = []
         raw_fifo = str(row.get("fifo_lots_json", "") or "").strip()
         if raw_fifo:
@@ -861,16 +827,16 @@ class StrategyRunner:
         )
 
     def _find_strategy_class(self, strategy_name: str) -> Optional[Type[BaseStrategy]]:
-        """鏍规嵁绛栫暐鍚嶇О鎵惧埌瀵瑰簲鐨勭瓥鐣ョ被銆?"""
+        """Find a registered strategy class by name."""
         for cls in self._strategy_classes:
             if cls.strategy_name == strategy_name:
                 return cls
         return None
 
-    # ------------------------------------------------------------------ 璋冨害鍣?
+    # ------------------------------------------------------------------ Scheduler
 
     def _start_scheduler(self) -> None:
-        """鍚姩 APScheduler 瀹氭椂浠诲姟绾跨▼銆?"""
+        """Start the APScheduler jobs for selection and state persistence."""
         try:
             from apscheduler.schedulers.blocking import BlockingScheduler
             from apscheduler.executors.pool import ProcessPoolExecutor as APSProcessPoolExecutor
@@ -880,10 +846,10 @@ class StrategyRunner:
                 "processpool": APSProcessPoolExecutor(max_workers=2),
             }
             self._scheduler = BlockingScheduler(executors=executors)
-            # 寮€鐩樺墠鍒锋柊褰撴棩绛栫暐骞舵縺娲?
+            # Refresh today's strategies before market open and activate them.
             self._scheduler.add_job(self.run_stock_selection, "cron",
                                     hour=9, minute=25, id="stock_selection")
-            # 鏀剁洏鍚庝繚瀛樼姸鎬?
+            # Persist state after market close.
             self._scheduler.add_job(self.save_state, "cron",
                                     hour=15, minute=5, id="save_state")
             if self._state_autosave_interval_sec > 0:
@@ -892,7 +858,7 @@ class StrategyRunner:
                                         id="autosave_state")
             self._scheduler.add_job(self._sync_orders_and_trades_job, "interval",
                                     seconds=30, id="sync_orders_and_trades")
-            # 姣?0鍒嗛挓娓呯悊宸插仠姝㈢瓥鐣?
+            # Clean stopped strategies every 30 minutes.
             self._scheduler.add_job(self._cleanup_stopped, "interval",
                                     minutes=30, id="cleanup")
             self._scheduler_thread = threading.Thread(
@@ -908,13 +874,13 @@ class StrategyRunner:
             logger.error("StrategyRunner: 调度器启动失败: %s", e, exc_info=True)
 
     def _autosave_state(self) -> None:
-        """鐩樹腑鍛ㄦ湡淇濆瓨鐘舵€侊紝闄嶄綆寮傚父閫€鍑哄鑷寸殑鎸佷粨涓㈠け椋庨櫓銆?"""
+        """Periodically persist intraday state to reduce restart risk."""
         if not self._running or not self.is_trading_day():
             return
         self.save_state()
 
     def is_trading_time(self) -> bool:
-        """鍒ゆ柇褰撳墠鏄惁浣嶄簬鏃ュ唴浜ゆ槗鏃舵銆?"""
+        """Return whether the current time is inside the intraday trading window."""
         now = datetime.now()
         if not self.is_trading_day(now):
             return False
@@ -922,12 +888,12 @@ class StrategyRunner:
         return (("09:30" <= t <= "11:30") or ("13:00" <= t <= "15:00"))
 
     def is_trading_day(self, when=None) -> bool:
-        """鍒ゆ柇鎸囧畾鏃ユ湡鏄惁涓轰氦鏄撴棩銆?"""
+        """Return whether the given date is a trading day."""
         target = when or datetime.now()
         return is_market_day(target)
 
     def _activate_for_trading_day(self, reason: str = "") -> bool:
-        """鍦ㄤ氦鏄撴棩婵€娲荤瓥鐣ャ€佹仮澶嶈闃呫€?"""
+        """Activate strategies and subscriptions for a trading day."""
         if not self.is_trading_day():
             logger.info("StrategyRunner: 今日非交易日，跳过策略激活 [%s]", reason or "unknown")
             return False
@@ -950,7 +916,7 @@ class StrategyRunner:
         return True
 
     def _prepare_all_strategies_for_trading_day(self, reason: str = "") -> None:
-        """鍦ㄧ粺涓€璁㈤槄鍓嶏紝鍏堝畬鎴愭墍鏈夌瓥鐣ョ殑浜ゆ槗鏃ラ鍒濆鍖栥€?"""
+        """Run all per-strategy pre-trading-day initialization before subscription sync."""
         trade_day = datetime.now().strftime("%Y%m%d")
         with self._lock:
             strategies = list(self._strategies)
@@ -964,20 +930,20 @@ class StrategyRunner:
                 failed += 1
 
         logger.info(
-            "StrategyRunner: 浜ゆ槗鏃ュ墠鍒濆鍖栧畬鎴?[%s]锛屾垚鍔?%d锛屽け璐?%d",
+            "StrategyRunner: 交易日前初始化完成 [%s]，成功 %d，失败 %d",
             reason or "unknown",
             prepared,
             failed,
         )
 
     def _prepare_strategy_for_trading_day(self, strategy: BaseStrategy, trade_day: str = "") -> bool:
-        """涓哄崟涓瓥鐣ユ墽琛屼氦鏄撴棩鍓嶅垵濮嬪寲銆?"""
+        """Run pre-trading-day initialization for one strategy."""
         target_trade_day = trade_day or datetime.now().strftime("%Y%m%d")
         try:
             return bool(strategy.prepare_for_trading_day(target_trade_day))
         except Exception as exc:
             logger.error(
-                "StrategyRunner: Strategy[%s] 浜ゆ槗鏃ュ墠鍒濆鍖栧け璐? %s",
+                "StrategyRunner: Strategy[%s] 交易日前初始化失败: %s",
                 strategy.strategy_id[:8],
                 exc,
                 exc_info=True,
@@ -989,7 +955,7 @@ class StrategyRunner:
         return
 
     def _sync_subscriptions(self) -> None:
-        """Keep ordinary-tick and Level2 subscriptions aligned with strategy needs."""
+        """Synchronize market data subscriptions with current strategies."""
         if not self._data_sub:
             return
 
@@ -1048,7 +1014,7 @@ class StrategyRunner:
         return valid or {"tick"}
 
     def _restore_pending_orders_from_storage(self) -> int:
-        """浠?SQLite 閲嶅缓蹇収涓褰曠殑娲诲姩璁㈠崟銆?"""
+        """Rebuild active orders recorded in snapshots from SQLite."""
         if not self._data_mgr or not self._order_mgr:
             return 0
 
@@ -1110,7 +1076,7 @@ class StrategyRunner:
         return restored_count
 
     def _cleanup_orphaned_pending_orders_from_storage(self) -> int:
-        """娓呯悊鏁版嵁搴撻噷鏈浠讳綍娲荤瓥鐣ユ帴绠＄殑鏈湴寰呮姤鎸傚崟銆?"""
+        """Clean local pending orders that are not owned by any active strategy."""
         if not self._data_mgr:
             return 0
 
@@ -1154,7 +1120,7 @@ class StrategyRunner:
 
     @staticmethod
     def _deserialize_order_row(row: dict) -> Order:
-        """鎶婃暟鎹簱琛屽弽搴忓垪鍖栨垚鍐呴儴 Order 瀵硅薄銆?"""
+        """Deserialize a SQLite order row into an internal Order object."""
         return Order(
             order_uuid=str(row.get("order_uuid", "") or ""),
             order_trace_id=str(row.get("order_trace_id", "") or ""),
@@ -1197,7 +1163,7 @@ class StrategyRunner:
 
     @staticmethod
     def _parse_db_datetime(value) -> datetime:
-        """鎶?SQLite 鏃堕棿瀛楁瑙ｆ瀽涓?datetime銆?"""
+        """Parse a SQLite timestamp into datetime."""
         text = str(value or "").strip()
         if not text:
             return datetime.now()
@@ -1210,7 +1176,7 @@ class StrategyRunner:
 
     @staticmethod
     def _safe_json_loads(raw: str) -> dict:
-        """瀹夊叏瑙ｆ瀽璁㈠崟蹇収 JSON銆?"""
+        """Safely parse order snapshot JSON."""
         import json
 
         try:
@@ -1220,7 +1186,7 @@ class StrategyRunner:
         return data if isinstance(data, dict) else {}
 
     def _cleanup_stopped(self) -> None:
-        """绉婚櫎宸插仠姝笖鏃犳寔浠撶殑绛栫暐锛屽悓鏃跺綊妗ｇ泩浜?"""
+        """Remove stopped strategies without positions and archive their realized PnL."""
         removed_ids = []
         with self._lock:
             remaining = []
@@ -1249,7 +1215,7 @@ class StrategyRunner:
             self.request_state_persist("cleanup_stopped")
 
     def dispatch_order_update(self, order) -> None:
-        """灏嗚鍗曟洿鏂板垎鍙戠粰瀵瑰簲绛栫暐"""
+        """Dispatch order updates to the owning strategy."""
         strategy = self.get_strategy(order.strategy_id)
         if strategy:
             self._mark_strategy_event(
@@ -1264,13 +1230,13 @@ class StrategyRunner:
             self._last_strategy_event = str(event or "")
 
     def _sync_orders_and_trades_job(self) -> None:
-        """浠呭湪浜ゆ槗鏃舵杩愯涓诲姩鍚屾锛岃ˉ鍋挎紡鍥炴姤鍦烘櫙銆?"""
+        """Run active account synchronization only during trading time."""
         if not self._running or not self.is_trading_time():
             return
         self.sync_orders_and_trades_once(reason="scheduler")
 
     def sync_orders_and_trades_once(self, reason: str = "manual") -> Dict[str, int]:
-        """涓诲姩鎷夊彇璐︽埛濮旀墭/鎴愪氦骞剁籂姝ｆ湰鍦扮姸鎬併€?"""
+        """Fetch account orders and trades and reconcile local state."""
         summary = {
             "trades_synced": 0,
             "orders_synced": 0,
@@ -1305,7 +1271,7 @@ class StrategyRunner:
         return summary
 
     def cancel_entry_orders_and_recover(self, strategy_id: str, remark: str = "") -> Dict[str, object]:
-        """浜哄伐鎾ら攢鏈垚浜ゅ缓浠撳崟锛屽苟鍦ㄥ畨鍏ㄦ椂鎭㈠鍏钩绔炰簤鐘舵€併€?"""
+        """Cancel unfinished entry orders and restore fair competition when safe."""
         strategy = self.get_strategy(strategy_id)
         if not strategy:
             return {"success": False, "message": "策略不存在"}
@@ -1373,7 +1339,7 @@ class StrategyRunner:
         }
 
     def _build_account_position_map(self) -> Dict[str, Dict[str, int]]:
-        """鏌ヨ骞舵爣鍑嗗寲璐︽埛鎸佷粨鏄犲皠銆?"""
+        """Query and normalize account positions."""
         if not self._connection_mgr or not self._connection_mgr.is_connected():
             return {}
 
@@ -1400,15 +1366,7 @@ class StrategyRunner:
         return account_position_map
 
     def _validate_account_constraints(self) -> None:
-        """鍦ㄧ瓥鐣ヨ繍琛屽墠鏍稿璐︽埛璧勪骇鍜岃处鎴锋寔浠撱€?
-
-        鏍￠獙瑙勫垯锛?
-        1. 绛栫暐鐨勬渶澶у彲鐢ㄨ祫閲戜笉鑳芥槑鏄惧ぇ浜庤处鎴峰彲鐢ㄨ祫閲戙€?
-        2. 绛栫暐鍐呴儴璁板綍鐨勬爣鐨勬寔浠撴暟閲忎笉鑳藉ぇ浜庤处鎴风湡瀹炴寔浠撴暟閲忋€?
-        3. 绛栫暐鍐呴儴璁板綍鐨勫彲鐢ㄦ暟閲忎笉鑳藉ぇ浜庤处鎴风湡瀹炲彲鐢ㄦ暟閲忋€?
-
-        娉ㄦ剰锛氳繖閲屾寜鐢ㄦ埛瑕佹眰浠呭彂鍑鸿鍛婏紝涓嶉樆姝㈢▼搴忕户缁繍琛屻€?
-        """
+        """Check account cash and position constraints before strategies run."""
         if not self._connection_mgr or not self._connection_mgr.is_connected():
             logger.info("StrategyRunner: 启动前账户校验已跳过，交易连接未就绪")
             return
@@ -1496,7 +1454,7 @@ class StrategyRunner:
                 self._pause_strategies_for_stock(stock_code, "策略可用持仓超过账户实际可用持仓")
 
     def _sync_position_availability_with_account(self, account_position_map: Dict[str, Dict[str, int]]) -> None:
-        """鎸夎处鎴风湡瀹炲彲鐢ㄦ寔浠撳帇闄嶇瓥鐣ヤ晶 available_quantity銆?"""
+        """Clamp strategy sellable quantity to account sellable holdings."""
         if not self._position_mgr:
             return
 
@@ -1530,7 +1488,7 @@ class StrategyRunner:
         positions: List[PositionInfo],
         account_available: int,
     ) -> Dict[str, int]:
-        """鎸夎处鎴峰彲鐢ㄤ笂闄愬帇闄嶅悓涓€鏍囩殑澶氫釜绛栫暐鐨勫彲鍗栨暟閲忋€?"""
+        """Allocate account sellable quantity across strategies for the same stock."""
         valid_positions = [pos for pos in positions if int(getattr(pos, "total_quantity", 0) or 0) > 0]
         if not valid_positions:
             return {}
@@ -1578,7 +1536,7 @@ class StrategyRunner:
         return allocations
 
     def _pause_strategies_for_stock(self, stock_code: str, reason: str) -> None:
-        """褰撹处鎴锋寔浠撶害鏉熶笉婊¤冻鏃讹紝鏆傚仠鐩稿叧绛栫暐浠ラ伩鍏嶇户缁彂鍑洪敊璇氦鏄撴寚浠ゃ€?"""
+        """Pause strategies when account position constraints are not satisfied."""
         paused_ids = []
         with self._lock:
             for strategy in self._strategies:
@@ -1597,7 +1555,7 @@ class StrategyRunner:
             )
 
     def _sync_trades_from_account(self, queried_trades: List[object]) -> int:
-        """鎶婅处鎴锋垚浜ゆ煡璇㈢粨鏋滆ˉ鐏屽洖鍐呴儴璁㈠崟/鎸佷粨閾捐矾銆?"""
+        """Backfill account trades into the internal order and position chain."""
         if not queried_trades:
             return 0
 
@@ -1645,7 +1603,7 @@ class StrategyRunner:
         return synced
 
     def _get_known_trade_ids(self) -> set[str]:
-        """杩斿洖宸茬煡鎴愪氦 ID 闆嗗悎锛屽苟鍦ㄩ娆′娇鐢ㄦ椂浠庢暟鎹簱棰勭儹銆?"""
+        """Return known trade ids and warm the cache from SQLite on first use."""
         if self._known_trade_ids is None:
             known_trade_ids: set[str] = set()
             if self._data_mgr:
@@ -1658,7 +1616,7 @@ class StrategyRunner:
         return self._known_trade_ids
 
     def _sync_orders_from_account(self, queried_orders: List[object]) -> Dict[str, int]:
-        """鎶婅处鎴峰鎵樻煡璇㈢粨鏋滃洖鍐欏埌鏈湴璁㈠崟鐘舵€併€?"""
+        """Write account order query results back into local order state."""
         summary = {"orders_synced": 0, "state_recovered": 0}
         if not queried_orders:
             return summary
@@ -1745,7 +1703,7 @@ class StrategyRunner:
         seen_xt_order_ids: set[int],
         seen_trace_ids: set[str],
     ) -> bool:
-        """鍒ゆ柇鏈湴娲诲姩鍗曟槸鍚﹀凡鍦ㄦ煖鍙板鎵樺垪琛ㄤ腑鍑虹幇銆?"""
+        """Return whether a local active order still exists in account orders."""
         xt_order_id = int(getattr(local_order, "xt_order_id", 0) or 0)
         if xt_order_id > 0 and xt_order_id in seen_xt_order_ids:
             return True
@@ -1754,7 +1712,7 @@ class StrategyRunner:
 
     @staticmethod
     def _resolve_missing_active_order_status(local_order: Order) -> OrderStatus:
-        """涓衡€滄煖鍙颁晶涓嶅瓨鍦ㄢ€濈殑鏈湴娲诲姩鍗曢€夋嫨鏀舵暃缁堟€併€?"""
+        """Choose a terminal status for local active orders missing from account orders."""
         if int(getattr(local_order, "filled_quantity", 0) or 0) > 0:
             return OrderStatus.PART_CANCEL
         if int(getattr(local_order, "xt_order_id", 0) or 0) > 0:
@@ -1762,7 +1720,7 @@ class StrategyRunner:
         return OrderStatus.JUNK
 
     def _recover_strategy_after_entry_release(self, strategy: BaseStrategy) -> bool:
-        """鍦ㄦ棤鎸佷粨涓旀棤娲诲姩涔板崟鏃讹紝鎶婄瓥鐣ユ敹鏁涘洖姝ｇ‘鐘舵€併€?"""
+        """Recover strategy state after an entry order is released."""
         if not strategy or strategy.status == StrategyStatus.STOPPED:
             return False
 
@@ -1780,7 +1738,7 @@ class StrategyRunner:
         return True
 
     def _warn_preflight(self, message: str) -> None:
-        """缁熶竴澶勭悊鍚姩鍓嶆牎楠岃鍛婏細鍚屾椂鍐欐棩蹇楀苟鍙戦€佸憡璀︺€?"""
+        """Log and send a startup preflight warning."""
         logger.warning(message)
         if self._alert_callback:
             try:
@@ -1790,7 +1748,7 @@ class StrategyRunner:
 
     @staticmethod
     def _map_xt_order_status(xt_status) -> OrderStatus:
-        """灏?xtquant 鍘熷璁㈠崟鐘舵€佺爜鏄犲皠涓哄唴閮ㄧ姸鎬併€?"""
+        """Map xtquant order status into the internal status enum."""
         mapping = {
             48: OrderStatus.UNREPORTED,
             49: OrderStatus.WAIT_REPORTING,
@@ -1808,7 +1766,7 @@ class StrategyRunner:
 
     @staticmethod
     def _extract_public_attrs(payload) -> Dict[str, object]:
-        """鎻愬彇瀵硅薄涓婄殑鍏紑灞炴€э紝渚夸簬璋冭瘯鍜屾寔涔呭寲銆?"""
+        """Extract public object attributes for debugging and persistence."""
         data: Dict[str, object] = {}
         if payload is None:
             return data
@@ -1825,7 +1783,7 @@ class StrategyRunner:
         return data
 
     def _build_xt_order_payload(self, order) -> Dict[str, object]:
-        """鎶婃煡璇㈠緱鍒扮殑 XtOrder 瀵硅薄杞崲鎴愮粺涓€ dict銆?"""
+        """Convert an XtOrder object into a normalized dict."""
         return {
             "account_type": int(getattr(order, "account_type", 0) or 0),
             "account_id": str(getattr(order, "account_id", "") or ""),
@@ -1853,7 +1811,7 @@ class StrategyRunner:
 
     @staticmethod
     def _xt_to_code(xt_code: str) -> str:
-        """鎶?xtquant 璇佸埜浠ｇ爜杞崲涓?6 浣嶅唴閮ㄨ瘉鍒镐唬鐮併€?"""
+        """Convert an xtquant security code into the internal six-digit code."""
         return xt_code.split(".")[0] if "." in xt_code else xt_code
 
 

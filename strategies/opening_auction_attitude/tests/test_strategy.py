@@ -231,9 +231,7 @@ def test_auction_reference_metrics_link_final_trades_to_late_buy_orders():
 
     assert round(metrics["open_pct"], 2) == 3.0
     assert metrics["final_auction_amount"] == 3_000_000
-    assert metrics["last20_bid_amount"] == 1_200_000
     assert metrics["last10_bid_amount"] == 1_000_000
-    assert metrics["final_from_last20_bid_pct"] == 100.0
     assert metrics["final_from_last10_bid_pct"] == 80.0
     assert metrics["final_from_limit_up_bid_pct"] == 80.0
 

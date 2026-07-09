@@ -90,12 +90,9 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         self._orders_by_no: dict[str, dict[str, Any]] = {}
         self._final_tx_amount = 0.0
         self._final_tx_count = 0
-        self._final_from_last20_bid_amount = 0.0
         self._final_from_last10_bid_amount = 0.0
         self._final_from_limit_up_bid_amount = 0.0
-        self._last20_bid_amount = 0.0
         self._last10_bid_amount = 0.0
-        self._last20_bid_count = 0
         self._last10_bid_count = 0
         self._final_auction_quote_amount = 0.0
         self._open_price_0925 = 0.0
@@ -211,9 +208,6 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
             return
         if side == "BUY":
             self._big_buy_order_amount += amount
-            if self._in_last20_bid_window(event.event_time):
-                self._last20_bid_amount += amount
-                self._last20_bid_count += 1
             if self._in_last10_bid_window(event.event_time):
                 self._last10_bid_amount += amount
                 self._last10_bid_count += 1
@@ -237,8 +231,6 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
                 buy_order = self._orders_by_no.get(str(event.buy_no or "").strip())
                 if buy_order:
                     order_time = buy_order.get("event_time")
-                    if self._in_last20_bid_window(order_time):
-                        self._final_from_last20_bid_amount += amount
                     if self._in_last10_bid_window(order_time):
                         self._final_from_last10_bid_amount += amount
                     if self._is_limit_up_bid_order(buy_order):
@@ -442,21 +434,17 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
             "post_0920_low_time": self._post_0920_low_time.strftime("%H:%M:%S") if self._post_0920_low_time else "",
             "final_vs_post_0920_low_pct": final_vs_low_pct,
             "final_auction_amount": float(final_amount or 0.0),
-            "final_amount_gt_3000w": final_amount > 30_000_000,
+            "final_amount_gt_1500w": final_amount > 15_000_000,
             "final_price_gt_post_0920_low": (
                 self._post_0920_low_price > 0 and final_price > self._post_0920_low_price
             ),
-            "open_pct_gt_3": open_pct > 3.0,
+            "open_pct_gt_4": open_pct > 4.0,
             "final_amount_source": final_amount_source,
             "tx_detail_available": tx_detail_available,
             "final_tx_amount": float(self._final_tx_amount or 0.0),
             "final_tx_count": int(self._final_tx_count or 0),
             "last10_bid_amount": float(self._last10_bid_amount or 0.0),
-            "last20_bid_amount": float(self._last20_bid_amount or 0.0),
             "last10_bid_count": int(self._last10_bid_count or 0),
-            "last20_bid_count": int(self._last20_bid_count or 0),
-            "final_from_last20_bid_amount": float(self._final_from_last20_bid_amount or 0.0),
-            "final_from_last20_bid_pct": self._amount_pct(self._final_from_last20_bid_amount, self._final_tx_amount),
             "final_from_last10_bid_amount": float(self._final_from_last10_bid_amount or 0.0),
             "final_from_last10_bid_pct": self._amount_pct(self._final_from_last10_bid_amount, self._final_tx_amount),
             "limit_up_price": float(self._effective_limit_up_price() or 0.0),
@@ -495,12 +483,6 @@ class OpeningAuctionAttitudeStrategy(BaseStrategy):
         if self._post_0920_low_price <= 0 or price < self._post_0920_low_price:
             self._post_0920_low_price = price
             self._post_0920_low_time = event_time
-
-    @staticmethod
-    def _in_last20_bid_window(event_time: datetime | None) -> bool:
-        if event_time is None:
-            return False
-        return time(9, 24, 40) <= event_time.time() < time(9, 25, 0)
 
     @staticmethod
     def _in_last10_bid_window(event_time: datetime | None) -> bool:

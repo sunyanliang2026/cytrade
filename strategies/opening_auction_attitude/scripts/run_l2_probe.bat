@@ -4,8 +4,7 @@ chcp 65001 >nul
 
 set "SCRIPT_DIR=%~dp0"
 set "REPO_ROOT=%SCRIPT_DIR%..\..\.."
-set "CONDA_PYTHON=C:\Users\ysun\miniconda3\envs\cytrade311\python.exe"
-set "DEFAULT_POOL=%REPO_ROOT%\data\stock_pools\current\main_seal_follow_pool.csv"
+set "DEFAULT_POOL=%REPO_ROOT%\strategies\opening_auction_attitude\data\opening_auction_universe.csv"
 
 for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TS=%%I"
 set "OUT_DIR=%REPO_ROOT%\data\probe\opening_auction_l2\%TS%"
@@ -14,11 +13,9 @@ set "LOG_FILE=%LOG_DIR%\opening_auction_l2_%TS%.log"
 
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 
-if exist "%CONDA_PYTHON%" (
-  set "PYTHON_EXE=%CONDA_PYTHON%"
-) else (
-  set "PYTHON_EXE=python"
-)
+call "%REPO_ROOT%\scripts\run\load_runtime_env.bat"
+if errorlevel 1 exit /b 1
+set "PYTHON_EXE=%CYTRADE_PYTHON%"
 
 echo [cytrade] python=%PYTHON_EXE%
 echo [cytrade] output=%OUT_DIR%

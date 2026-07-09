@@ -1,0 +1,18 @@
+{
+  "sets": {
+    "iwencai.limitup_direct": {
+      "source": "iwencai",
+      "query": "涨停，主板非st，最近50日单日最高成交额，实际流通市值大于19亿,30日最大振幅小于60%，20日区间涨幅小于40%，几天几板"
+    }
+  },
+  "final": {
+    "union": [
+      "iwencai.limitup_direct"
+    ]
+  },
+  "jiuyangongshe": {
+    "enabled": true,
+    "user_url": "https://www.jiuyangongshe.com/u/4df747be1bf143a998171ef03559b517",
+    "require_today": true
+  }
+}

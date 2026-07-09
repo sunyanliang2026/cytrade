@@ -32,8 +32,8 @@ from strategies.opening_auction_attitude import (
 
 
 DEFAULT_RAW_NAME = "opening_l2_raw.jsonl"
-DEFAULT_NAME_POOL = "data/stock_pools/current/main_seal_follow_pool.csv"
-DEFAULT_NAME_POOL_ROOT = "data/stock_pools"
+DEFAULT_NAME_POOL = "strategies/opening_auction_attitude/data/opening_auction_universe.csv"
+DEFAULT_NAME_POOL_ROOT = "strategies/opening_auction_attitude/data"
 
 
 def exchange_for(stock: str) -> str:

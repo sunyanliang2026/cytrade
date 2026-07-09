@@ -18,6 +18,13 @@ data/db/*.sqlite3
 data/probe/
 data/replay/
 data/stock_pools/
+data/standalone_stock_pool/
+strategies/main_seal_follow/data/source_cache/
+strategies/opening_auction_attitude/data/source_cache/
+strategies/opening_auction_attitude/data/opening_auction_source_pool*.csv
+strategies/opening_auction_attitude/data/opening_auction_universe.csv
+strategies/opening_auction_attitude/data/test_opening_auction_pool_*.csv
+strategies/opening_auction_attitude/output/stock_pool_runs/
 .tmp_pytest*/
 docs/_zip_inspect/
 config/main_seal_follow_pool.backup_*.csv

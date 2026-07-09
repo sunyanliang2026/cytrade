@@ -1,0 +1,52 @@
+{
+  "sets": {
+    "iwencai.limitup_direct": {
+      "source": "iwencai",
+      "query": "涨停，实际流通市值大于19亿，30日最大振幅小于50%，20日区间涨幅小于50%，非ST，主板"
+    },
+    "iwencai.base_strong": {
+      "source": "iwencai",
+      "query": "20日区间涨幅小于50%，收盘价大于30日最高价的85%，收盘价小于60日最低价的150%，主板非ST，实际换手率大于6%，实际流通市值大于30亿"
+    },
+    "jiuyangongshe.hot_events": {
+      "source": "jiuyangongshe",
+      "node": "hot_events"
+    },
+    "jiuyangongshe.daily_announcements": {
+      "source": "jiuyangongshe",
+      "node": "daily_announcements"
+    },
+    "jiuyangongshe.limit_events": {
+      "source": "jiuyangongshe",
+      "node": "limit_events"
+    }
+  },
+  "final": {
+    "union": [
+      "iwencai.limitup_direct",
+      {
+        "intersect": [
+          "jiuyangongshe.hot_events",
+          "iwencai.base_strong"
+        ]
+      },
+      {
+        "intersect": [
+          "jiuyangongshe.daily_announcements",
+          "iwencai.base_strong"
+        ]
+      },
+      {
+        "intersect": [
+          "jiuyangongshe.limit_events",
+          "iwencai.base_strong"
+        ]
+      }
+    ]
+  },
+  "jiuyangongshe": {
+    "enabled": true,
+    "user_url": "https://www.jiuyangongshe.com/u/4df747be1bf143a998171ef03559b517",
+    "require_today": true
+  }
+}

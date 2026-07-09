@@ -214,7 +214,10 @@ def run_probe(pool_path: str, seconds: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Dry-run live probe for MainSealFollow stock pool.")
-    parser.add_argument("--pool", default=str(REPO_ROOT / "data" / "stock_pools" / "current" / "main_seal_follow_pool.csv"))
+    parser.add_argument(
+        "--pool",
+        default=str(REPO_ROOT / "strategies" / "main_seal_follow" / "data" / "main_seal_follow_pool.csv"),
+    )
     parser.add_argument("--seconds", type=int, default=60)
     args = parser.parse_args()
     run_probe(args.pool, args.seconds)
