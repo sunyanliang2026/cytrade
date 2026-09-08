@@ -1,0 +1,8 @@
+{
+  "dry_run": false,
+  "low_price_threshold": 8.0,
+  "low_price_min_lots": 5000,
+  "normal_price_min_amount": 5000000.0,
+  "neighbor_count": 10,
+  "neighbor_window_seconds": 3.0
+}
