@@ -50,6 +50,7 @@ class _FakeConnection:
         self._ready = ready
         self._last_error = last_error or {}
         self._asset = asset
+        self.asset_queries = 0
 
     def get_trader(self):
         return self._trader
@@ -65,6 +66,7 @@ class _FakeConnection:
         return dict(self._last_error)
 
     def query_stock_asset(self):
+        self.asset_queries += 1
         return self._asset
 
 
@@ -132,6 +134,15 @@ def test_trade_executor_dry_run_keeps_mock_order_path(monkeypatch):
     assert order in order_mgr.get_active_orders()
 
 
+def test_buy_limit_does_not_round_float_noise_to_next_tick(monkeypatch):
+    monkeypatch.setattr("trading.executor._XT_AVAILABLE", False)
+    executor = TradeExecutor(None, OrderManager(), live_trading_enabled=False)
+
+    order = executor.buy_limit("s1", "strategy", "002909", 7.930000000000001, 100)
+
+    assert order.price == 7.93
+
+
 def test_trade_executor_dry_run_never_touches_live_counter_when_connected(monkeypatch):
     monkeypatch.setattr("trading.executor._XT_AVAILABLE", True)
     trader = _FakeTrader()
@@ -186,6 +197,23 @@ def test_trade_executor_live_ready_submits_async_order(monkeypatch):
     assert order_mgr._seq_to_uuid[12345] == order.order_uuid
     assert order.xt_fields["preflight_available_cash"] == 5000.0
     assert order.xt_fields["preflight_required_amount"] == 1001.0
+
+
+def test_armed_limit_buy_batch_uses_one_asset_query_for_multiple_orders(monkeypatch):
+    monkeypatch.setattr("trading.executor._XT_AVAILABLE", True)
+    trader = _FakeTrader()
+    conn = _FakeConnection(trader=trader, account=_FakeAccount(), ready=True, asset=_FakeAsset(cash=5000))
+    executor = TradeExecutor(conn, OrderManager(), live_trading_enabled=True)
+
+    preflight = executor.arm_limit_buy_batch([("001259", 10.01, 100), ("001259", 10.01, 100)])
+    first = executor.buy_limit("s1", "strategy", "001259", 10.01, 100)
+    second = executor.buy_limit("s1", "strategy", "001259", 10.01, 100)
+
+    assert preflight["ok"] is True
+    assert conn.asset_queries == 1
+    assert first.xt_fields["batch_preflight"] is True
+    assert second.xt_fields["batch_preflight"] is True
+    assert len(trader.orders) == 2
 
 
 def test_trade_executor_live_blocks_insufficient_cash(monkeypatch):

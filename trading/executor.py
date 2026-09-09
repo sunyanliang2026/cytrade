@@ -64,6 +64,8 @@ class TradeExecutor:
         self._position_mgr = position_mgr
         # 必须显式打开 live，执行器才允许把请求发到底层柜台。
         self._live_trading_enabled = bool(live_trading_enabled)
+        self._armed_batch_buy_orders: dict[tuple[str, float, int], int] = {}
+        self._armed_batch_available_cash: Optional[float] = None
 
     @property
     def connection_manager(self):
@@ -125,6 +127,39 @@ class TradeExecutor:
             "total_asset": total_asset,
         }
 
+    def arm_limit_buy_batch(self, requests: list[tuple[str, float, int]]) -> dict:
+        """Check one frozen batch once, then avoid per-order asset queries.
+
+        The caller must submit exactly these requests immediately afterwards.
+        """
+        normalized = []
+        total_required = 0.0
+        for stock_code, price, quantity in requests:
+            normalized_price = self._normalize_limit_price(stock_code, OrderDirection.BUY, price)
+            required = normalized_price * int(quantity or 0)
+            if not self._is_valid_stock_code(stock_code) or normalized_price <= 0 or int(quantity or 0) <= 0:
+                return {"ok": False, "reason": "invalid_batch_order"}
+            normalized.append((self._batch_buy_key(stock_code, normalized_price, quantity), required))
+            total_required += required
+        if not self._live_trading_enabled:
+            return {"ok": True, "available_cash": None, "required_amount": total_required}
+        asset = self._query_live_asset()
+        available_cash = self._extract_available_cash(asset) if asset is not None else None
+        if available_cash is None:
+            return {"ok": False, "reason": "buying_power_cash_unavailable"}
+        if available_cash + 1e-6 < total_required:
+            return {
+                "ok": False,
+                "reason": "insufficient_cash",
+                "available_cash": available_cash,
+                "required_amount": total_required,
+            }
+        self._armed_batch_buy_orders = {}
+        for key, _ in normalized:
+            self._armed_batch_buy_orders[key] = self._armed_batch_buy_orders.get(key, 0) + 1
+        self._armed_batch_available_cash = available_cash
+        return {"ok": True, "available_cash": available_cash, "required_amount": total_required}
+
     # ------------------------------------------------------------------ 买入
 
     def buy_limit(self, strategy_id: str, strategy_name: str,
@@ -132,7 +167,15 @@ class TradeExecutor:
                   quantity: int, remark: str = "") -> Order:
         """提交限价买入订单。"""
         # 这里先构造内部 Order 对象，再统一交给 _submit_order 发出。
-        order = Order(
+        return self._submit_order(self.prepare_limit_buy(
+            strategy_id, strategy_name, stock_code, price, quantity, remark
+        ))
+
+    def prepare_limit_buy(self, strategy_id: str, strategy_name: str,
+                          stock_code: str, price: float,
+                          quantity: int, remark: str = "") -> Order:
+        """Construct a limit BUY order without submitting it."""
+        return Order(
             strategy_id=strategy_id,
             strategy_name=strategy_name,
             stock_code=stock_code,
@@ -142,8 +185,6 @@ class TradeExecutor:
             quantity=quantity,
             remark=remark or f"限价买入 {stock_code}",
         )
-        return self._submit_order(order)
-
     def buy_latest(self, strategy_id: str, strategy_name: str,
                    stock_code: str, quantity: int, remark: str = "") -> Order:
         """提交最新价买入订单。"""
@@ -389,6 +430,7 @@ class TradeExecutor:
             # 让后续策略链路依旧可以完整演练。
             order.xt_order_id = int(time.time() * 1000) % 2**31
             order.status = OrderStatus.WAIT_REPORTING
+            order.xt_fields["submit_seq"] = seq
             self._order_mgr.register_order(order)
             logger.info("[ORDER] [MOCK] 下单 uuid=%s code=%s dir=%s price=%.3f qty=%d",
                         order.order_uuid[:8], order.stock_code,
@@ -411,6 +453,8 @@ class TradeExecutor:
             self._log_live_order_preflight(order, account)
 
             # order_stock_async 返回的是本地下单序列号 seq，真正的柜台订单号要等异步回报再绑定。
+            call_started = time.perf_counter_ns()
+            call_wall_time = time.time_ns()
             seq = trader.order_stock_async(
                 account,
                 xt_code,
@@ -421,20 +465,19 @@ class TradeExecutor:
                 order.strategy_name,
                 order.order_trace_id,
             )
+            call_returned = time.perf_counter_ns()
+            order.xt_fields["submit_call_time_ns"] = call_wall_time
+            order.xt_fields["submit_return_time_ns"] = time.time_ns()
+            order.xt_fields["submit_elapsed_us"] = (call_returned - call_started) / 1000.0
             order.status = OrderStatus.WAIT_REPORTING
             self._order_mgr.register_order(order)
             self._order_mgr.register_seq(seq, order.order_uuid)
-            logger.info(
-                "[ORDER] 下单提交 uuid=%s trace=%s seq=%d code=%s dir=%s price=%.3f qty=%d remark=%s",
-                order.order_uuid[:8],
-                order.order_trace_id,
-                seq,
-                order.stock_code,
-                order.direction.value,
-                order.price,
-                order.quantity,
-                order.remark,
-            )
+            if not order.xt_fields.get("batch_preflight"):
+                logger.info(
+                    "[ORDER] 下单提交 uuid=%s trace=%s seq=%d code=%s dir=%s price=%.3f qty=%d remark=%s",
+                    order.order_uuid[:8], order.order_trace_id, seq, order.stock_code,
+                    order.direction.value, order.price, order.quantity, order.remark,
+                )
         except Exception as e:
             order.status = OrderStatus.JUNK
             order.status_msg = str(e or "")
@@ -523,6 +566,14 @@ class TradeExecutor:
         required_amount = self._estimate_required_amount(order)
         if required_amount <= 0:
             return "buying_power_price_missing"
+        batch_key = self._batch_buy_key(order.stock_code, order.price, order.quantity)
+        remaining = self._armed_batch_buy_orders.get(batch_key, 0)
+        if remaining > 0:
+            self._armed_batch_buy_orders[batch_key] = remaining - 1
+            order.xt_fields["preflight_available_cash"] = self._armed_batch_available_cash
+            order.xt_fields["preflight_required_amount"] = required_amount
+            order.xt_fields["batch_preflight"] = True
+            return ""
         asset = self._query_live_asset()
         if asset is None:
             return f"buying_power_asset_unavailable:required_amount={required_amount:.2f}"
@@ -538,6 +589,10 @@ class TradeExecutor:
         order.xt_fields["preflight_available_cash"] = available_cash
         order.xt_fields["preflight_required_amount"] = required_amount
         return ""
+
+    @staticmethod
+    def _batch_buy_key(stock_code: str, price: float, quantity: int) -> tuple[str, float, int]:
+        return (str(stock_code or "").split(".", 1)[0].zfill(6), round(float(price or 0.0), 3), int(quantity or 0))
 
     def _query_live_asset(self):
         if not self._conn_mgr or not hasattr(self._conn_mgr, "query_stock_asset"):
@@ -587,6 +642,8 @@ class TradeExecutor:
 
     def _log_live_order_preflight(self, order: Order, account) -> None:
         if not self._live_trading_enabled:
+            return
+        if order.xt_fields.get("batch_preflight"):
             return
         logger.warning(
             (
@@ -743,6 +800,14 @@ class TradeExecutor:
         decimal_price = Decimal(str(price))
         units = decimal_price / tick
         rounding = ROUND_CEILING if direction == OrderDirection.BUY else ROUND_FLOOR
+        # Values such as 7.930000000000001 are the binary-float form of an
+        # exact 7.93 quote. Remove only this representation noise; a genuine
+        # off-tick price must still be rounded according to the order side.
+        epsilon = Decimal("1e-9")
+        if direction == OrderDirection.BUY:
+            units -= epsilon
+        else:
+            units += epsilon
         normalized = units.to_integral_value(rounding=rounding) * tick
         return float(normalized)
 

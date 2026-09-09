@@ -30,6 +30,9 @@ class SubmissionResult:
     reason: str = ""
     order_uuid: str = ""
     submission_seq: int = 0
+    submit_call_time_ns: int = 0
+    submit_return_time_ns: int = 0
+    submit_elapsed_us: float = 0.0
 
 
 class OvernightLimitUpBuyStrategy(BaseStrategy):
@@ -48,6 +51,7 @@ class OvernightLimitUpBuyStrategy(BaseStrategy):
         self._source_row = int(params.get("source_row", 0) or 0)
         self._request_key = str(params.get("request_key") or f"stock:{self.stock_code}")
         self._submitted_trade_days = set(str(item) for item in (params.get("submitted_trade_days") or []))
+        self._prepared_order = None
 
     @classmethod
     def required_data_kinds(cls) -> set[str]:
@@ -124,7 +128,13 @@ class OvernightLimitUpBuyStrategy(BaseStrategy):
             f"trade_day={trade_day_text} amount={self._amount:.2f} "
             f"limit_up={limit_up_price:.3f} qty={quantity}"
         )
-        order = self.add_position(limit_up_price, quantity, remark=remark)
+        order = self._prepared_order
+        if order is None:
+            order = self.add_position(limit_up_price, quantity, remark=remark)
+        else:
+            order = self._trade_executor._submit_order(order)
+            self._track_order(order)
+            self.__class__._sync_class_stats(self._position_mgr)
         if not order:
             return self._result(
                 status="failed",
@@ -170,6 +180,22 @@ class OvernightLimitUpBuyStrategy(BaseStrategy):
             order=order,
         )
 
+    def prepare_order(self, limit_up_price: float, quantity: int) -> bool:
+        """Freeze the order object before the dispatch time."""
+        prepare = getattr(self._trade_executor, "prepare_limit_buy", None)
+        if not callable(prepare):
+            return False
+        remark = (
+            "overnight_limit_up_buy "
+            f"trade_day=preflight amount={self._amount:.2f} "
+            f"limit_up={limit_up_price:.3f} qty={quantity}"
+        )
+        self._prepared_order = prepare(
+            self.strategy_id, self.strategy_name, self.stock_code,
+            limit_up_price, quantity, remark,
+        )
+        return True
+
     @property
     def request_key(self) -> str:
         return self._request_key
@@ -196,6 +222,9 @@ class OvernightLimitUpBuyStrategy(BaseStrategy):
             reason=reason,
             order_uuid=str(getattr(order, "order_uuid", "") or ""),
             submission_seq=int(getattr(order, "xt_fields", {}).get("submit_seq", 0) or 0),
+            submit_call_time_ns=int(getattr(order, "xt_fields", {}).get("submit_call_time_ns", 0) or 0),
+            submit_return_time_ns=int(getattr(order, "xt_fields", {}).get("submit_return_time_ns", 0) or 0),
+            submit_elapsed_us=float(getattr(order, "xt_fields", {}).get("submit_elapsed_us", 0.0) or 0.0),
         )
 
     @staticmethod

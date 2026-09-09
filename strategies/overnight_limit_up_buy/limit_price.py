@@ -53,7 +53,7 @@ class LimitUpPriceProvider:
 
         target_day = expected_trade_day or date.today()
         detail = self._get_instrument_detail(xt_code)
-        previous_close = self._get_previous_close(xt_code, target_day)
+        previous_close = self._get_previous_close(xt_code, target_day, detail)
         derived_price = calculate_limit_up_price(previous_close, stock_code, detail) if previous_close > 0 else 0.0
         tick_price = self._from_full_tick(xt_code, stock_code, target_day)
         if derived_price > 0:
@@ -111,21 +111,43 @@ class LimitUpPriceProvider:
         return detail if isinstance(detail, dict) else {}
 
     def _from_full_tick(self, xt_code: str, stock_code: str, expected_trade_day: date | None = None) -> float:
-        getter = getattr(xtdata, "get_full_tick", None) if xtdata is not None else None
-        if not callable(getter):
-            return 0.0
-        try:
-            tick_map = getter([xt_code]) or {}
-        except Exception:
-            return 0.0
-        if not isinstance(tick_map, dict):
-            return 0.0
-        payload = tick_map.get(xt_code) or tick_map.get(stock_code) or {}
+        payload = self._get_full_tick(xt_code, stock_code)
         if not tick_day_is_current(payload, expected_trade_day):
             return 0.0
         return extract_limit_up_price(payload)
 
-    def _get_previous_close(self, xt_code: str, target_day: date) -> float:
+    def _get_full_tick(self, xt_code: str, stock_code: str) -> dict:
+        getter = getattr(xtdata, "get_full_tick", None) if xtdata is not None else None
+        if not callable(getter):
+            return {}
+        try:
+            tick_map = getter([xt_code]) or {}
+        except Exception:
+            return {}
+        if not isinstance(tick_map, dict):
+            return {}
+        payload = tick_map.get(xt_code) or tick_map.get(stock_code) or {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _get_previous_close(self, xt_code: str, target_day: date, detail: dict) -> float:
+        # Before the open, QMT's daily history can lag. In the overnight
+        # snapshot, detail.PreClose/ tick.lastClose are the close from the
+        # session before detail.TradingDay; tick.lastPrice is detail.TradingDay
+        # close and is therefore today's previous close.
+        detail_close = extract_previous_close(detail)
+        detail_day = normalize_day(detail.get("TradingDay") or detail.get("tradingDay"))
+        tick = self._get_full_tick(xt_code, xt_code)
+        tick_close = extract_last_price(tick)
+        tick_day = extract_tick_day(tick)
+        if tick_close > 0 and detail_day and tick_day == detail_day and tick_day < target_day:
+            return tick_close
+        if detail_close > 0 and detail_day and detail_day == target_day and not tick:
+            return detail_close
+        if detail_close > 0 and detail_day and detail_day <= target_day and tick:
+            return 0.0
+
+        # Compatibility fallback for QMT/test providers that do not expose
+        # PreClose in instrument detail. Real QMT data takes the branch above.
         getter = getattr(xtdata, "get_market_data_ex", None) if xtdata is not None else None
         if not callable(getter):
             return 0.0
@@ -179,14 +201,49 @@ def tick_day_is_current(payload: Any, today: date | None = None) -> bool:
     raw_time = payload.get("time") or payload.get("timestamp") or payload.get("dataTime")
     if raw_time in (None, "", 0):
         return False
+    observed = extract_tick_day(payload)
+    return observed == (today or date.today()) if observed else True
+
+
+def extract_tick_day(payload: Any) -> date | None:
+    if not isinstance(payload, dict):
+        return None
+    raw_time = payload.get("time") or payload.get("timestamp") or payload.get("dataTime")
+    if raw_time in (None, "", 0):
+        return None
     try:
         value = float(raw_time)
         if value > 10_000_000_000:
             value /= 1000.0
-        observed = datetime.fromtimestamp(value).date()
+        return datetime.fromtimestamp(value).date()
     except (TypeError, ValueError, OSError, OverflowError):
-        return True
-    return observed == (today or date.today())
+        return None
+
+
+def extract_previous_close(payload: Any) -> float:
+    if not isinstance(payload, dict):
+        return 0.0
+    for key in ("PreClose", "preClose", "lastClose", "LastClose"):
+        try:
+            value = float(payload.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0.0
+
+
+def extract_last_price(payload: Any) -> float:
+    if not isinstance(payload, dict):
+        return 0.0
+    for key in ("lastPrice", "LastPrice", "price", "Price"):
+        try:
+            value = float(payload.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0.0
 
 
 def prices_equal(left: float, right: float) -> bool:

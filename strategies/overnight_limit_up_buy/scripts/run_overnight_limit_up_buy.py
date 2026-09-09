@@ -93,13 +93,17 @@ def wait_until(target: datetime, logger, *, now_provider=None, sleep_fn=None) ->
         if now >= target:
             return
         remaining = max(0.0, (target - now).total_seconds())
+        if remaining <= 0.25:
+            # Avoid the normal scheduler quantum crossing the dispatch time.
+            sleep_fn(min(0.001, remaining))
+            continue
         logger.info(
             "%s waiting target_time=%s remaining_sec=%.0f",
             SESSION_EVENT_PREFIX,
             target.strftime("%H:%M:%S"),
             remaining,
         )
-        sleep_fn(min(30.0, max(0.1, remaining)))
+        sleep_fn(min(30.0, max(0.1, remaining - 0.2)))
 
 
 def build_dry_run_executor() -> TradeExecutor:
@@ -205,6 +209,9 @@ def build_frozen_plan(configs, provider, executor, store, trade_day: date) -> tu
             ]
         for plan in plans:
             plan.strategy.config.params["batch_available_cash"] = funding.get("available_cash")
+    for plan in plans:
+        if callable(getattr(plan.strategy, "prepare_order", None)):
+            plan.strategy.prepare_order(plan.limit_up_price, plan.quantity)
     return plans, []
 
 
@@ -225,6 +232,12 @@ def display_frozen_plan(plans: list[FrozenOrderPlan], *, trade_day: date, submit
     if available_cash is not None:
         print(f"Available cash at preflight: {float(available_cash):.2f}")
     print()
+
+
+def format_ns_timestamp(value: int) -> str:
+    if not value:
+        return ""
+    return datetime.fromtimestamp(value / 1_000_000_000).isoformat(timespec="microseconds")
 
 
 def confirm_frozen_plan(args: argparse.Namespace) -> bool:
@@ -357,6 +370,14 @@ def run_session(
             SESSION_EVENT_PREFIX, plan.source_row, result.stock_code, result.status, result.submission_seq,
             result.reason, result.amount, result.limit_up_price, result.quantity, result.order_uuid[:8],
         )
+        if result.submit_call_time_ns:
+            logger.info(
+                "%s timing row=%d stock=%s call=%s return=%s elapsed_us=%.1f seq=%d",
+                SESSION_EVENT_PREFIX, plan.source_row, plan.stock_code,
+                format_ns_timestamp(result.submit_call_time_ns),
+                format_ns_timestamp(result.submit_return_time_ns),
+                result.submit_elapsed_us, result.submission_seq,
+            )
 
     submitted = sum(1 for _, item in results if item.status == "submitted")
     skipped = sum(1 for _, item in results if item.status == "skipped")

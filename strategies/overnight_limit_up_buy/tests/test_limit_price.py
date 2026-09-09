@@ -134,3 +134,37 @@ def test_provider_ignores_snapshot_from_previous_day(monkeypatch):
     monkeypatch.setattr(limit_price, "_XT_AVAILABLE", True)
 
     assert LimitUpPriceProvider().get_limit_up_price("600108") == 5.83
+
+
+def test_provider_uses_detail_preclose_when_daily_history_is_stale(monkeypatch):
+    fake = _FakeXtData()
+    fake.detail["603999.SH"] = {
+        "PreClose": 6.63,
+        "UpStopPrice": 7.29,
+        "TradingDay": "20260908",
+    }
+    fake.tick["603999.SH"] = {
+        "lastClose": 6.63,
+        "lastPrice": 7.29,
+        "time": int(datetime(2026, 9, 8, 15, 0).timestamp() * 1000),
+    }
+    monkeypatch.setattr(limit_price, "xtdata", fake)
+    monkeypatch.setattr(limit_price, "_XT_AVAILABLE", True)
+
+    provider = LimitUpPriceProvider()
+
+    assert provider.get_limit_up_quote("603999", date(2026, 9, 9)) == (8.02, 7.29)
+
+
+def test_provider_rejects_tick_from_different_session(monkeypatch):
+    fake = _FakeXtData()
+    fake.detail["603999.SH"] = {"PreClose": 6.63, "TradingDay": "20260908"}
+    fake.tick["603999.SH"] = {
+        "lastClose": 6.63,
+        "lastPrice": 6.63,
+        "time": int(datetime(2026, 9, 7, 15, 0).timestamp() * 1000),
+    }
+    monkeypatch.setattr(limit_price, "xtdata", fake)
+    monkeypatch.setattr(limit_price, "_XT_AVAILABLE", True)
+
+    assert LimitUpPriceProvider().get_limit_up_price("603999", date(2026, 9, 9)) == 0.0
