@@ -27,6 +27,7 @@ from strategies.large_order_limit_up_buy import LargeOrderLimitUpBuyStrategy
 from strategies.large_order_limit_up_buy.scripts.run_market_only import load_strategy_config, session_time
 
 SESSION_EVENT_PREFIX = "LARGE_ORDER_LIMIT_UP_BUY_LIVE"
+SUMMARY_INTERVAL_SECONDS = 600
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,6 +88,18 @@ def validate_live_confirmation(args: argparse.Namespace, configs: list[StrategyC
     return ""
 
 
+def log_monitor_summary(logger, strategies, data_sub) -> None:
+    status = data_sub.get_latest_data_status()
+    latest = status.get("latest_data_time") or ""
+    delay = float(status.get("data_delay_ms", 0.0) or 0.0)
+    logger.info(
+        "[LARGE_ORDER] SUMMARY stocks=%d l2_stocks=%d l2_kinds=%d latest_data_time=%s delay_ms=%.0f %s",
+        len(strategies), len(data_sub.get_l2_subscription_map()),
+        sum(len(kinds) for kinds in data_sub.get_l2_subscription_map().values()),
+        latest, delay, " ".join(strategy.console_summary() for strategy in strategies),
+    )
+
+
 def run_live_session(args: argparse.Namespace) -> str:
     logger = get_logger("system")
     configs = build_configs(args)
@@ -138,14 +151,21 @@ def run_live_session(args: argparse.Namespace) -> str:
     )
     try:
         runner.start()
+        strategies = []
         for config in configs:
-            runner.add_strategy(LargeOrderLimitUpBuyStrategy(config, ctx["trade_exec"], ctx["pos_mgr"]))
+            strategy = LargeOrderLimitUpBuyStrategy(config, ctx["trade_exec"], ctx["pos_mgr"])
+            strategies.append(strategy)
+            runner.add_strategy(strategy)
         data_thread = threading.Thread(target=data_sub.start, daemon=True, name="large-order-live-data-sub")
         data_thread.start()
         _start_runtime_heartbeat(ctx, stop_event, mode="live")
-        logger.info("%s monitoring_started l2=%s", SESSION_EVENT_PREFIX, data_sub.get_l2_subscription_map())
+        logger.info("[LARGE_ORDER] monitoring_started live=true l2=%s", data_sub.get_l2_subscription_map())
+        next_summary = time.monotonic() + SUMMARY_INTERVAL_SECONDS
         while not stop_event.is_set() and datetime.now() < stop_at:
             time.sleep(1)
+            if time.monotonic() >= next_summary:
+                log_monitor_summary(logger, strategies, data_sub)
+                next_summary += SUMMARY_INTERVAL_SECONDS
     finally:
         runner.stop()
         data_sub.stop()

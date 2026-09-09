@@ -20,6 +20,8 @@ from monitor.logger import get_log_file_path, get_logger
 from strategy.models import StrategyConfig
 from strategies.large_order_limit_up_buy import LargeOrderLimitUpBuyStrategy
 
+SUMMARY_INTERVAL_SECONDS = 600
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run LargeOrderLimitUpBuy in market-only dry-run mode.")
@@ -44,6 +46,18 @@ def load_strategy_config() -> dict:
 def session_time(now: datetime, value: str) -> datetime:
     hour, minute = (int(item) for item in value.split(":", 1))
     return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def log_monitor_summary(logger, strategies, data_sub) -> None:
+    status = data_sub.get_latest_data_status()
+    latest = status.get("latest_data_time") or ""
+    delay = float(status.get("data_delay_ms", 0.0) or 0.0)
+    l2_map = data_sub.get_l2_subscription_map()
+    logger.info(
+        "[LARGE_ORDER] SUMMARY stocks=%d l2_stocks=%d l2_kinds=%d latest_data_time=%s delay_ms=%.0f %s",
+        len(strategies), len(l2_map), sum(len(kinds) for kinds in l2_map.values()), latest, delay,
+        " ".join(strategy.console_summary() for strategy in strategies),
+    )
 
 
 def main() -> None:
@@ -91,14 +105,21 @@ def main() -> None:
     _log_runtime_startup_config(settings, ctx["conn_mgr"], mode="market-only")
     try:
         runner.start()
+        strategies = []
         for config in configs:
-            runner.add_strategy(LargeOrderLimitUpBuyStrategy(config, ctx.get("trade_exec"), ctx.get("pos_mgr")))
+            strategy = LargeOrderLimitUpBuyStrategy(config, ctx.get("trade_exec"), ctx.get("pos_mgr"))
+            strategies.append(strategy)
+            runner.add_strategy(strategy)
         data_thread = threading.Thread(target=data_sub.start, daemon=True, name="large-order-data-sub")
         data_thread.start()
         _start_runtime_heartbeat(ctx, stop_event, mode="market-only")
-        logger.info("LargeOrderLimitUpBuy running strategies=%d l2=%s", len(runner.get_all_strategies()), data_sub.get_l2_subscription_map())
+        logger.info("[LARGE_ORDER] monitoring_started live=false l2=%s", data_sub.get_l2_subscription_map())
+        next_summary = time.monotonic() + SUMMARY_INTERVAL_SECONDS
         while not stop_event.is_set() and datetime.now() < stop_at:
             time.sleep(1)
+            if time.monotonic() >= next_summary:
+                log_monitor_summary(logger, strategies, data_sub)
+                next_summary += SUMMARY_INTERVAL_SECONDS
     finally:
         runner.stop()
         data_sub.stop()

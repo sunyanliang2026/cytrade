@@ -37,7 +37,13 @@ class _SummaryFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         """只允许订单、成交与 MainSealFollow 关键事件通过。"""
         msg = record.getMessage()
-        return record.levelno >= logging.WARNING or "[ORDER]" in msg or "[TRADE]" in msg or "MSF_EVENT" in msg
+        return (
+            record.levelno >= logging.WARNING
+            or "[ORDER]" in msg
+            or "[TRADE]" in msg
+            or "MSF_EVENT" in msg
+            or "[LARGE_ORDER]" in msg
+        )
 
 
 class LogManager:

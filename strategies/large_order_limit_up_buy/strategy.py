@@ -65,6 +65,16 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._last_limit_up_lookup = 0.0
         self._initial_quote_checked = False
         self._entry_phase = "WAIT_INITIAL_QUOTE"
+        self._open_price = 0.0
+        self._session_low_price = 0.0
+        self._dip_requirement_logged = False
+        self._dip_confirmed_logged = False
+        self._big_order_count = 0
+        self._decision_count = 0
+        self._submitted_count = 0
+        self._blocked_dip_count = 0
+        self._blocked_active_count = 0
+        self._blocked_position_count = 0
         self._pre_close = 0.0
         self._last_quote: L2QuoteEvent | None = None
         self._orders_by_no: dict[str, dict[str, Any]] = {}
@@ -127,7 +137,29 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._open_record_files()
 
     def on_tick(self, tick: TickData) -> None:
-        return None
+        if tick.stock_code != self.stock_code:
+            return
+        event_time = tick.data_time or tick.recv_time
+        if not self._is_continuous_trading_time(event_time):
+            return
+        open_price = float(tick.open or 0.0)
+        low_price = float(tick.low or 0.0)
+        if open_price > 0 and self._open_price <= 0:
+            self._open_price = open_price
+        if low_price <= 0:
+            low_price = float(tick.last_price or 0.0)
+        if low_price > 0:
+            self._session_low_price = (
+                low_price if self._session_low_price <= 0
+                else min(self._session_low_price, low_price)
+            )
+        if self._entry_phase == "READY" and self._has_open_dip() and not self._dip_confirmed_logged:
+            self._dip_confirmed_logged = True
+            logger.info(
+                "[LARGE_ORDER] %s opening_dip_confirmed open=%.3f low=%.3f ratio=%.4f",
+                self.stock_code, self._open_price, self._session_low_price,
+                self._session_low_price / self._open_price,
+            )
 
     def on_l2_quote(self, event: L2QuoteEvent) -> None:
         if event.stock_code != self.stock_code:
@@ -152,12 +184,12 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         if not self._initial_quote_checked:
             self._initial_quote_checked = True
             if self._quote_is_limit_up(event):
-                self._entry_phase = "WAIT_REOPEN"
+                self._set_entry_phase("WAIT_REOPEN", "startup_already_limit_up")
                 self._log_event("startup_already_limit_up", limit_up_price=self._limit_up_price)
             else:
-                self._entry_phase = "READY"
+                self._set_entry_phase("READY", "startup_not_limit_up")
         elif self._entry_phase == "WAIT_REOPEN" and self._quote_is_broken(event):
-            self._entry_phase = "WAIT_RESEAL"
+            self._set_entry_phase("WAIT_RESEAL", "limit_up_reopened")
             self._log_event("limit_up_reopened", limit_up_price=self._limit_up_price)
         self._write_raw("l2quote", event.event_time, event.raw_xt_fields)
 
@@ -184,7 +216,15 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._orders_by_no[entrust_no] = record if entrust_no else record
         self._queue_orders.append(record)
         if self._is_big_order(price, volume, amount):
-            self._maybe_submit(record)
+            self._big_order_count += 1
+            if self._entry_phase == "READY" and not self._has_open_dip():
+                self._blocked_dip_count += 1
+                if not self._dip_requirement_logged:
+                    self._dip_requirement_logged = True
+                    self._log_event("buy_blocked", reason="opening_dip_not_confirmed", open_price=self._open_price,
+                                    session_low_price=self._session_low_price, required_ratio=0.985)
+            else:
+                self._maybe_submit(record)
         self._write_pending_neighbors()
 
     def on_l2_transaction(self, event: L2TransactionEvent) -> None:
@@ -220,8 +260,10 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
 
     def _maybe_submit(self, trigger: dict[str, Any]) -> None:
         if self._active_order_uuid:
+            self._blocked_active_count += 1
             return
         if self._has_position():
+            self._blocked_position_count += 1
             return
         price = float(trigger["price"])
         quantity = int(math.floor(self._plan_amount / price / 100.0) * 100)
@@ -237,12 +279,19 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         for index, item in enumerate(front, start=-len(front)):
             self._write_neighbor("queue_neighbor", trigger, item, index)
         self._trigger_count += 1
+        self._decision_count += 1
+        logger.info(
+            "[LARGE_ORDER] %s BUY_DECISION price=%.3f volume=%d amount=%.2f trigger_entrust_no=%s",
+            self.stock_code, price, int(trigger.get("volume", 0)), float(trigger.get("amount", 0.0)),
+            trigger.get("entrust_no", ""),
+        )
         remark = f"L2涨停大单打板 trigger={trigger.get('entrust_no', '')} front={front_volume}股"
         order = self.add_position(price, quantity, remark)
         if order is None:
             self._log_event("buy_blocked", reason="order_executor_unavailable", trigger=trigger)
             return
         self._active_order_uuid = str(order.order_uuid or "")
+        self._submitted_count += 1
         self._active_trigger_entrust_no = str(trigger.get("entrust_no", "") or "")
         self._write_snapshot(order, trigger, front_volume, front_amount, now)
         self._write_neighbor("our_order", trigger, {
@@ -269,6 +318,15 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             self._log_event("our_order_finished", status=str(status), can_retrigger=True)
         elif status in (OrderStatus.SUCCEEDED, OrderStatus.PART_SUCC):
             self._log_event("our_order_filled", status=str(status), filled_quantity=int(getattr(order, "filled_quantity", 0) or 0), can_retrigger=False)
+
+    def console_summary(self) -> str:
+        return (
+            f"{self.stock_code}:phase={self._entry_phase},open={self._open_price:.3f},"
+            f"low={self._session_low_price:.3f},big={self._big_order_count},"
+            f"decision={self._decision_count},submitted={self._submitted_count},"
+            f"blocked_dip={self._blocked_dip_count},blocked_active={self._blocked_active_count},"
+            f"blocked_position={self._blocked_position_count}"
+        )
 
     def _open_record_files(self) -> None:
         day_dir = self._record_dir / datetime.now().strftime("%Y-%m-%d")
@@ -380,6 +438,9 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         """Exclude all auction orders from the live trigger path."""
         return isinstance(value, datetime) and value.time() >= dt_time(9, 30)
 
+    def _has_open_dip(self) -> bool:
+        return self._open_price > 0 and self._session_low_price < self._open_price * 0.985
+
     def _quote_is_limit_up(self, event: L2QuoteEvent) -> bool:
         return any(
             self._is_limit_up_price(price)
@@ -395,6 +456,16 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         return any(
             0 < price < self._limit_up_price and not self._is_limit_up_price(price)
             for price in (float(event.last_price or 0.0), float(event.bid1 or 0.0))
+        )
+
+    def _set_entry_phase(self, phase: str, reason: str = "") -> None:
+        if self._entry_phase == phase:
+            return
+        previous = self._entry_phase
+        self._entry_phase = phase
+        logger.info(
+            "[LARGE_ORDER] %s phase=%s->%s%s",
+            self.stock_code, previous, phase, f" reason={reason}" if reason else "",
         )
 
     @staticmethod
