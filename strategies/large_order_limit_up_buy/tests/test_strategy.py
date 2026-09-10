@@ -1,5 +1,6 @@
 from datetime import datetime
 
+from config.enums import OrderStatus
 from core.l2_models import L2OrderEvent, L2QuoteEvent
 from core.models import TickData
 from strategy.models import StrategyConfig
@@ -57,22 +58,16 @@ def test_select_stocks_accepts_minimal_manual_pool_without_name(tmp_path):
     assert [item.params["stock_name"] for item in stocks] == ["", ""]
 
 
-def test_low_price_threshold_uses_lots_and_no_volume_cap(tmp_path):
+def test_big_order_threshold_uses_unified_amount(tmp_path):
     strategy = make_strategy(tmp_path)
-    assert strategy._is_big_order(7.99, 500100, 7.99 * 500100)
-    assert not strategy._is_big_order(7.99, 500000, 7.99 * 500000)
-    assert strategy._is_big_order(2.0, 1_500_000, 3_000_000)
-
-
-def test_normal_price_threshold_uses_amount(tmp_path):
-    strategy = make_strategy(tmp_path)
-    assert strategy._is_big_order(8.0, 62500, 5_000_001)
-    assert not strategy._is_big_order(8.0, 62500, 5_000_000)
+    assert strategy._is_big_order(2.0, 750000, 1_500_000)
+    assert strategy._is_big_order(20.0, 75000, 1_500_000)
+    assert not strategy._is_big_order(20.0, 74999, 1_499_980)
 
 
 def test_only_limit_up_buy_orders_can_trigger(tmp_path):
     strategy = make_strategy(tmp_path)
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, pre_close=7.27))
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, pre_close=7.27, bid1=7.9))
     strategy.on_l2_order(event(price=7.99, volume=600000, no="not-limit"))
     strategy.on_l2_order(event(price=8.0, volume=600000, side="SELL", no="sell"))
     assert strategy._trigger_count == 0
@@ -80,7 +75,7 @@ def test_only_limit_up_buy_orders_can_trigger(tmp_path):
 
 def test_auction_orders_are_recorded_but_do_not_trigger(tmp_path):
     strategy = make_strategy(tmp_path)
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, pre_close=7.27))
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, pre_close=7.27, bid1=7.9))
 
     strategy.on_l2_order(event(price=8.0, volume=625001, no="auction", event_time=datetime(2026, 9, 8, 9, 15)))
 
@@ -90,10 +85,10 @@ def test_auction_orders_are_recorded_but_do_not_trigger(tmp_path):
 
 def test_continuous_session_orders_can_trigger_at_0930(tmp_path):
     strategy = make_strategy(tmp_path)
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, pre_close=7.27, last_price=7.9))
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, pre_close=7.27, last_price=7.9, bid1=7.9))
     mark_open_dip(strategy)
 
-    strategy.on_l2_order(event(price=8.0, volume=625001, no="continuous", event_time=datetime(2026, 9, 8, 9, 30)))
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="continuous", event_time=datetime(2026, 9, 8, 9, 30)))
 
     assert strategy._trigger_count == 1
 
@@ -105,9 +100,9 @@ def test_quote_without_limit_up_uses_exact_qmt_price(monkeypatch, tmp_path):
 
     monkeypatch.setattr(strategy_module, "LimitUpPriceProvider", FakeProvider)
     strategy = make_strategy(tmp_path)
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", pre_close=7.27, last_price=7.9))
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", pre_close=7.27, last_price=7.9, bid1=7.9))
     mark_open_dip(strategy)
-    strategy.on_l2_order(event(price=8.0, volume=625001, no="exact-price"))
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="exact-price"))
     assert strategy._limit_up_price == 8.0
     assert strategy._trigger_count == 1
 
@@ -119,17 +114,17 @@ def test_quote_without_exact_limit_up_does_not_infer_price(monkeypatch, tmp_path
 
     monkeypatch.setattr(strategy_module, "LimitUpPriceProvider", FakeProvider)
     strategy = make_strategy(tmp_path)
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", pre_close=7.27))
-    strategy.on_l2_order(event(price=8.0, volume=625001, no="no-exact-price"))
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", pre_close=7.27, bid1=7.9))
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="no-exact-price"))
     assert strategy._limit_up_price == 0.0
     assert strategy._trigger_count == 0
 
 
 def test_duplicate_entrust_no_does_not_repeat(tmp_path):
     strategy = make_strategy(tmp_path)
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, pre_close=7.27, last_price=7.9))
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, pre_close=7.27, last_price=7.9, bid1=7.9))
     mark_open_dip(strategy)
-    trigger = event(price=8.0, volume=625001, no="same")
+    trigger = event(price=8.0, volume=187500, no="same")
     strategy.on_l2_order(trigger)
     strategy.on_l2_order(trigger)
     assert strategy._trigger_count == 1
@@ -138,6 +133,7 @@ def test_duplicate_entrust_no_does_not_repeat(tmp_path):
 class FakeExecutor:
     def __init__(self):
         self.orders = []
+        self.cancels = []
 
     def buy_limit(self, strategy_id, strategy_name, stock_code, price, quantity, remark):
         order = Order(
@@ -151,6 +147,10 @@ class FakeExecutor:
         self.orders.append(order)
         return order
 
+    def cancel_order(self, order_uuid, remark=""):
+        self.cancels.append((order_uuid, remark))
+        return True
+
 
 def test_big_order_submits_immediately_and_records_front_queue(tmp_path):
     executor = FakeExecutor()
@@ -163,10 +163,10 @@ def test_big_order_submits_immediately_and_records_front_queue(tmp_path):
         None,
     )
     strategy.start()
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, pre_close=7.27, last_price=7.9))
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, pre_close=7.27, last_price=7.9, bid1=7.9))
     mark_open_dip(strategy)
     strategy.on_l2_order(event(price=8.0, volume=100000, no="front"))
-    strategy.on_l2_order(event(price=8.0, volume=625001, no="trigger"))
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="trigger"))
 
     assert len(executor.orders) == 1
     assert executor.orders[0].price == 8.0
@@ -192,27 +192,32 @@ def test_startup_sealed_stock_waits_for_reopen_then_reseal(tmp_path):
     strategy.on_l2_quote(L2QuoteEvent(
         stock_code="600001", limit_up_price=8.0, last_price=8.0, bid1=8.0,
     ))
-    strategy.on_l2_order(event(price=8.0, volume=625001, no="sealed-old"))
-    assert strategy._entry_phase == "WAIT_REOPEN"
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="sealed-old"))
+    assert strategy._entry_phase == "DONE"
+
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="later-big"))
+    assert len(executor.orders) == 1
     assert strategy._trigger_count == 0
 
     strategy.on_l2_quote(L2QuoteEvent(
         stock_code="600001", limit_up_price=8.0, last_price=7.9, bid1=7.9,
     ))
     assert strategy._entry_phase == "WAIT_RESEAL"
-    strategy.on_l2_order(event(price=8.0, volume=625001, no="reseal-new"))
+    strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-new"))
 
     assert strategy._trigger_count == 1
     assert len(executor.orders) == 1
 
 
-def test_empty_initial_quote_does_not_bypass_startup_sealed_check(tmp_path):
+def test_startup_sealed_status_uses_bid1_not_last_price(tmp_path):
     strategy = make_strategy(tmp_path)
     strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0))
     assert strategy._entry_phase == "WAIT_INITIAL_QUOTE"
 
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, last_price=8.0))
-    assert strategy._entry_phase == "WAIT_REOPEN"
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=8.0, bid1=7.9,
+    ))
+    assert strategy._entry_phase == "READY"
 
 
 def test_unsealed_start_requires_open_dip_before_trigger(tmp_path):
@@ -224,14 +229,14 @@ def test_unsealed_start_requires_open_dip_before_trigger(tmp_path):
         stock_code="600001", open=10.0, low=9.86, last_price=9.86,
         data_time=datetime(2026, 9, 8, 9, 30),
     ))
-    strategy.on_l2_order(event(price=8.0, volume=625001, no="no-dip"))
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="no-dip"))
     assert strategy._trigger_count == 0
 
     strategy.on_tick(TickData(
         stock_code="600001", open=10.0, low=9.84, last_price=9.84,
         data_time=datetime(2026, 9, 8, 9, 31),
     ))
-    strategy.on_l2_order(event(price=8.0, volume=625001, no="after-dip"))
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="after-dip"))
     assert strategy._trigger_count == 1
 
 
@@ -244,6 +249,68 @@ def test_reseal_path_does_not_require_open_dip(tmp_path):
     )
     strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, last_price=8.0, bid1=8.0))
     strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, last_price=7.9, bid1=7.9))
-    strategy.on_l2_order(event(price=8.0, volume=625001, no="reseal-no-dip"))
+    strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-no-dip"))
     assert strategy._entry_phase == "WAIT_RESEAL"
     assert strategy._trigger_count == 1
+
+
+def test_reseal_submits_first_order_then_cancels_when_validation_fails(tmp_path):
+    executor = FakeExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(stock_code="600001", params={"plan_amount": 100000, "record_dir": str(tmp_path)}),
+        executor,
+        None,
+    )
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, bid1=8.0))
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, bid1=7.9))
+
+    strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
+    for number in range(20):
+        strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
+
+    assert len(executor.orders) == 1
+    assert len(executor.cancels) == 1
+    assert strategy._reseal_validation_result == "failed"
+    assert strategy._entry_phase == "WAIT_REOPEN"
+
+
+def test_reseal_keeps_order_when_two_big_orders_arrive_within_twenty(tmp_path):
+    executor = FakeExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(stock_code="600001", params={"plan_amount": 100000, "record_dir": str(tmp_path)}),
+        executor,
+        None,
+    )
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, bid1=8.0))
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, bid1=7.9))
+
+    strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
+    for number in range(20):
+        volume = 187500 if number in (3, 15) else 100
+        strategy.on_l2_order(event(price=8.0, volume=volume, no=f"follow-{number}"))
+
+    assert len(executor.orders) == 1
+    assert executor.cancels == []
+    assert strategy._reseal_validation_result == "passed"
+
+
+def test_filled_entry_disables_all_later_entries_for_the_stock(tmp_path):
+    executor = FakeExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(stock_code="600001", params={"plan_amount": 100000, "record_dir": str(tmp_path)}),
+        executor,
+        None,
+    )
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, bid1=7.9))
+    mark_open_dip(strategy)
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="first-limit-up"))
+
+    first_order = executor.orders[0]
+    first_order.status = OrderStatus.SUCCEEDED
+    first_order.filled_quantity = first_order.quantity
+    strategy.on_order_update(first_order)
+
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="later-limit-up"))
+    assert strategy._entry_phase == "DONE"
+    assert strategy._entry_filled is True
+    assert len(executor.orders) == 1

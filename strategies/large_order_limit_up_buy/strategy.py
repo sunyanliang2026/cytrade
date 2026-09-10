@@ -54,9 +54,13 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._stock_name = str(params.get("stock_name") or params.get("name") or "").strip()
         self._plan_amount = float(params.get("plan_amount", 0.0) or 0.0)
         self._dry_run = bool(params.get("dry_run", True))
-        self._low_price_threshold = float(params.get("low_price_threshold", 8.0) or 8.0)
-        self._low_price_min_lots = int(params.get("low_price_min_lots", 5000) or 5000)
-        self._normal_price_min_amount = float(params.get("normal_price_min_amount", 5_000_000.0) or 5_000_000.0)
+        self._big_order_min_amount = float(params.get("big_order_min_amount", 1_500_000.0) or 1_500_000.0)
+        self._reseal_validation_order_count = max(
+            1, int(params.get("reseal_validation_order_count", 20) or 20)
+        )
+        self._reseal_validation_big_order_count = max(
+            1, int(params.get("reseal_validation_big_order_count", 2) or 2)
+        )
         self._neighbor_count = max(1, int(params.get("neighbor_count", 5) or 5))
         self._neighbor_window_seconds = max(0.0, float(params.get("neighbor_window_seconds", 3.0) or 3.0))
         self._record_dir = Path(str(params.get("record_dir") or self.DEFAULT_RECORD_DIR))
@@ -82,6 +86,11 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._seen_entrust_nos: set[str] = set()
         self._active_order_uuid = ""
         self._active_trigger_entrust_no = ""
+        self._reseal_validation_active = False
+        self._reseal_validation_orders_seen = 0
+        self._reseal_validation_big_orders_seen = 0
+        self._reseal_validation_result = ""
+        self._entry_filled = False
         self._trigger_count = 0
         self._sealed_trade_amount = 0.0
         self._recent_trades: deque[tuple[float, float]] = deque(maxlen=5000)
@@ -122,9 +131,9 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                         "stock_name": name,
                         "plan_amount": amount,
                         "dry_run": self._dry_run,
-                        "low_price_threshold": self._low_price_threshold,
-                        "low_price_min_lots": self._low_price_min_lots,
-                        "normal_price_min_amount": self._normal_price_min_amount,
+                        "big_order_min_amount": self._big_order_min_amount,
+                        "reseal_validation_order_count": self._reseal_validation_order_count,
+                        "reseal_validation_big_order_count": self._reseal_validation_big_order_count,
                         "neighbor_count": self._neighbor_count,
                         "neighbor_window_seconds": self._neighbor_window_seconds,
                         "record_dir": str(self._record_dir),
@@ -215,9 +224,14 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         record = self._order_record(event, volume, amount, side)
         self._orders_by_no[entrust_no] = record if entrust_no else record
         self._queue_orders.append(record)
-        if self._is_big_order(price, volume, amount):
+        if self._reseal_validation_active:
+            self._observe_reseal_validation(record)
+        elif self._entry_phase == "WAIT_RESEAL":
+            # A reseal is time-sensitive: take the queue position first, then validate support.
+            self._maybe_submit(record, reseal_validation=True)
+        elif self._entry_phase == "READY" and self._is_big_order(price, volume, amount):
             self._big_order_count += 1
-            if self._entry_phase == "READY" and not self._has_open_dip():
+            if not self._has_open_dip():
                 self._blocked_dip_count += 1
                 if not self._dip_requirement_logged:
                     self._dip_requirement_logged = True
@@ -258,7 +272,9 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             self._last_queue = event
             self._write_raw("l2orderqueue", event.event_time, event.raw_xt_fields)
 
-    def _maybe_submit(self, trigger: dict[str, Any]) -> None:
+    def _maybe_submit(self, trigger: dict[str, Any], *, reseal_validation: bool = False) -> None:
+        if self._entry_filled:
+            return
         if self._active_order_uuid:
             self._blocked_active_count += 1
             return
@@ -293,6 +309,18 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._active_order_uuid = str(order.order_uuid or "")
         self._submitted_count += 1
         self._active_trigger_entrust_no = str(trigger.get("entrust_no", "") or "")
+        if reseal_validation:
+            self._reseal_validation_active = True
+            self._reseal_validation_orders_seen = 0
+            self._reseal_validation_big_orders_seen = 0
+            self._reseal_validation_result = "pending"
+            self._log_event(
+                "reseal_validation_started",
+                order_uuid=self._active_order_uuid,
+                required_orders=self._reseal_validation_order_count,
+                required_big_orders=self._reseal_validation_big_order_count,
+                big_order_min_amount=self._big_order_min_amount,
+            )
         self._write_snapshot(order, trigger, front_volume, front_amount, now)
         self._write_neighbor("our_order", trigger, {
             "entrust_no": self._active_order_uuid,
@@ -309,6 +337,40 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._log_event("buy_submitted", trigger=trigger, front_volume=front_volume, front_amount=front_amount,
                         order_uuid=self._active_order_uuid, quantity=quantity, dry_run=self._dry_run)
 
+    def _observe_reseal_validation(self, record: dict[str, Any]) -> None:
+        """Evaluate only orders received after our reseal order was submitted."""
+        self._reseal_validation_orders_seen += 1
+        if bool(record.get("is_big_order")):
+            self._reseal_validation_big_orders_seen += 1
+            self._big_order_count += 1
+
+        if self._reseal_validation_orders_seen < self._reseal_validation_order_count:
+            return
+
+        if self._reseal_validation_big_orders_seen >= self._reseal_validation_big_order_count:
+            self._reseal_validation_active = False
+            self._reseal_validation_result = "passed"
+            self._log_event(
+                "reseal_validation_passed",
+                observed_orders=self._reseal_validation_orders_seen,
+                observed_big_orders=self._reseal_validation_big_orders_seen,
+                big_order_min_amount=self._big_order_min_amount,
+            )
+            return
+
+        self._reseal_validation_active = False
+        self._reseal_validation_result = "failed"
+        self._set_entry_phase("DONE", "reseal_validation_failed")
+        cancel_order = getattr(self._trade_executor, "cancel_order", None)
+        requested = bool(cancel_order(self._active_order_uuid, remark="reseal validation failed")) if callable(cancel_order) else False
+        self._log_event(
+            "reseal_validation_failed",
+            observed_orders=self._reseal_validation_orders_seen,
+            observed_big_orders=self._reseal_validation_big_orders_seen,
+            required_big_orders=self._reseal_validation_big_order_count,
+            cancel_requested=requested,
+        )
+
     def _on_order_update_hook(self, order) -> None:
         if str(getattr(order, "order_uuid", "")) != self._active_order_uuid:
             return
@@ -316,14 +378,29 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         if status in (OrderStatus.CANCELED, OrderStatus.PART_CANCEL, OrderStatus.JUNK, OrderStatus.UNKNOWN):
             self._active_order_uuid = ""
             self._log_event("our_order_finished", status=str(status), can_retrigger=True)
-        elif status in (OrderStatus.SUCCEEDED, OrderStatus.PART_SUCC):
-            self._log_event("our_order_filled", status=str(status), filled_quantity=int(getattr(order, "filled_quantity", 0) or 0), can_retrigger=False)
+        elif status == OrderStatus.SUCCEEDED or (
+            status == OrderStatus.PART_SUCC and int(getattr(order, "filled_quantity", 0) or 0) > 0
+        ):
+            if not self._entry_filled:
+                self._entry_filled = True
+                self._reseal_validation_active = False
+                self._set_entry_phase("DONE", "entry_filled")
+                self._log_event(
+                    "our_order_filled",
+                    status=str(status),
+                    filled_quantity=int(getattr(order, "filled_quantity", 0) or 0),
+                    can_retrigger=False,
+                )
 
     def console_summary(self) -> str:
         return (
             f"{self.stock_code}:phase={self._entry_phase},open={self._open_price:.3f},"
             f"low={self._session_low_price:.3f},big={self._big_order_count},"
             f"decision={self._decision_count},submitted={self._submitted_count},"
+            f"reseal_verify={self._reseal_validation_orders_seen}/{self._reseal_validation_order_count},"
+            f"reseal_big={self._reseal_validation_big_orders_seen}/{self._reseal_validation_big_order_count},"
+            f"reseal_result={self._reseal_validation_result or '-'},"
+            f"entry_filled={self._entry_filled},"
             f"blocked_dip={self._blocked_dip_count},blocked_active={self._blocked_active_count},"
             f"blocked_position={self._blocked_position_count}"
         )
@@ -403,10 +480,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                                                                "name": self._stock_name, **payload}, ensure_ascii=False, default=str))
 
     def _is_big_order(self, price: float, volume: int, amount: float) -> bool:
-        lots = volume / 100.0
-        if price < self._low_price_threshold:
-            return lots > self._low_price_min_lots
-        return amount > self._normal_price_min_amount
+        return amount >= self._big_order_min_amount
 
     def _is_limit_up_price(self, price: float) -> bool:
         return self._limit_up_price > 0 and abs(price - self._limit_up_price) <= max(0.0001, self._limit_up_price * 0.00001)
@@ -442,21 +516,14 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         return self._open_price > 0 and self._session_low_price < self._open_price * 0.985
 
     def _quote_is_limit_up(self, event: L2QuoteEvent) -> bool:
-        return any(
-            self._is_limit_up_price(price)
-            for price in (float(event.last_price or 0.0), float(event.bid1 or 0.0))
-            if price > 0
-        )
+        return self._is_limit_up_price(float(event.bid1 or 0.0))
 
     @staticmethod
     def _quote_has_price(event: L2QuoteEvent) -> bool:
-        return any(float(price or 0.0) > 0 for price in (event.last_price, event.bid1))
+        return float(event.bid1 or 0.0) > 0
 
     def _quote_is_broken(self, event: L2QuoteEvent) -> bool:
-        return any(
-            0 < price < self._limit_up_price and not self._is_limit_up_price(price)
-            for price in (float(event.last_price or 0.0), float(event.bid1 or 0.0))
-        )
+        return not self._is_limit_up_price(float(event.bid1 or 0.0))
 
     def _set_entry_phase(self, phase: str, reason: str = "") -> None:
         if self._entry_phase == phase:

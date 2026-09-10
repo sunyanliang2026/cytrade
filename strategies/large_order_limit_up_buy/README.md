@@ -1,5 +1,13 @@
 # LargeOrderLimitUpBuy
 
+## Current Entry Rules
+
+- A large limit-up buy order is a single `l2order` worth at least 1.5 million yuan.
+- First limit-up entries keep the opening-dip requirement and require that large order.
+- Reseal entries submit on the first observed limit-up BUY `l2order`, then inspect the next 20 limit-up BUY orders. The order is retained only when at least two are large orders; otherwise the strategy requests cancellation of the unfilled order and disables further entries for that stock instance.
+- Any partial or full entry fill disables further entries for that stock instance for the remainder of the run.
+- `bid1 == exact limit-up price` is used only for sealed/reopened state detection. A sell-one quote at limit-up is not a sealed board and does not trigger an entry.
+
 独立的 Level2 大单打板策略。人工股票池位于 `data/manual_pool.csv`，设计文档位于 `docs/design.md`。
 
 当前入口为：
