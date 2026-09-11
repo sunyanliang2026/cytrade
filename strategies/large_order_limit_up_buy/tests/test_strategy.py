@@ -1,5 +1,7 @@
 from datetime import datetime
 
+import pytest
+
 from config.enums import OrderStatus
 from core.l2_models import L2OrderEvent, L2QuoteEvent
 from core.models import TickData
@@ -191,22 +193,91 @@ def test_startup_sealed_stock_waits_for_reopen_then_reseal(tmp_path):
     strategy.start()
     strategy.on_l2_quote(L2QuoteEvent(
         stock_code="600001", limit_up_price=8.0, last_price=8.0, bid1=8.0,
+        bid1_volume=130_000, event_time=datetime(2026, 9, 8, 9, 30, 0),
     ))
     strategy.on_l2_order(event(price=8.0, volume=187500, no="sealed-old"))
-    assert strategy._entry_phase == "DONE"
-
-    strategy.on_l2_order(event(price=8.0, volume=187500, no="later-big"))
-    assert len(executor.orders) == 1
+    assert strategy._entry_phase == "WAIT_REOPEN"
     assert strategy._trigger_count == 0
 
     strategy.on_l2_quote(L2QuoteEvent(
         stock_code="600001", limit_up_price=8.0, last_price=7.9, bid1=7.9,
+        event_time=datetime(2026, 9, 8, 9, 30, 21),
     ))
     assert strategy._entry_phase == "WAIT_RESEAL"
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=7.8, bid1=7.8,
+        event_time=datetime(2026, 9, 8, 9, 30, 31),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=8.0, bid1=8.0,
+        bid1_volume=1000, event_time=datetime(2026, 9, 8, 9, 30, 32),
+    ))
     strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-new"))
 
     assert strategy._trigger_count == 1
     assert len(executor.orders) == 1
+
+
+def _prepare_reseal_candidate(strategy, *, seal_volume=130_000, break_time=21,
+                              reopen_low=7.8, reseal_time=32):
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=8.0, bid1=8.0,
+        bid1_volume=seal_volume, event_time=datetime(2026, 9, 8, 9, 30, 0),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=7.9, bid1=7.9,
+        event_time=datetime(2026, 9, 8, 9, 30, break_time),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=reopen_low, bid1=reopen_low,
+        event_time=datetime(2026, 9, 8, 9, 30, reseal_time - 1),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=8.0, bid1=8.0,
+        bid1_volume=1000, event_time=datetime(2026, 9, 8, 9, 30, reseal_time),
+    ))
+
+
+@pytest.mark.parametrize(
+    ("seal_volume", "break_time", "reopen_low", "reseal_time"),
+    [
+        (124_999, 21, 7.8, 32),  # prior seal amount is below 100 million
+        (130_000, 20, 7.8, 32),  # prior seal duration is not greater than 20s
+        (130_000, 21, 7.8, 30),  # reopen duration is below 10s
+        (130_000, 21, 7.9, 32),  # reopen low does not break 98.5%
+    ],
+)
+def test_reseal_requires_each_gate(tmp_path, seal_volume, break_time, reopen_low, reseal_time):
+    strategy = make_strategy(tmp_path)
+    _prepare_reseal_candidate(
+        strategy,
+        seal_volume=seal_volume,
+        break_time=break_time,
+        reopen_low=reopen_low,
+        reseal_time=reseal_time,
+    )
+
+    strategy.on_l2_order(event(price=8.0, volume=100, no="blocked-reseal"))
+
+    assert strategy._trigger_count == 0
+    assert strategy._entry_phase in {"WAIT_REOPEN", "WAIT_RESEAL"}
+    assert strategy._reseal_ready is False
+
+
+def test_unqualified_new_seal_does_not_reuse_old_reopen_window(tmp_path):
+    strategy = make_strategy(tmp_path)
+    _prepare_reseal_candidate(strategy)
+    assert strategy._entry_phase == "WAIT_RESEAL"
+
+    # Reseal briefly, then break again before 20 seconds and below 100m.
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=7.9, bid1=7.9,
+        event_time=datetime(2026, 9, 8, 9, 30, 33),
+    ))
+
+    assert strategy._entry_phase == "WAIT_REOPEN"
+    assert strategy._reopen_since is None
+    assert strategy._reseal_ready is False
 
 
 def test_startup_sealed_status_uses_bid1_not_last_price(tmp_path):
@@ -223,7 +294,7 @@ def test_startup_sealed_status_uses_bid1_not_last_price(tmp_path):
 def test_unsealed_start_requires_open_dip_before_trigger(tmp_path):
     strategy = make_strategy(tmp_path)
     strategy.on_l2_quote(L2QuoteEvent(
-        stock_code="600001", limit_up_price=8.0, last_price=7.9,
+        stock_code="600001", limit_up_price=8.0, last_price=7.9, bid1=7.9,
     ))
     strategy.on_tick(TickData(
         stock_code="600001", open=10.0, low=9.86, last_price=9.86,
@@ -247,8 +318,22 @@ def test_reseal_path_does_not_require_open_dip(tmp_path):
         executor,
         None,
     )
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, last_price=8.0, bid1=8.0))
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, last_price=7.9, bid1=7.9))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=8.0, bid1=8.0,
+        bid1_volume=130_000, event_time=datetime(2026, 9, 8, 9, 30, 0),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=7.9, bid1=7.9,
+        event_time=datetime(2026, 9, 8, 9, 30, 21),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=7.8, bid1=7.8,
+        event_time=datetime(2026, 9, 8, 9, 30, 31),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=8.0, bid1=8.0,
+        bid1_volume=1000, event_time=datetime(2026, 9, 8, 9, 30, 32),
+    ))
     strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-no-dip"))
     assert strategy._entry_phase == "WAIT_RESEAL"
     assert strategy._trigger_count == 1
@@ -261,8 +346,22 @@ def test_reseal_submits_first_order_then_cancels_when_validation_fails(tmp_path)
         executor,
         None,
     )
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, bid1=8.0))
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, bid1=7.9))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=8.0, bid1_volume=130_000,
+        event_time=datetime(2026, 9, 8, 9, 30, 0),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=7.9,
+        event_time=datetime(2026, 9, 8, 9, 30, 21),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=7.8,
+        event_time=datetime(2026, 9, 8, 9, 30, 31),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=8.0,
+        bid1_volume=1000, event_time=datetime(2026, 9, 8, 9, 30, 32),
+    ))
 
     strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
     for number in range(20):
@@ -271,7 +370,7 @@ def test_reseal_submits_first_order_then_cancels_when_validation_fails(tmp_path)
     assert len(executor.orders) == 1
     assert len(executor.cancels) == 1
     assert strategy._reseal_validation_result == "failed"
-    assert strategy._entry_phase == "WAIT_REOPEN"
+    assert strategy._entry_phase == "DONE"
 
 
 def test_reseal_keeps_order_when_two_big_orders_arrive_within_twenty(tmp_path):
@@ -281,8 +380,22 @@ def test_reseal_keeps_order_when_two_big_orders_arrive_within_twenty(tmp_path):
         executor,
         None,
     )
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, bid1=8.0))
-    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, bid1=7.9))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=8.0, bid1_volume=130_000,
+        event_time=datetime(2026, 9, 8, 9, 30, 0),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=7.9,
+        event_time=datetime(2026, 9, 8, 9, 30, 21),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=7.8,
+        event_time=datetime(2026, 9, 8, 9, 30, 31),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=8.0,
+        bid1_volume=1000, event_time=datetime(2026, 9, 8, 9, 30, 32),
+    ))
 
     strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
     for number in range(20):

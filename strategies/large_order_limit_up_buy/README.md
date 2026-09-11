@@ -5,6 +5,7 @@
 - A large limit-up buy order is a single `l2order` worth at least 1.5 million yuan.
 - First limit-up entries keep the opening-dip requirement and require that large order.
 - Reseal entries submit on the first observed limit-up BUY `l2order`, then inspect the next 20 limit-up BUY orders. The order is retained only when at least two are large orders; otherwise the strategy requests cancellation of the unfilled order and disables further entries for that stock instance.
+- A reseal is eligible only after the prior sealed period was observed above 100 million yuan and longer than 20 seconds. The reopened period must last at least 10 seconds and its low price must be below 98.5% of the limit-up price.
 - Any partial or full entry fill disables further entries for that stock instance for the remainder of the run.
 - `bid1 == exact limit-up price` is used only for sealed/reopened state detection. A sell-one quote at limit-up is not a sealed board and does not trigger an entry.
 
