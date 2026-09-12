@@ -1,7 +1,8 @@
 {
   "dry_run": false,
-  "big_order_min_amount": 1500000.0,
-  "reseal_validation_order_count": 20,
+  "first_seal_big_order_min_amount": 2000000.0,
+  "reseal_validation_big_order_min_amount": 1500000.0,
+  "reseal_validation_order_count": 50,
   "reseal_validation_big_order_count": 2,
   "reseal_min_prior_seal_amount": 100000000.0,
   "reseal_min_prior_seal_seconds": 20.0,
