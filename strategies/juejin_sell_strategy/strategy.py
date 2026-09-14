@@ -54,6 +54,7 @@ class JuejinSellStrategy(BaseStrategy):
         self._timestamp_2: Optional[datetime] = self._parse_dt(params.get("timestamp_2"))
         self._timestamp_10: Optional[datetime] = self._parse_dt(params.get("timestamp_10"))
         self._up_sell = self._to_int(params.get("up_sell"), 0)
+        self._limit_open_second_sell_done = bool(params.get("limit_open_second_sell_done", False))
         self._pre_close = float(params.get("pre_close", 0.0) or 0.0)
         self._pre_flag = self._to_int(params.get("pre_flag"), self._flag)
         self._pre_up_amount = float(params.get("pre_up_amt", params.get("pre_up_amount", 0.0)) or 0.0)
@@ -171,6 +172,7 @@ class JuejinSellStrategy(BaseStrategy):
         high_price = float(tick.high or tick.last_price or 0.0)
         low_price = float(tick.low or tick.last_price or 0.0)
         position = self._get_position()
+        first_sell_done_before_tick = self._up_sell == 99
 
         if (
             now.hour == 9
@@ -359,24 +361,36 @@ class JuejinSellStrategy(BaseStrategy):
                 if self._up_sell == 99:
                     self._flag = -9
 
+        if (
+            first_sell_done_before_tick
+            and not self._limit_open_second_sell_done
+            and self._pre_bid >= pre_close * 1.03
+            and bid_p < pre_close * 1.03
+            and position is not None
+        ):
+            self._cancel_active_orders("开板首卖后跌破 3% 前撤单")
+            order = self._submit_sell(
+                self._sell_quantity,
+                round(bid_p * 0.99, 2),
+                "涨停开板首卖后跌破 3% 卖第二笔",
+                action_key="limit_open_second_sell",
+            )
+            if order:
+                self._limit_open_second_sell_done = True
+                self._flag = -9
+                self._log_status("涨停开板首卖后跌破 3%")
+
         if self._open_flag == 10 and bid_p < limit_up:
             gap_seconds = self._seconds_since(self._timestamp_10, now)
-            if gap_seconds > 300 and position is not None:
-                order = self._submit_sell(
-                    self._target_sell_quantity(position),
-                    round(bid_p, 2),
-                    "涨停开板 5 分钟不回封卖出",
-                    action_key="limit_open_5min",
-                )
-                if order:
-                    self._flag = 0
-                    self._open_flag = 0
-                    self._timestamp_10 = now
-                    self._log_status("涨停开板 5 分钟不回封")
+            if gap_seconds > 300:
+                self._flag = 0
+                self._open_flag = 0
+                self._timestamp_10 = now
+                self._log_status("涨停开板 5 分钟不回封，转普通价格逻辑")
 
         if bid_p > pre_close * 1.07 and bid_p < limit_up and self._flag >= 0 and self._flag != 10:
             self._flag = 7
-        if bid_p > pre_close * 1.04 and bid_p < pre_close * 1.07 and self._flag >= -3:
+        if bid_p > pre_close * 1.04 and bid_p < pre_close * 1.07 and self._flag == -3:
             self._flag = 5
 
         self._pre_bid = bid_p
@@ -413,6 +427,7 @@ class JuejinSellStrategy(BaseStrategy):
             "timestamp_2": self._format_dt(self._timestamp_2),
             "timestamp_10": self._format_dt(self._timestamp_10),
             "up_sell": self._up_sell,
+            "limit_open_second_sell_done": self._limit_open_second_sell_done,
             "pre_close": self._pre_close,
             "pre_flag": self._pre_flag,
             "pre_up_amount": self._pre_up_amount,
@@ -438,6 +453,9 @@ class JuejinSellStrategy(BaseStrategy):
         self._timestamp_2 = self._parse_dt(payload.get("timestamp_2"))
         self._timestamp_10 = self._parse_dt(payload.get("timestamp_10"))
         self._up_sell = self._to_int(payload.get("up_sell"), self._up_sell)
+        self._limit_open_second_sell_done = bool(
+            payload.get("limit_open_second_sell_done", self._limit_open_second_sell_done)
+        )
         self._pre_close = float(payload.get("pre_close", self._pre_close) or 0.0)
         self._pre_flag = self._to_int(payload.get("pre_flag"), self._pre_flag)
         self._pre_up_amount = float(payload.get("pre_up_amount", self._pre_up_amount) or 0.0)
@@ -455,7 +473,7 @@ class JuejinSellStrategy(BaseStrategy):
             return None
 
         position = self._get_position()
-        available = self._position_available(position)
+        available = self._available_for_sell(position)
         sell_quantity = min(max(0, int(quantity or 0)), available)
         if sell_quantity <= 0 or price <= 0:
             return None
@@ -484,6 +502,30 @@ class JuejinSellStrategy(BaseStrategy):
         self.request_state_persist(reason=f"juejin_sell_order:{self.strategy_id}", min_interval_sec=0.0)
         return order
 
+    def _available_for_sell(self, position: Optional[PositionInfo]) -> int:
+        """Return current sellable quantity, validating the live account first."""
+        if self._trade_executor and bool(getattr(self._trade_executor, "live_trading_enabled", False)):
+            connection_mgr = getattr(self._trade_executor, "connection_manager", None)
+            query_position = getattr(connection_mgr, "query_stock_position", None)
+            if not callable(query_position):
+                logger.error("JuejinSellStrategy[%s] 实盘无法查询账户持仓，禁止下单", self.strategy_id[:8])
+                return 0
+            try:
+                account_position = query_position(self.stock_code)
+            except Exception as exc:
+                logger.error(
+                    "JuejinSellStrategy[%s] 查询账户持仓失败，禁止下单 stock=%s error=%s",
+                    self.strategy_id[:8], self.stock_code, exc,
+                )
+                return 0
+            if account_position is None:
+                return 0
+            available = self._get_attr(account_position, "can_use_volume", None)
+            if available is None:
+                available = self._get_attr(account_position, "available_quantity", 0)
+            return max(0, self._to_int(available, 0))
+        return self._position_available(position)
+
     def _cancel_active_orders(self, remark: str) -> int:
         if not self._trade_executor:
             return 0
@@ -507,13 +549,12 @@ class JuejinSellStrategy(BaseStrategy):
         return canceled
 
     def _get_position(self) -> Optional[PositionInfo]:
-        """Return the position declared by ``sell_10.csv``.
+        """Return the CSV-declared position used to evaluate signal branches.
 
-        This sell-only strategy intentionally does not gate signals on the real
-        QMT account position.  During verification the account may have no
-        holding for the symbol; the strategy should still submit the sell
-        attempt based on the CSV quantity and let the execution/account layer
-        accept or reject the order.
+        The declared position keeps dry-run and signal verification usable
+        without an account holding.  Actual live order quantities are checked
+        against the account's current ``can_use_volume`` in
+        :meth:`_available_for_sell` before submission.
         """
         return self._csv_position
 

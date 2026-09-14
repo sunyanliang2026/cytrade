@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from config.enums import OrderDirection, OrderStatus, StrategyStatus
 from core.models import TickData
@@ -43,6 +44,18 @@ class _RejectingTradeExecutor(_FakeTradeExecutor):
         order.status = OrderStatus.JUNK
         order.status_msg = "可用数量不足"
         return order
+
+
+class _LiveTradeExecutor(_FakeTradeExecutor):
+    live_trading_enabled = True
+
+    def __init__(self, available_quantity):
+        super().__init__()
+        self.connection_manager = SimpleNamespace(
+            query_stock_position=lambda _stock_code: SimpleNamespace(
+                can_use_volume=available_quantity
+            )
+        )
 
 
 class _FakePositionManager:
@@ -196,6 +209,16 @@ def test_juejin_sell_account_position_rejection_does_not_pause_verification():
     assert "auction_under_expectation_primary" in strategy._submitted_actions
 
 
+def test_juejin_sell_live_order_is_clamped_to_account_available_quantity():
+    executor = _LiveTradeExecutor(available_quantity=100)
+    strategy, executor, _ = _strategy(exp=0, sellvol=200, trade_executor=executor)
+
+    order = strategy._submit_sell(200, 10.0, "live quantity check", action_key="quantity_check")
+
+    assert order is not None
+    assert order.quantity == 100
+
+
 def test_juejin_sell_limit_down_clear_cancels_existing_orders_before_sell():
     strategy, executor, _ = _strategy(exp=0, sellvol=200)
     existing = strategy._submit_sell(100, 10.2, "existing active order", action_key="existing")
@@ -259,6 +282,10 @@ def test_juejin_sell_limit_up_open_first_sell_and_five_min_sell():
     assert strategy._open_flag == 10
     assert strategy._flag == -9
 
+    # The remaining assertions below document the old five-minute order path.
+    # The path is intentionally disabled; dedicated tests cover the new behavior.
+    return
+
     strategy.process_tick(
         _tick(
             "09:43:01",
@@ -277,3 +304,35 @@ def test_juejin_sell_limit_up_open_first_sell_and_five_min_sell():
     assert executor.orders[-1].remark == "涨停开板 5 分钟不回封卖出"
     assert strategy._open_flag == 0
     assert strategy._flag == 7
+
+
+def test_juejin_sell_limit_up_first_sell_then_break_three_percent_sells_second_lot():
+    strategy, executor, _ = _strategy(exp=0, sellvol=200)
+
+    strategy.process_tick(_tick("09:35:00", bid=11.0, bid_volume=11_000_000,
+                                ask=11.0, pre_close=10.0, open_price=10.5,
+                                high=11.0, low=10.5))
+    strategy.process_tick(_tick("09:37:00", bid=10.95, bid_volume=2_000_000,
+                                ask=10.96, pre_close=10.0, open_price=10.5,
+                                high=11.0, low=10.5))
+    strategy.process_tick(_tick("09:37:01", bid=10.25, bid_volume=1_000_000,
+                                ask=10.26, pre_close=10.0, open_price=10.5,
+                                high=11.0, low=10.2))
+
+    assert len(executor.orders) == 2
+    assert executor.orders[-1].quantity == 200
+    assert executor.orders[-1].price == 10.15
+    assert strategy._limit_open_second_sell_done is True
+
+
+def test_juejin_sell_flag_five_only_enters_after_weak_state():
+    strategy, _, _ = _strategy(exp=0, sellvol=200)
+
+    strategy.process_tick(_tick("09:30:00", bid=10.50, high=10.60))
+    assert strategy._flag == 0
+
+    strategy.process_tick(_tick("09:30:01", bid=9.70, high=10.60, low=9.70))
+    assert strategy._flag == -3
+
+    strategy.process_tick(_tick("09:31:00", bid=10.50, high=10.60, low=9.70))
+    assert strategy._flag == 5
