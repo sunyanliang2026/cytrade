@@ -127,7 +127,7 @@ class TradeExecutor:
             "total_asset": total_asset,
         }
 
-    def arm_limit_buy_batch(self, requests: list[tuple[str, float, int]]) -> dict:
+    def arm_limit_buy_batch(self, requests: list[tuple[str, float, int]], *, attempts_per_order: int = 1) -> dict:
         """Check one frozen batch once, then avoid per-order asset queries.
 
         The caller must submit exactly these requests immediately afterwards.
@@ -154,9 +154,10 @@ class TradeExecutor:
                 "available_cash": available_cash,
                 "required_amount": total_required,
             }
+        attempts = max(1, int(attempts_per_order or 1))
         self._armed_batch_buy_orders = {}
         for key, _ in normalized:
-            self._armed_batch_buy_orders[key] = self._armed_batch_buy_orders.get(key, 0) + 1
+            self._armed_batch_buy_orders[key] = self._armed_batch_buy_orders.get(key, 0) + attempts
         self._armed_batch_available_cash = available_cash
         return {"ok": True, "available_cash": available_cash, "required_amount": total_required}
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+import time
 from typing import Callable, Optional
 
 from config.enums import OrderStatus, StrategyStatus
@@ -33,6 +34,8 @@ class SubmissionResult:
     submit_call_time_ns: int = 0
     submit_return_time_ns: int = 0
     submit_elapsed_us: float = 0.0
+    attempt: int = 1
+    attempts: int = 1
 
 
 class OvernightLimitUpBuyStrategy(BaseStrategy):
@@ -86,6 +89,9 @@ class OvernightLimitUpBuyStrategy(BaseStrategy):
         submission_store=None,
         record_submission: bool = True,
         log_submission: bool = True,
+        max_attempts: int = 1,
+        retry_delay_ms: int = 100,
+        rejection_wait_ms: int = 100,
     ) -> SubmissionResult:
         trade_day_text = format_trade_day(trade_day)
         if self.status != StrategyStatus.RUNNING:
@@ -128,13 +134,30 @@ class OvernightLimitUpBuyStrategy(BaseStrategy):
             f"trade_day={trade_day_text} amount={self._amount:.2f} "
             f"limit_up={limit_up_price:.3f} qty={quantity}"
         )
+        max_attempts = max(1, int(max_attempts or 1))
         order = self._prepared_order
-        if order is None:
-            order = self.add_position(limit_up_price, quantity, remark=remark)
-        else:
-            order = self._trade_executor._submit_order(order)
-            self._track_order(order)
-            self.__class__._sync_class_stats(self._position_mgr)
+        self._prepared_order = None
+        for attempt in range(1, max_attempts + 1):
+            if order is None:
+                order = self.add_position(limit_up_price, quantity, remark=remark)
+            else:
+                order = self._trade_executor._submit_order(order)
+                self._track_order(order)
+                self.__class__._sync_class_stats(self._position_mgr)
+            if not order:
+                break
+            if attempt < max_attempts:
+                wait_for_counter_update(order, rejection_wait_ms)
+            if attempt < max_attempts and is_counter_not_open(order):
+                logger.warning(
+                    "OVERNIGHT_LIMIT_UP_BUY retry stock=%s attempt=%d next_attempt=%d reason=%s uuid=%s",
+                    self.stock_code, attempt, attempt + 1, order.status_msg,
+                    getattr(order, "order_uuid", "")[:8],
+                )
+                time.sleep(max(0, int(retry_delay_ms)) / 1000.0)
+                order = self._new_order_for_retry(limit_up_price, quantity, remark)
+                continue
+            break
         if not order:
             return self._result(
                 status="failed",
@@ -180,14 +203,20 @@ class OvernightLimitUpBuyStrategy(BaseStrategy):
             order=order,
         )
 
-    def prepare_order(self, limit_up_price: float, quantity: int) -> bool:
+    def _new_order_for_retry(self, limit_up_price: float, quantity: int, remark: str):
+        prepare = getattr(self._trade_executor, "prepare_limit_buy", None)
+        if callable(prepare):
+            return prepare(self.strategy_id, self.strategy_name, self.stock_code, limit_up_price, quantity, remark)
+        return None
+
+    def prepare_order(self, limit_up_price: float, quantity: int, trade_day: str | date | datetime | None = None) -> bool:
         """Freeze the order object before the dispatch time."""
         prepare = getattr(self._trade_executor, "prepare_limit_buy", None)
         if not callable(prepare):
             return False
         remark = (
             "overnight_limit_up_buy "
-            f"trade_day=preflight amount={self._amount:.2f} "
+            f"trade_day={format_trade_day(trade_day) if trade_day else 'preflight'} amount={self._amount:.2f} "
             f"limit_up={limit_up_price:.3f} qty={quantity}"
         )
         self._prepared_order = prepare(
@@ -230,6 +259,20 @@ class OvernightLimitUpBuyStrategy(BaseStrategy):
     @staticmethod
     def _default_csv_path() -> Path:
         return Path(__file__).resolve().parent / "data" / "orders.csv"
+
+
+def is_counter_not_open(order: Order) -> bool:
+    """Return true only for an explicit pre-open counter rejection."""
+    if getattr(order, "status", None) != OrderStatus.JUNK:
+        return False
+    text = str(getattr(order, "status_msg", "") or "").lower()
+    return "未到开市时间" in text or "not open" in text or "before market open" in text
+
+
+def wait_for_counter_update(order: Order, wait_ms: int) -> None:
+    deadline = time.monotonic() + max(0, int(wait_ms)) / 1000.0
+    while getattr(order, "status", None) != OrderStatus.JUNK and time.monotonic() < deadline:
+        time.sleep(0.001)
 
 
 def calculate_order_quantity(amount: float, limit_up_price: float) -> int:

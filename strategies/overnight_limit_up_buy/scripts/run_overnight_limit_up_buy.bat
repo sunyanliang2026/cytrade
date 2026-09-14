@@ -9,6 +9,9 @@ rem CSV_FILE is the stock pool. It must contain only: stock_code,amount.
 rem Add as many rows as required in that CSV.
 rem ============================================================
 set "SUBMIT_TIME=08:30:00"
+set "COUNTER_OFFSET_MS=150"
+set "RETRY_DELAY_MS=100"
+set "REJECTION_WAIT_MS=100"
 set "RUN_LIVE=true"
 set "NO_WAIT=false"
 set "MARKET_DAY_ONLY=true"
@@ -48,6 +51,8 @@ echo Overnight limit-up buy
 echo Repo:        %REPO_ROOT%
 echo Python:      %CYTRADE_PYTHON%
 echo Submit time: %SUBMIT_TIME%
+echo Counter offset: %COUNTER_OFFSET_MS% ms
+echo Retry delay:    %RETRY_DELAY_MS% ms (max 1 retry)
 echo Run live:    %RUN_LIVE%
 echo CSV file:    %CSV_FILE%
 echo State file:  %STATE_FILE%
@@ -67,6 +72,9 @@ pushd "%REPO_ROOT%"
   --csv "%CSV_FILE%" ^
   --state-file "%STATE_FILE%" ^
   --submit-time "%SUBMIT_TIME%" ^
+  --counter-offset-ms "%COUNTER_OFFSET_MS%" ^
+  --retry-delay-ms "%RETRY_DELAY_MS%" ^
+  --rejection-wait-ms "%REJECTION_WAIT_MS%" ^
   --post-submit-wait-sec "%POST_SUBMIT_WAIT_SEC%" ^
   --require-plan-confirm ^
   %MARKET_DAY_ARGS% ^

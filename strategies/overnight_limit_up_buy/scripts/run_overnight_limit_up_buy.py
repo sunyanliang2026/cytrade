@@ -12,7 +12,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 os.environ.setdefault("PYTHONUTF8", "1")
@@ -196,7 +196,13 @@ def build_frozen_plan(configs, provider, executor, store, trade_day: date) -> tu
 
     arm_batch = getattr(executor, "arm_limit_buy_batch", None)
     if callable(arm_batch):
-        funding = arm_batch([(plan.stock_code, plan.limit_up_price, plan.quantity) for plan in plans])
+        try:
+            funding = arm_batch(
+                [(plan.stock_code, plan.limit_up_price, plan.quantity) for plan in plans],
+                attempts_per_order=2 if getattr(executor, "live_trading_enabled", False) else 1,
+            )
+        except TypeError:
+            funding = arm_batch([(plan.stock_code, plan.limit_up_price, plan.quantity) for plan in plans])
         if not bool(funding.get("ok")):
             for plan in plans:
                 plan.strategy.stop()
@@ -211,7 +217,7 @@ def build_frozen_plan(configs, provider, executor, store, trade_day: date) -> tu
             plan.strategy.config.params["batch_available_cash"] = funding.get("available_cash")
     for plan in plans:
         if callable(getattr(plan.strategy, "prepare_order", None)):
-            plan.strategy.prepare_order(plan.limit_up_price, plan.quantity)
+            plan.strategy.prepare_order(plan.limit_up_price, plan.quantity, trade_day=trade_day)
     return plans, []
 
 
@@ -220,7 +226,7 @@ def display_frozen_plan(plans: list[FrozenOrderPlan], *, trade_day: date, submit
     available_cash = (plans[0].strategy.config.params or {}).get("batch_available_cash")
     print()
     print("Frozen overnight limit-up BUY plan")
-    print(f"Trade day: {trade_day.isoformat()}  Submit time: {submit_at.strftime('%H:%M:%S')}")
+    print(f"Trade day: {trade_day.isoformat()}  Submit time: {submit_at.strftime('%H:%M:%S.%f')[:-3]}")
     print("row  stock   amount       prev_close  limit_price  quantity  estimated_amount")
     for plan in plans:
         print(
@@ -273,6 +279,7 @@ def run_session(
         return "skipped_non_market_day"
 
     submit_at = build_submit_datetime(now, str(args.submit_time))
+    submit_at += timedelta(milliseconds=max(0, int(getattr(args, "counter_offset_ms", 0))))
     selector = OvernightLimitUpBuyStrategy(StrategyConfig(params={"csv_path": str(csv_path)}))
     configs = selector.select_stocks()
     if not configs:
@@ -345,6 +352,9 @@ def run_session(
             submission_store=store,
             record_submission=False,
             log_submission=False,
+            max_attempts=2 if live_mode else 1,
+            retry_delay_ms=getattr(args, "retry_delay_ms", 100),
+            rejection_wait_ms=getattr(args, "rejection_wait_ms", 100),
         )
         results.append((plan, result))
 
@@ -456,7 +466,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run overnight limit-up BUY orders in dry-run mode.")
     parser.add_argument("--csv", default=str(default_csv_path()), help="CSV with exactly stock_code,amount columns.")
     parser.add_argument("--state-file", default=str(default_state_path()), help="JSON file used for daily idempotency.")
-    parser.add_argument("--submit-time", default="08:30:00", help="Submission time, HH:MM[:SS].")
+    parser.add_argument("--submit-time", default="08:30:00", help="Broker opening time, HH:MM[:SS].")
+    parser.add_argument("--counter-offset-ms", type=int, default=300, help="Delay after broker opening time before dispatch.")
+    parser.add_argument("--retry-delay-ms", type=int, default=100, help="Delay before one retry after a pre-open rejection.")
+    parser.add_argument("--rejection-wait-ms", type=int, default=100, help="Time to wait for an asynchronous rejection before retrying.")
     parser.add_argument("--no-wait", action="store_true", help="Submit immediately; useful for dry-run verification.")
     parser.add_argument("--market-day-only", dest="market_day_only", action="store_true", default=True)
     parser.add_argument("--no-market-day-only", dest="market_day_only", action="store_false")

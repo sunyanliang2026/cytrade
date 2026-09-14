@@ -35,6 +35,34 @@ class _RejectingExecutor(_FakeExecutor):
         return order
 
 
+class _RetryExecutor(_FakeExecutor):
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    def prepare_limit_buy(self, strategy_id, strategy_name, stock_code, price, quantity, remark=""):
+        return Order(
+            strategy_id=strategy_id,
+            strategy_name=strategy_name,
+            stock_code=stock_code,
+            direction=OrderDirection.BUY,
+            price=price,
+            quantity=quantity,
+            remark=remark,
+            status=OrderStatus.UNREPORTED,
+        )
+
+    def _submit_order(self, order):
+        self.attempts += 1
+        self.orders.append(order)
+        if self.attempts == 1:
+            order.status = OrderStatus.JUNK
+            order.status_msg = "[COUNTER] 未到开市时间,系统禁止委托"
+        else:
+            order.status = OrderStatus.WAIT_REPORTING
+        return order
+
+
 class _MemoryStore:
     def __init__(self):
         self.records = {}
@@ -115,3 +143,21 @@ def test_submit_once_does_not_record_rejected_order():
 
     assert result.status == "rejected"
     assert store.records == {}
+
+
+def test_submit_once_retries_only_counter_preopen_rejection():
+    executor = _RetryExecutor()
+    strategy = _strategy(executor=executor)
+    strategy.prepare_order(11.03, 2300, trade_day=date(2026, 9, 9))
+
+    result = strategy.submit_once(
+        trade_day="2026-09-09",
+        price_lookup=lambda code: 11.03,
+        max_attempts=2,
+        retry_delay_ms=0,
+        rejection_wait_ms=0,
+    )
+
+    assert result.status == "submitted"
+    assert executor.attempts == 2
+    assert executor.orders[0].order_uuid != executor.orders[1].order_uuid
