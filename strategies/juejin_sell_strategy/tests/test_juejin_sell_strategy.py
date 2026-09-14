@@ -206,7 +206,7 @@ def test_juejin_sell_account_position_rejection_does_not_pause_verification():
     assert executor.orders[0].status == OrderStatus.JUNK
     assert executor.orders[0].status_msg == "可用数量不足"
     assert strategy.status == StrategyStatus.RUNNING
-    assert "auction_under_expectation_primary" in strategy._submitted_actions
+    assert "auction_under_expectation_primary" not in strategy._submitted_actions
 
 
 def test_juejin_sell_live_order_is_clamped_to_account_available_quantity():
