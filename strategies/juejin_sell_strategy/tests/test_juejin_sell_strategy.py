@@ -251,7 +251,7 @@ def test_juejin_sell_limit_up_open_first_sell_and_five_min_sell():
         _tick(
             "09:35:00",
             bid=11.0,
-            bid_volume=11_000_000,
+            bid_volume=110_000,
             ask=11.0,
             pre_close=10.0,
             open_price=10.5,
@@ -266,7 +266,7 @@ def test_juejin_sell_limit_up_open_first_sell_and_five_min_sell():
         _tick(
             "09:37:00",
             bid=10.95,
-            bid_volume=2_000_000,
+            bid_volume=20_000,
             ask=10.96,
             pre_close=10.0,
             open_price=10.5,
@@ -309,13 +309,13 @@ def test_juejin_sell_limit_up_open_first_sell_and_five_min_sell():
 def test_juejin_sell_limit_up_first_sell_then_break_three_percent_sells_second_lot():
     strategy, executor, _ = _strategy(exp=0, sellvol=200)
 
-    strategy.process_tick(_tick("09:35:00", bid=11.0, bid_volume=11_000_000,
+    strategy.process_tick(_tick("09:35:00", bid=11.0, bid_volume=110_000,
                                 ask=11.0, pre_close=10.0, open_price=10.5,
                                 high=11.0, low=10.5))
-    strategy.process_tick(_tick("09:37:00", bid=10.95, bid_volume=2_000_000,
+    strategy.process_tick(_tick("09:37:00", bid=10.95, bid_volume=20_000,
                                 ask=10.96, pre_close=10.0, open_price=10.5,
                                 high=11.0, low=10.5))
-    strategy.process_tick(_tick("09:37:01", bid=10.25, bid_volume=1_000_000,
+    strategy.process_tick(_tick("09:37:01", bid=10.25, bid_volume=10_000,
                                 ask=10.26, pre_close=10.0, open_price=10.5,
                                 high=11.0, low=10.2))
 
@@ -323,6 +323,12 @@ def test_juejin_sell_limit_up_first_sell_then_break_three_percent_sells_second_l
     assert executor.orders[-1].quantity == 200
     assert executor.orders[-1].price == 10.15
     assert strategy._limit_open_second_sell_done is True
+
+
+def test_juejin_sell_book_amount_converts_qmt_lots_to_shares():
+    strategy, _, _ = _strategy(exp=0, sellvol=200)
+
+    assert strategy._book_amount(16.21, 100_000) == 162_100_000
 
 
 def test_juejin_sell_flag_five_only_enters_after_weak_state():

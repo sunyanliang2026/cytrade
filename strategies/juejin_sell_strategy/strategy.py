@@ -634,7 +634,8 @@ class JuejinSellStrategy(BaseStrategy):
         return self._limit_up_price, self._limit_down_price
 
     def _book_amount(self, price: float, volume: int) -> float:
-        return float(price or 0.0) * float(volume or 0) * self._book_volume_multiplier
+        # QMT bidVol is reported in lots (手), while the amount thresholds use shares.
+        return float(price or 0.0) * float(volume or 0) * 100 * self._book_volume_multiplier
 
     def _log_status(self, reason: str) -> None:
         logger.info(
