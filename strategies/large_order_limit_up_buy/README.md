@@ -2,13 +2,13 @@
 
 ## Current Entry Rules
 
-- A first-seal large limit-up buy order is a single `l2order` worth at least 2 million yuan.
-- First limit-up entries keep the opening-dip requirement and require that large order.
+- First-seal entries require `bid1 == exact limit-up price`, a bid-one seal above 60 million yuan, then more than 10 million yuan cumulatively across limit-up BUY `l2order` records of at least 2 million yuan each. The opening-dip requirement remains in effect.
 - Reseal entries submit on the first observed limit-up BUY `l2order`, then inspect the next 50 limit-up BUY orders. The order is retained only when at least two are 1.5 million yuan orders; otherwise the strategy requests cancellation of the unfilled order and disables further entries for that stock instance.
 - After either entry, the next 30 seconds of 1.5 million yuan limit-up buy orders are written to a Chinese, one-order-per-row CSV with order, fill, cancel, remaining amount, and status.
-- A reseal is eligible only after the prior sealed period was observed above 100 million yuan and longer than 20 seconds. The reopened period must last at least 10 seconds and its low price must be below 98.5% of the limit-up price.
+- A reseal is eligible only after the prior sealed period was observed above 100 million yuan and longer than 10 seconds. The reopened period must last at least 3 seconds; no reopened-low-price condition applies.
+- Planned rule: when a pool stock's opening gain is below 3.5%, its monitoring will stop for that trading day. This rule is documented but not implemented yet.
 - Any partial or full entry fill disables further entries for that stock instance for the remainder of the run.
-- `bid1 == exact limit-up price` is used only for sealed/reopened state detection. A sell-one quote at limit-up is not a sealed board and does not trigger an entry.
+- `bid1 == exact limit-up price` is required for sealed/reopened state detection and first-seal entry eligibility. A sell-one quote at limit-up is not a sealed board and does not trigger an entry.
 
 独立的 Level2 大单打板策略。人工股票池位于 `data/manual_pool.csv`，设计文档位于 `docs/design.md`。
 
