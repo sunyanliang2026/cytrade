@@ -1,7 +1,8 @@
 from argparse import Namespace
+import logging
 
 from strategy.models import StrategyConfig
-from strategies.large_order_limit_up_buy.scripts.run_live import validate_live_confirmation
+from strategies.large_order_limit_up_buy.scripts.run_live import StrategyConsoleFilter, validate_live_confirmation
 
 
 def args(**overrides):
@@ -36,3 +37,17 @@ def test_live_confirmation_supports_multiple_csv_rows_with_total_limit():
     configs = [config("600001", 1000), config("000001", 1000)]
     assert validate_live_confirmation(args(max_order_amount=1000, max_total_amount=2000), configs) == ""
     assert validate_live_confirmation(args(max_order_amount=1000, max_total_amount=1999), configs) == "live_plan_exceeds_max_total_amount"
+
+
+def test_strategy_console_filter_hides_unrelated_runtime_info_but_keeps_strategy_and_warnings():
+    console_filter = StrategyConsoleFilter()
+
+    def record(level, message):
+        return logging.LogRecord("cytrade.system", level, __file__, 1, message, (), None)
+
+    assert not console_filter.filter(record(logging.INFO, "Runtime heartbeat mode=live"))
+    assert not console_filter.filter(record(logging.INFO, "[ORDER] 忽略无策略归属成交 xt_order_id=1"))
+    assert not console_filter.filter(record(logging.INFO, "[ORDER] [TRADE] 成交回报 order_id=1"))
+    assert console_filter.filter(record(logging.INFO, "[LARGE_ORDER] 002212 BUY_DECISION"))
+    assert console_filter.filter(record(logging.INFO, "LargeOrderLimitUpBuy {\"event\": \"our_order_filled\"}"))
+    assert console_filter.filter(record(logging.WARNING, "DataSubscription: data latency too high"))

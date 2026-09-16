@@ -7,10 +7,12 @@ the QMT account is connected and Level2 monitoring starts.
 from __future__ import annotations
 
 import argparse
+import logging
 import signal
 import sys
 import threading
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -30,6 +32,29 @@ SESSION_EVENT_PREFIX = "LARGE_ORDER_LIMIT_UP_BUY_LIVE"
 SUMMARY_INTERVAL_SECONDS = 600
 
 
+class StrategyConsoleFilter(logging.Filter):
+    """Keep live-console output focused on this strategy while files stay complete."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        message = record.getMessage()
+        return (
+            "[LARGE_ORDER]" in message
+            or "LargeOrderLimitUpBuy" in message
+            or SESSION_EVENT_PREFIX in message
+        )
+
+
+def install_strategy_console_filter() -> None:
+    console_filter = StrategyConsoleFilter()
+    for logger_name in ("system", "trade", "debug"):
+        logger = get_logger(logger_name)
+        for handler in logger.handlers:
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                handler.addFilter(console_filter)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run LargeOrderLimitUpBuy with explicit live confirmations.")
     parser.add_argument("--live", action="store_true", help="Required. Allows the runner to connect the trading account.")
@@ -42,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-order-amount", type=float, default=0.0, help="Required hard limit for each CSV plan_amount.")
     parser.add_argument("--max-total-amount", type=float, default=0.0, help="Required hard limit for total CSV plan_amount.")
     parser.add_argument("--no-market-day-check", dest="market_day_only", action="store_false")
+    parser.add_argument("--full-console", action="store_true", help="Print all runtime console logs for troubleshooting.")
     parser.set_defaults(market_day_only=True)
     return parser
 
@@ -92,11 +118,13 @@ def log_monitor_summary(logger, strategies, data_sub) -> None:
     status = data_sub.get_latest_data_status()
     latest = status.get("latest_data_time") or ""
     delay = float(status.get("data_delay_ms", 0.0) or 0.0)
+    phases = Counter(strategy._entry_phase for strategy in strategies)
+    submitted = sum(strategy._submitted_count for strategy in strategies)
+    filled = sum(1 for strategy in strategies if strategy._entry_filled)
+    phase_text = ",".join(f"{phase}:{count}" for phase, count in sorted(phases.items()))
     logger.info(
-        "[LARGE_ORDER] SUMMARY stocks=%d l2_stocks=%d l2_kinds=%d latest_data_time=%s delay_ms=%.0f %s",
-        len(strategies), len(data_sub.get_l2_subscription_map()),
-        sum(len(kinds) for kinds in data_sub.get_l2_subscription_map().values()),
-        latest, delay, " ".join(strategy.console_summary() for strategy in strategies),
+        "[LARGE_ORDER] 汇总 监控=%d 已下单=%d 已成交=%d 状态=%s 延迟=%.0fms 行情=%s",
+        len(strategies), submitted, filled, phase_text, delay, latest,
     )
 
 
@@ -117,10 +145,12 @@ def run_live_session(args: argparse.Namespace) -> str:
     settings = Settings(
         LOAD_PREVIOUS_STATE_ON_START=False,
         CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN=False,
-        LOG_SUMMARY_MODE=True,
+        LOG_SUMMARY_MODE=not bool(args.full_console),
         SESSION_EXIT_TIME=args.stop_time,
     )
     ctx = build_app(strategy_classes=[], settings=settings)
+    if not args.full_console:
+        install_strategy_console_filter()
     stop_event = threading.Event()
     if not _connect_account_for_runtime(ctx, mode="large_order_limit_up_buy_live", stop_event=stop_event):
         logger.error("%s skipped reason=live_preflight_failed", SESSION_EVENT_PREFIX)
