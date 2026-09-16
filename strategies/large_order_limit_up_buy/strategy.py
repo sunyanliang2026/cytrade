@@ -59,6 +59,12 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             params.get("first_seal_big_order_min_amount", params.get("big_order_min_amount", 2_000_000.0))
             or 2_000_000.0
         )
+        self._first_seal_min_bid_amount = float(
+            params.get("first_seal_min_bid_amount", 60_000_000.0) or 60_000_000.0
+        )
+        self._first_seal_required_order_amount = float(
+            params.get("first_seal_required_order_amount", 10_000_000.0) or 10_000_000.0
+        )
         self._validation_big_order_min_amount = float(
             params.get("reseal_validation_big_order_min_amount", 1_500_000.0) or 1_500_000.0
         )
@@ -72,13 +78,10 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             params.get("reseal_min_prior_seal_amount", 100_000_000.0) or 100_000_000.0
         )
         self._reseal_min_prior_seal_seconds = float(
-            params.get("reseal_min_prior_seal_seconds", 20.0) or 20.0
+            params.get("reseal_min_prior_seal_seconds", 10.0) or 10.0
         )
         self._reseal_min_reopen_seconds = float(
-            params.get("reseal_min_reopen_seconds", 10.0) or 10.0
-        )
-        self._reseal_max_reopen_price_ratio = float(
-            params.get("reseal_max_reopen_price_ratio", 0.985) or 0.985
+            params.get("reseal_min_reopen_seconds", 3.0) or 3.0
         )
         self._neighbor_count = max(1, int(params.get("neighbor_count", 5) or 5))
         self._neighbor_window_seconds = max(0.0, float(params.get("neighbor_window_seconds", 3.0) or 3.0))
@@ -99,6 +102,8 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._dip_requirement_logged = False
         self._dip_confirmed_logged = False
         self._big_order_count = 0
+        self._first_seal_order_amount = 0.0
+        self._first_seal_amount_observed = False
         self._decision_count = 0
         self._submitted_count = 0
         self._blocked_dip_count = 0
@@ -162,13 +167,14 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                         "plan_amount": amount,
                         "dry_run": self._dry_run,
                         "first_seal_big_order_min_amount": self._first_seal_big_order_min_amount,
+                        "first_seal_min_bid_amount": self._first_seal_min_bid_amount,
+                        "first_seal_required_order_amount": self._first_seal_required_order_amount,
                         "reseal_validation_big_order_min_amount": self._validation_big_order_min_amount,
                         "reseal_validation_order_count": self._reseal_validation_order_count,
                         "reseal_validation_big_order_count": self._reseal_validation_big_order_count,
                         "reseal_min_prior_seal_amount": self._reseal_min_prior_seal_amount,
                         "reseal_min_prior_seal_seconds": self._reseal_min_prior_seal_seconds,
                         "reseal_min_reopen_seconds": self._reseal_min_reopen_seconds,
-                        "reseal_max_reopen_price_ratio": self._reseal_max_reopen_price_ratio,
                         "neighbor_count": self._neighbor_count,
                         "neighbor_window_seconds": self._neighbor_window_seconds,
                         "record_dir": str(self._record_dir),
@@ -233,14 +239,14 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                 self._sealed_max_amount,
                 self._quote_bid_amount(event),
             )
+            if self._entry_phase == "READY" and self._quote_bid_amount(event) > self._first_seal_min_bid_amount:
+                self._first_seal_amount_observed = True
             if self._entry_phase == "WAIT_RESEAL" and self._reopen_since is not None:
                 self._reseal_ready = self._reopen_conditions_met(quote_time)
                 if self._reseal_ready:
                     self._log_event(
                         "reseal_conditions_met",
                         reopen_seconds=round(self._elapsed_seconds(self._reopen_since, quote_time), 3),
-                        reopen_low_price=self._reopen_low_price,
-                        required_low_price=self._limit_up_price * self._reseal_max_reopen_price_ratio,
                     )
         elif quote_time is not None:
             had_sealed_period = self._sealed_since is not None
@@ -272,6 +278,9 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                 )
             self._sealed_since = None
             self._sealed_max_amount = 0.0
+            if self._entry_phase == "READY" and not self._submitted_count:
+                self._first_seal_amount_observed = False
+                self._first_seal_order_amount = 0.0
         if not self._initial_quote_checked and not self._quote_has_price(event):
             return
         if not self._initial_quote_checked:
@@ -316,15 +325,23 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         elif self._entry_phase == "WAIT_RESEAL" and self._reseal_ready:
             # A reseal is time-sensitive: take the queue position first, then validate support.
             self._maybe_submit(record, reseal_validation=True)
-        elif self._entry_phase == "READY" and self._is_first_seal_big_order(price, volume, amount):
+        elif (
+            self._entry_phase == "READY"
+            and self._first_seal_amount_observed
+            and self._last_quote is not None
+            and self._quote_is_limit_up(self._last_quote)
+            and self._quote_bid_amount(self._last_quote) > self._first_seal_min_bid_amount
+            and self._is_first_seal_big_order(price, volume, amount)
+        ):
             self._big_order_count += 1
+            self._first_seal_order_amount += amount
             if not self._has_open_dip():
                 self._blocked_dip_count += 1
                 if not self._dip_requirement_logged:
                     self._dip_requirement_logged = True
                     self._log_event("buy_blocked", reason="opening_dip_not_confirmed", open_price=self._open_price,
                                     session_low_price=self._session_low_price, required_ratio=0.985)
-            else:
+            elif self._first_seal_order_amount > self._first_seal_required_order_amount:
                 self._maybe_submit(record)
         self._write_pending_neighbors()
         if post_window_active:
@@ -491,6 +508,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         return (
             f"{self.stock_code}:phase={self._entry_phase},open={self._open_price:.3f},"
             f"low={self._session_low_price:.3f},big={self._big_order_count},"
+            f"first_seal_amount={self._first_seal_order_amount:.2f}/{self._first_seal_required_order_amount:.2f},"
             f"decision={self._decision_count},submitted={self._submitted_count},"
             f"reseal_verify={self._reseal_validation_orders_seen}/{self._reseal_validation_order_count},"
             f"reseal_big={self._reseal_validation_big_orders_seen}/{self._reseal_validation_big_order_count},"
@@ -718,8 +736,6 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             self._reopen_since is not None
             and quote_time is not None
             and self._elapsed_seconds(self._reopen_since, quote_time) >= self._reseal_min_reopen_seconds
-            and self._reopen_low_price > 0
-            and self._reopen_low_price < self._limit_up_price * self._reseal_max_reopen_price_ratio
         )
 
     @staticmethod

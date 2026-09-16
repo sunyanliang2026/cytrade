@@ -1,13 +1,14 @@
 {
   "dry_run": false,
   "first_seal_big_order_min_amount": 2000000.0,
+  "first_seal_min_bid_amount": 60000000.0,
+  "first_seal_required_order_amount": 10000000.0,
   "reseal_validation_big_order_min_amount": 1500000.0,
   "reseal_validation_order_count": 50,
   "reseal_validation_big_order_count": 2,
   "reseal_min_prior_seal_amount": 100000000.0,
-  "reseal_min_prior_seal_seconds": 20.0,
-  "reseal_min_reopen_seconds": 10.0,
-  "reseal_max_reopen_price_ratio": 0.985,
+  "reseal_min_prior_seal_seconds": 10.0,
+  "reseal_min_reopen_seconds": 3.0,
   "neighbor_count": 10,
   "neighbor_window_seconds": 3.0
 }
