@@ -74,6 +74,9 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._reseal_validation_big_order_count = max(
             1, int(params.get("reseal_validation_big_order_count", 2) or 2)
         )
+        self._reseal_validation_continue_on_failure = bool(
+            params.get("reseal_validation_continue_on_failure", False)
+        )
         self._reseal_min_prior_seal_amount = float(
             params.get("reseal_min_prior_seal_amount", 100_000_000.0) or 100_000_000.0
         )
@@ -172,6 +175,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                         "reseal_validation_big_order_min_amount": self._validation_big_order_min_amount,
                         "reseal_validation_order_count": self._reseal_validation_order_count,
                         "reseal_validation_big_order_count": self._reseal_validation_big_order_count,
+                        "reseal_validation_continue_on_failure": self._reseal_validation_continue_on_failure,
                         "reseal_min_prior_seal_amount": self._reseal_min_prior_seal_amount,
                         "reseal_min_prior_seal_seconds": self._reseal_min_prior_seal_seconds,
                         "reseal_min_reopen_seconds": self._reseal_min_reopen_seconds,
@@ -472,15 +476,30 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
 
         self._reseal_validation_active = False
         self._reseal_validation_result = "failed"
-        self._set_entry_phase("DONE", "reseal_validation_failed")
         cancel_order = getattr(self._trade_executor, "cancel_order", None)
         requested = bool(cancel_order(self._active_order_uuid, remark="reseal validation failed")) if callable(cancel_order) else False
+        can_continue = (
+            self._reseal_validation_continue_on_failure
+            and requested
+            and not self._entry_filled
+            and bool(self._active_order_uuid)
+        )
+        if can_continue:
+            # The current seal already triggered an order. Wait for a fresh
+            # break/reseal cycle so validation failure cannot retrigger here.
+            self._entry_phase = "WAIT_REOPEN"
+            self._reseal_ready = False
+            self._reopen_since = None
+            self._reopen_low_price = 0.0
+        else:
+            self._set_entry_phase("DONE", "reseal_validation_failed")
         self._log_event(
             "reseal_validation_failed",
             observed_orders=self._reseal_validation_orders_seen,
             observed_big_orders=self._reseal_validation_big_orders_seen,
             required_big_orders=self._reseal_validation_big_order_count,
             cancel_requested=requested,
+            continue_monitoring=can_continue,
         )
 
     def _on_order_update_hook(self, order) -> None:
@@ -727,8 +746,10 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         return (
             self._sealed_since is not None
             and quote_time is not None
-            and self._sealed_max_amount >= self._reseal_min_prior_seal_amount
-            and self._elapsed_seconds(self._sealed_since, quote_time) > self._reseal_min_prior_seal_seconds
+            and (
+                self._sealed_max_amount >= self._reseal_min_prior_seal_amount
+                or self._elapsed_seconds(self._sealed_since, quote_time) > self._reseal_min_prior_seal_seconds
+            )
         )
 
     def _reopen_conditions_met(self, quote_time: datetime | None) -> bool:

@@ -320,12 +320,13 @@ def _prepare_reseal_candidate(strategy, *, seal_volume=130_000, break_time=21,
 @pytest.mark.parametrize(
     ("seal_volume", "break_time", "reopen_low", "reseal_time"),
     [
-        (124_999, 21, 7.8, 32),  # prior seal amount is below 100 million
-        (130_000, 10, 7.8, 32),  # prior seal duration is not greater than 10s
+        (124_999, 10, 7.8, 32),  # both prior-seal conditions are false
         (130_000, 11, 7.8, 13),  # reopen duration is below 3s
     ],
 )
-def test_reseal_requires_each_gate(tmp_path, seal_volume, break_time, reopen_low, reseal_time):
+def test_reseal_requires_one_prior_seal_condition_and_reopen_duration(
+    tmp_path, seal_volume, break_time, reopen_low, reseal_time
+):
     strategy = make_strategy(tmp_path)
     _prepare_reseal_candidate(
         strategy,
@@ -340,6 +341,22 @@ def test_reseal_requires_each_gate(tmp_path, seal_volume, break_time, reopen_low
     assert strategy._trigger_count == 0
     assert strategy._entry_phase in {"WAIT_REOPEN", "WAIT_RESEAL"}
     assert strategy._reseal_ready is False
+
+
+def test_reseal_accepts_short_seal_when_prior_amount_reaches_threshold(tmp_path):
+    strategy = make_strategy(tmp_path)
+    _prepare_reseal_candidate(
+        strategy,
+        seal_volume=130_000,
+        break_time=5,
+        reopen_low=7.8,
+        reseal_time=9,
+    )
+
+    strategy.on_l2_order(event(price=8.0, volume=100, no="short-seal-reseal"))
+
+    assert strategy._reseal_ready is True
+    assert strategy._trigger_count == 1
 
 
 def test_unqualified_new_seal_does_not_reuse_old_reopen_window(tmp_path):
@@ -444,7 +461,7 @@ def test_reseal_submits_first_order_then_cancels_when_validation_fails(tmp_path)
     ))
 
     strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
-    for number in range(50):
+    for number in range(150):
         strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
 
     assert len(executor.orders) == 1
@@ -478,13 +495,54 @@ def test_reseal_keeps_order_when_two_big_orders_arrive_within_twenty(tmp_path):
     ))
 
     strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
-    for number in range(50):
+    for number in range(150):
         volume = 187500 if number in (3, 15) else 100
         strategy.on_l2_order(event(price=8.0, volume=volume, no=f"follow-{number}"))
 
     assert len(executor.orders) == 1
     assert executor.cancels == []
     assert strategy._reseal_validation_result == "passed"
+
+
+def test_reseal_validation_can_continue_after_successful_cancel(tmp_path):
+    executor = FakeExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(
+            stock_code="600001",
+            params={
+                "plan_amount": 100000,
+                "record_dir": str(tmp_path),
+                "reseal_validation_continue_on_failure": True,
+            },
+        ),
+        executor,
+        None,
+    )
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=8.0, bid1_volume=130_000,
+        event_time=datetime(2026, 9, 8, 9, 30, 0),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=7.9,
+        event_time=datetime(2026, 9, 8, 9, 30, 21),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=7.8,
+        event_time=datetime(2026, 9, 8, 9, 30, 31),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=8.0,
+        bid1_volume=1000, event_time=datetime(2026, 9, 8, 9, 30, 32),
+    ))
+
+    strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
+    for number in range(150):
+        strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
+
+    assert len(executor.orders) == 1
+    assert len(executor.cancels) == 1
+    assert strategy._reseal_validation_result == "failed"
+    assert strategy._entry_phase == "WAIT_REOPEN"
 
 
 def test_filled_entry_disables_all_later_entries_for_the_stock(tmp_path):
