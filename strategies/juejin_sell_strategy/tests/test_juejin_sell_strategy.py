@@ -342,3 +342,18 @@ def test_juejin_sell_flag_five_only_enters_after_weak_state():
 
     strategy.process_tick(_tick("09:31:00", bid=10.50, high=10.60, low=9.70))
     assert strategy._flag == 5
+
+
+def test_juejin_sell_flag_seven_sells_after_high_pullback_25_percent():
+    strategy, executor, _ = _strategy(exp=0, sellvol=200)
+
+    strategy.process_tick(_tick("09:35:00", bid=10.75, high=10.80, low=10.70))
+    assert strategy._flag == 7
+
+    strategy.process_tick(_tick("09:35:01", bid=10.50, high=10.80, low=10.50))
+
+    assert len(executor.orders) == 1
+    assert executor.orders[0].quantity == 200
+    assert executor.orders[0].price == 10.39
+    assert executor.orders[0].remark == "flag 7 高点回落 2.5% 卖出一笔"
+    assert strategy._flag == -9

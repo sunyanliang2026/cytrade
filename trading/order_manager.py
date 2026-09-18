@@ -186,13 +186,6 @@ class OrderManager:
             is_strategy_trade = bool(order or strategy_id)
 
             if not is_strategy_trade:
-                logger.info(
-                    "[ORDER] 忽略无策略归属成交 xt_order_id=%s code=%s price=%.3f qty=%s",
-                    xt_order_id,
-                    str(trade_info.get("stock_code", "") or ""),
-                    float(trade_info.get("traded_price", trade_info.get("price", 0)) or 0.0),
-                    int(trade_info.get("traded_volume", trade_info.get("quantity", 0)) or 0),
-                )
                 return
 
             xt_order_type = self._to_int(trade_info.get("order_type", 0))

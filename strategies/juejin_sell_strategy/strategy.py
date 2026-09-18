@@ -56,6 +56,7 @@ class JuejinSellStrategy(BaseStrategy):
         self._up_sell = self._to_int(params.get("up_sell"), 0)
         self._limit_open_second_sell_done = bool(params.get("limit_open_second_sell_done", False))
         self._pending_limit_open_second_sell = bool(params.get("pending_limit_open_second_sell", False))
+        self._flag7_sell_condition_state: Optional[tuple[bool, bool]] = None
         self._pre_close = float(params.get("pre_close", 0.0) or 0.0)
         self._pre_flag = self._to_int(params.get("pre_flag"), self._flag)
         self._pre_up_amount = float(params.get("pre_up_amt", params.get("pre_up_amount", 0.0)) or 0.0)
@@ -233,6 +234,10 @@ class JuejinSellStrategy(BaseStrategy):
         if self._price_equal(bid_p, limit_up) and self._book_amount(bid_p, bid_v) > 120_000_000 and self._flag != 99:
             self._flag = 10
             self._open_flag = 0
+            logger.info(
+                "JuejinSellStrategy[%s] %s 涨停封单确认 bid=%.2f bid_vol=%d手 amount=%.0f threshold=120000000 flag=10",
+                self.strategy_id[:8], self._nick, bid_p, bid_v, self._book_amount(bid_p, bid_v),
+            )
         if bid_p < pre_close * 0.975 and self._flag not in (99, -3, 66):
             self._flag = -3
 
@@ -306,6 +311,23 @@ class JuejinSellStrategy(BaseStrategy):
                 if self._order_submission_accepted(order):
                     self._flag = -9
                     self._log_status("flag 5 跌破 3%")
+
+        if (
+            self._flag == 7
+            and position is not None
+            and high_price > 0
+            and bid_p < high_price * 0.975
+        ):
+            self._cancel_active_orders("flag 7 高点回落 2.5% 前撤单")
+            order = self._submit_sell(
+                self._target_sell_quantity(position),
+                round(bid_p * 0.99, 2),
+                "flag 7 高点回落 2.5% 卖出一笔",
+                action_key="flag7_high_pullback_25",
+            )
+            if self._order_submission_accepted(order):
+                self._flag = -9
+                self._log_status("flag 7 高点回落 2.5%")
 
         if high_price > pre_close * 1.085 and bid_p < pre_close * 1.07 and self._flag == 7 and position is not None:
             self._cancel_active_orders("冲高 8.5% 未封板跌破 7%")
@@ -392,6 +414,30 @@ class JuejinSellStrategy(BaseStrategy):
             self._flag = 7
         if bid_p > pre_close * 1.04 and bid_p < pre_close * 1.07 and self._flag == -3:
             self._flag = 5
+
+        if self._flag == 7:
+            high_reached = high_price > pre_close * 1.085
+            pulled_back = bid_p < pre_close * 1.07
+            condition_state = (high_reached, pulled_back)
+            if condition_state != self._flag7_sell_condition_state:
+                if high_reached and pulled_back:
+                    reason = "卖出条件满足"
+                elif not high_reached and not pulled_back:
+                    reason = "等待最高价达到8.5%且买一回落到7%以下"
+                elif not high_reached:
+                    reason = "未卖出：当日最高价未达到8.5%"
+                else:
+                    reason = "等待买一回落到7%以下"
+                logger.info(
+                    "JuejinSellStrategy[%s] %s flag=7监控 bid=%.2f 涨幅=%.2f%% high=%.2f "
+                    "高点阈值=%.2f 回落阈值=%.2f %s",
+                    self.strategy_id[:8], self._nick, bid_p,
+                    (bid_p / pre_close - 1) * 100,
+                    high_price, pre_close * 1.085, pre_close * 1.07, reason,
+                )
+            self._flag7_sell_condition_state = condition_state
+        else:
+            self._flag7_sell_condition_state = None
 
         self._pre_bid = bid_p
         if self._price_equal(bid_p, limit_up):

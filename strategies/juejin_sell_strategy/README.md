@@ -25,6 +25,8 @@ Behavior notes:
 - `sellvol` in CSV is treated as the strategy-side sellable quantity.
 - The strategy does not require or mock live account holdings before emitting a sell attempt.
 - If the real account has no holding, the sell order may be rejected by the execution/account layer; that is acceptable for verification and does not pause this strategy for account-position rejection messages.
+- After entering `flag=7`, the existing sell rules remain active. An additional one-lot sell is submitted when the bid falls more than 2.5% from the session high.
+- Runtime logs report limit-up confirmation and the `flag=7` thresholds/reason when no sell is submitted.
 
 ## 卖出逻辑
 
