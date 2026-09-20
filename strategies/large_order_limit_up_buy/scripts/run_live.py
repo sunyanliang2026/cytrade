@@ -26,7 +26,11 @@ from main import _connect_account_for_runtime, _start_runtime_heartbeat, build_a
 from monitor.logger import get_log_file_path, get_logger
 from strategy.models import StrategyConfig
 from strategies.large_order_limit_up_buy import LargeOrderLimitUpBuyStrategy
-from strategies.large_order_limit_up_buy.scripts.run_market_only import load_strategy_config, session_time
+from strategies.large_order_limit_up_buy.scripts.run_market_only import (
+    initialize_auction_states,
+    load_strategy_config,
+    session_time,
+)
 
 SESSION_EVENT_PREFIX = "LARGE_ORDER_LIMIT_UP_BUY_LIVE"
 SUMMARY_INTERVAL_SECONDS = 600
@@ -186,6 +190,7 @@ def run_live_session(args: argparse.Namespace) -> str:
             strategy = LargeOrderLimitUpBuyStrategy(config, ctx["trade_exec"], ctx["pos_mgr"])
             strategies.append(strategy)
             runner.add_strategy(strategy)
+        initialize_auction_states(strategies, logger)
         data_thread = threading.Thread(target=data_sub.start, daemon=True, name="large-order-live-data-sub")
         data_thread.start()
         _start_runtime_heartbeat(ctx, stop_event, mode="live")

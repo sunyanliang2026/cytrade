@@ -190,6 +190,45 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         super().start()
         self._open_record_files()
 
+    def initialize_from_auction_tick(
+        self,
+        *,
+        bid1: float,
+        limit_up_price: float = 0.0,
+        event_time: datetime | None = None,
+    ) -> bool:
+        """Initialize the opening state from a pre-open ordinary tick."""
+        if self._initial_quote_checked or float(bid1 or 0.0) <= 0:
+            return False
+        if float(limit_up_price or 0.0) > 0:
+            self._limit_up_price = float(limit_up_price)
+        if self._limit_up_price <= 0:
+            exact_price = LimitUpPriceProvider().get_exact_limit_up_price(self.stock_code)
+            if exact_price > 0:
+                self._limit_up_price = exact_price
+        if self._limit_up_price <= 0:
+            return False
+        self._initial_quote_checked = True
+        if self._is_limit_up_price(float(bid1)):
+            self._set_entry_phase("WAIT_REOPEN", "auction_tick_limit_up")
+            self._log_event(
+                "auction_tick_initialized",
+                bid1=float(bid1),
+                limit_up_price=self._limit_up_price,
+                result="WAIT_REOPEN",
+                event_time=event_time,
+            )
+        else:
+            self._set_entry_phase("READY", "auction_tick_not_limit_up")
+            self._log_event(
+                "auction_tick_initialized",
+                bid1=float(bid1),
+                limit_up_price=self._limit_up_price,
+                result="READY",
+                event_time=event_time,
+            )
+        return True
+
     def on_tick(self, tick: TickData) -> None:
         if tick.stock_code != self.stock_code:
             return

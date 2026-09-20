@@ -7,7 +7,7 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -21,6 +21,108 @@ from strategy.models import StrategyConfig
 from strategies.large_order_limit_up_buy import LargeOrderLimitUpBuyStrategy
 
 SUMMARY_INTERVAL_SECONDS = 600
+
+
+def _full_tick_first_value(payload: dict, field: str) -> float:
+    value = payload.get(field)
+    if value is None:
+        return 0.0
+    if not isinstance(value, (str, bytes)):
+        try:
+            value = value[0] if len(value) else 0.0
+        except (TypeError, IndexError, KeyError):
+            pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _full_tick_time(payload: dict, fallback: datetime) -> datetime:
+    value = payload.get("time") or payload.get("sysTime")
+    try:
+        numeric = float(value)
+        if numeric > 10_000_000_000:
+            numeric /= 1000.0
+        return datetime.fromtimestamp(numeric)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return fallback
+
+
+def _full_tick_limit_up(payload: dict) -> float:
+    for field in ("upLimitPrice", "upperLimitPrice", "limitUp"):
+        value = _full_tick_first_value(payload, field)
+        if value > 0:
+            return value
+    return 0.0
+
+
+def initialize_auction_states(strategies, logger, now: datetime | None = None) -> None:
+    """Use the current ordinary tick during 09:25-09:30, with L2 fallback."""
+    now = now or datetime.now()
+    if now.time() < dt_time(9, 25):
+        for strategy in strategies:
+            logger.info(
+                "[LARGE_ORDER] %s 竞价快照暂未读取，原因=before_auction_window，继续等待L2行情",
+                strategy.stock_code,
+            )
+        return
+    if now.time() >= dt_time(9, 30):
+        for strategy in strategies:
+            logger.warning(
+                "[LARGE_ORDER] %s 竞价快照获取失败，原因=auction_window_closed，继续使用L2最新行情",
+                strategy.stock_code,
+            )
+        return
+
+    try:
+        from xtquant import xtdata
+        xt_codes = [
+            f"{strategy.stock_code}.SH" if strategy.stock_code.startswith("6") else f"{strategy.stock_code}.SZ"
+            for strategy in strategies
+        ]
+        tick_map = xtdata.get_full_tick(xt_codes)
+        if tick_map is None:
+            tick_map = {}
+    except Exception as exc:
+        for strategy in strategies:
+            logger.warning(
+                "[LARGE_ORDER] %s 竞价快照获取失败，原因=request_error:%s，继续使用L2最新行情",
+                strategy.stock_code, type(exc).__name__,
+            )
+        return
+    if not isinstance(tick_map, dict):
+        for strategy in strategies:
+            logger.warning(
+                "[LARGE_ORDER] %s 竞价快照获取失败，原因=invalid_response，继续使用L2最新行情",
+                strategy.stock_code,
+            )
+        return
+
+    normalized = {}
+    for key, payload in tick_map.items():
+        if isinstance(payload, dict):
+            normalized[str(key).split(".", 1)[0]] = payload
+    for strategy in strategies:
+        payload = normalized.get(strategy.stock_code)
+        reason = ""
+        if payload is None:
+            reason = "stock_not_found"
+        else:
+            bid1 = _full_tick_first_value(payload, "bidPrice")
+            if bid1 <= 0:
+                reason = "invalid_bid1"
+            elif not strategy.initialize_from_auction_tick(
+                bid1=bid1,
+                limit_up_price=_full_tick_limit_up(payload),
+                event_time=_full_tick_time(payload, now),
+            ):
+                reason = "limit_up_price_unavailable"
+        if reason:
+            logger.warning(
+                "[LARGE_ORDER] %s 竞价快照获取失败，原因=%s，继续使用L2最新行情",
+                strategy.stock_code, reason,
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -110,6 +212,7 @@ def main() -> None:
             strategy = LargeOrderLimitUpBuyStrategy(config, ctx.get("trade_exec"), ctx.get("pos_mgr"))
             strategies.append(strategy)
             runner.add_strategy(strategy)
+        initialize_auction_states(strategies, logger)
         data_thread = threading.Thread(target=data_sub.start, daemon=True, name="large-order-data-sub")
         data_thread.start()
         _start_runtime_heartbeat(ctx, stop_event, mode="market-only")
