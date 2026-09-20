@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest_*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -25,8 +26,15 @@ strategies/opening_auction_attitude/data/opening_auction_source_pool*.csv
 strategies/opening_auction_attitude/data/opening_auction_universe.csv
 strategies/opening_auction_attitude/data/test_opening_auction_pool_*.csv
 strategies/opening_auction_attitude/output/stock_pool_runs/
+strategies/overnight_limit_up_buy/state/
 .tmp_pytest*/
+.tmp_pytest_*/
+strategies/*/data/*.csv
+strategies/*/data/runtime_records/
 docs/_zip_inspect/
+docs/掘金/
+AGENTS - *.md
+*.7z
 config/main_seal_follow_pool.backup_*.csv
 config/main_seal_follow_pool.csv
 config/main_seal_follow_manual_pool.csv

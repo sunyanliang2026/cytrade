@@ -1,6 +1,12 @@
 import csv
+import json
+import sys
+import types
 from pathlib import Path
 
+import pytest
+
+import scripts.pool.build_standalone_stock_pool as standalone_pool
 from scripts.pool.build_standalone_stock_pool import (
     DEFAULT_OUTPUT,
     DEFAULT_SOURCE_CACHE_DIR,
@@ -8,6 +14,7 @@ from scripts.pool.build_standalone_stock_pool import (
     DEFAULT_TRACE_DIR,
     OUTPUT_HEADERS,
     JingjiaBuyRow,
+    find_max_amount_column,
     market_symbol,
     parse_board_level,
     rows_from_records,
@@ -46,6 +53,16 @@ def test_market_symbol_uses_required_exchange_prefix():
     assert market_symbol("SHSE.600288") == "SHSE.600288"
     assert market_symbol("000973.SZ") == "SZSE.000973"
     assert market_symbol("002841") == "SZSE.002841"
+
+
+def test_find_max_amount_column_prefers_amount_over_amount_date():
+    columns = [
+        "code",
+        "区间最高成交额日[20260508-20260717]",
+        "区间最高成交额[20260508-20260717]",
+    ]
+
+    assert find_max_amount_column(columns) == "区间最高成交额[20260508-20260717]"
 
 
 def test_parse_board_level_matches_jingjiabuy_rules():
@@ -121,3 +138,81 @@ def test_write_jingjiabuy_uses_sample_header_and_utf8(tmp_path):
         OUTPUT_HEADERS,
         ["SHSE.600288", "31000", "0", "1", "大恒科技", "1869913047"],
     ]
+
+
+def _write_standalone_source_config(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "sets": {
+                    "iwencai.limitup_direct": {
+                        "source": "iwencai",
+                        "query": "涨停，主板非st",
+                    }
+                },
+                "final": {"union": ["iwencai.limitup_direct"]},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_collect_iwencai_records_fails_without_reusing_cache_when_pywencai_fails(tmp_path, monkeypatch):
+    source_config = tmp_path / "sources.json"
+    _write_standalone_source_config(source_config)
+    cache_dir = tmp_path / "source_cache"
+    previous_cache = cache_dir / "2026-07-09" / "iwencai.limitup_direct.raw.csv"
+    previous_cache.parent.mkdir(parents=True)
+    previous_cache.write_text(
+        "股票代码,股票简称,最近50日单日最高成交额,几天几板\n"
+        "600288.SH,大恒科技,18.69913047亿,2天2板\n",
+        encoding="utf-8-sig",
+    )
+    empty_cache = cache_dir / "2026-07-13" / "iwencai.limitup_direct.raw.csv"
+    empty_cache.parent.mkdir(parents=True)
+    empty_cache.write_text("股票代码\n", encoding="utf-8-sig")
+
+    fake_pywencai = types.SimpleNamespace(get=lambda **kwargs: (_ for _ in ()).throw(AttributeError("'NoneType' object has no attribute 'get'")))
+    monkeypatch.setitem(sys.modules, "pywencai", fake_pywencai)
+    monkeypatch.setattr(standalone_pool, "resolve_iwencai_cookie", lambda value="": "cookie")
+    monkeypatch.setattr(standalone_pool, "_query_iwencai_records_enhanced", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Access Denied")))
+    monkeypatch.setattr(standalone_pool, "_diagnose_iwencai_failure", lambda **kwargs: "问财接口拒绝访问")
+    real_datetime = standalone_pool.datetime
+    monkeypatch.setattr(standalone_pool, "datetime", types.SimpleNamespace(now=lambda: real_datetime(2026, 7, 14)))
+
+    args = build_parser().parse_args(
+        [
+            "--source-config",
+            str(source_config),
+            "--source-cache-dir",
+            str(cache_dir),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="调用 pywencai 失败"):
+        standalone_pool._collect_iwencai_records(args)
+
+    assert not (cache_dir / "2026-07-14" / "iwencai.limitup_direct.raw.csv").exists()
+
+
+def test_collect_iwencai_records_raises_clear_error_when_pywencai_returns_none(tmp_path, monkeypatch):
+    source_config = tmp_path / "sources.json"
+    _write_standalone_source_config(source_config)
+    fake_pywencai = types.SimpleNamespace(get=lambda **kwargs: None)
+    monkeypatch.setitem(sys.modules, "pywencai", fake_pywencai)
+    monkeypatch.setattr(standalone_pool, "resolve_iwencai_cookie", lambda value="": "cookie")
+    monkeypatch.setattr(standalone_pool, "_query_iwencai_records_enhanced", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("robot empty")))
+    monkeypatch.setattr(standalone_pool, "_diagnose_iwencai_failure", lambda **kwargs: "问财返回非选股表格")
+
+    args = build_parser().parse_args(
+        [
+            "--source-config",
+            str(source_config),
+            "--source-cache-dir",
+            str(tmp_path / "source_cache"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="返回为空"):
+        standalone_pool._collect_iwencai_records(args)

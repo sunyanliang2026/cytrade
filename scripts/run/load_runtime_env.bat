@@ -12,6 +12,12 @@ if not defined CYTRADE_PYTHON (
 )
 
 if not defined CYTRADE_PYTHON (
+    if exist "C:\Users\Administrator\miniconda3\envs\cytrade311\python.exe" (
+        set "CYTRADE_PYTHON=C:\Users\Administrator\miniconda3\envs\cytrade311\python.exe"
+    )
+)
+
+if not defined CYTRADE_PYTHON (
     set "CYTRADE_PYTHON=C:\Users\ysun\miniconda3\envs\cytrade311\python.exe"
 )
 

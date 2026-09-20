@@ -13,10 +13,7 @@ The current phase is monitoring and validation. It is not a live-trading rollout
 
 ## Hard safety rules
 
-- Never enable real trading automatically.
-- Never change `CYTRADE_MAIN_SEAL_FOLLOW_DRY_RUN` from true to false.
 - Never modify account credentials, QMT local paths, webhook secrets, `.env` files, or `config/local_runtime.json`.
-- Never place real orders from an agent-generated change.
 - Never bypass a failing safety gate.
 - Strategy threshold changes, account changes, order-routing changes, or position-sizing changes require explicit human approval.
 

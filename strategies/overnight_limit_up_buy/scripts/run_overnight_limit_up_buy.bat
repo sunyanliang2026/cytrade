@@ -9,7 +9,7 @@ rem CSV_FILE is the stock pool. It must contain only: stock_code,amount.
 rem Add as many rows as required in that CSV.
 rem ============================================================
 set "SUBMIT_TIME=08:30:00"
-set "COUNTER_OFFSET_MS=150"
+set "COUNTER_OFFSET_MS=50"
 set "RETRY_DELAY_MS=100"
 set "REJECTION_WAIT_MS=100"
 set "RUN_LIVE=true"
