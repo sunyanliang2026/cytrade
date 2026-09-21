@@ -381,6 +381,37 @@ def test_runner_syncs_l2_subscription_plan_and_dispatches_events():
     assert runtime_status["last_strategy_event_time"] is not None
 
 
+def test_runner_can_register_batch_before_one_subscription_sync():
+    fake_data_sub = _FakeDataSubscription()
+    runner = StrategyRunner(data_subscription=fake_data_sub)
+    runner._running = True
+    runner.is_trading_day = lambda: True
+    calls = []
+    original_sync = runner._sync_subscriptions
+
+    def recording_sync():
+        calls.append(1)
+        original_sync()
+
+    runner._sync_subscriptions = recording_sync
+    runner.add_strategy(
+        _DummyL2Strategy(StrategyConfig(stock_code="000001")),
+        sync_subscriptions=False,
+    )
+    runner.add_strategy(
+        _DummyL2Strategy(StrategyConfig(stock_code="600001")),
+        sync_subscriptions=False,
+    )
+
+    assert calls == []
+    assert fake_data_sub.tick_codes == set()
+    runner.sync_subscriptions()
+
+    assert calls == [1]
+    assert fake_data_sub.tick_codes == {"000001", "600001"}
+    assert set(fake_data_sub.l2_map) == {"000001", "600001"}
+
+
 def test_runner_expands_dynamic_l2_subscription_after_quote():
     fake_data_sub = _FakeDataSubscription()
     runner = StrategyRunner(data_subscription=fake_data_sub)

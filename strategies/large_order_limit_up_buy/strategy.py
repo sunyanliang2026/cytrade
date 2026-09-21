@@ -259,6 +259,10 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
     def on_l2_quote(self, event: L2QuoteEvent) -> None:
         if event.stock_code != self.stock_code:
             return
+        self._write_raw("l2quote", event.event_time, event.raw_xt_fields)
+        quote_time = event.event_time or event.recv_time
+        if isinstance(quote_time, datetime) and quote_time.time() < dt_time(9, 30):
+            return
         self._last_quote = event
         self._pre_close = float(event.pre_close or self._pre_close or 0.0)
         if event.limit_up_price > 0:
@@ -274,7 +278,6 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                 self._log_event("limit_up_price_unavailable", reason="qmt_exact_price_missing")
         if self._limit_up_price <= 0:
             return
-        quote_time = event.event_time or event.recv_time
         quote_is_sealed = self._quote_is_limit_up(event)
         if quote_is_sealed:
             if self._sealed_since is None:
@@ -344,8 +347,6 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             # The transition is handled above only after a qualifying observed seal.
             if self._last_seal_qualified:
                 self._set_entry_phase("WAIT_RESEAL", "limit_up_reopened")
-        self._write_raw("l2quote", event.event_time, event.raw_xt_fields)
-
     def on_l2_order(self, event: L2OrderEvent) -> None:
         if event.stock_code != self.stock_code:
             return
@@ -401,6 +402,9 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         if event.stock_code != self.stock_code:
             return
         self._write_raw("l2transaction", event.event_time, event.raw_xt_fields)
+        transaction_time = event.event_time or event.recv_time
+        if isinstance(transaction_time, datetime) and transaction_time.time() < dt_time(9, 30):
+            return
         amount = float(event.amount or 0.0) or float(event.price or 0.0) * int(event.volume or 0)
         if amount > 0 and float(event.price or 0.0) > 0:
             self._sealed_trade_amount += amount if self._is_limit_up_price(float(event.price)) else 0.0

@@ -21,6 +21,8 @@ from strategy.models import StrategyConfig
 from strategies.large_order_limit_up_buy import LargeOrderLimitUpBuyStrategy
 
 SUMMARY_INTERVAL_SECONDS = 600
+AUCTION_SNAPSHOT_TIME = (9, 25, 0)
+AUCTION_SNAPSHOT_DEADLINE = (9, 25, 5)
 
 
 def _display_names(strategies) -> str:
@@ -67,15 +69,23 @@ def _full_tick_limit_up(payload: dict) -> float:
     return 0.0
 
 
-def initialize_auction_states(strategies, logger, now: datetime | None = None) -> None:
+def initialize_auction_states(
+    strategies,
+    logger,
+    now: datetime | None = None,
+    *,
+    log_failures: bool = True,
+) -> list:
     """Use the current ordinary tick during 09:25-09:30, with L2 fallback."""
     now = now or datetime.now()
     if now.time() < dt_time(9, 25):
-        _log_auction_failure(logger, strategies, "尚未进入竞价窗口")
-        return
+        if log_failures:
+            _log_auction_failure(logger, strategies, "尚未进入竞价窗口")
+        return list(strategies)
     if now.time() >= dt_time(9, 30):
-        _log_auction_failure(logger, strategies, "竞价窗口已结束")
-        return
+        if log_failures:
+            _log_auction_failure(logger, strategies, "竞价窗口已结束")
+        return list(strategies)
 
     try:
         from xtquant import xtdata
@@ -87,11 +97,13 @@ def initialize_auction_states(strategies, logger, now: datetime | None = None) -
         if tick_map is None:
             tick_map = {}
     except Exception as exc:
-        _log_auction_failure(logger, strategies, f"接口异常:{type(exc).__name__}", warning=True)
-        return
+        if log_failures:
+            _log_auction_failure(logger, strategies, f"接口异常:{type(exc).__name__}", warning=True)
+        return list(strategies)
     if not isinstance(tick_map, dict):
-        _log_auction_failure(logger, strategies, "返回格式错误", warning=True)
-        return
+        if log_failures:
+            _log_auction_failure(logger, strategies, "返回格式错误", warning=True)
+        return list(strategies)
 
     normalized = {}
     for key, payload in tick_map.items():
@@ -99,6 +111,8 @@ def initialize_auction_states(strategies, logger, now: datetime | None = None) -
             normalized[str(key).split(".", 1)[0]] = payload
     failures = {}
     for strategy in strategies:
+        if getattr(strategy, "_initial_quote_checked", False):
+            continue
         payload = normalized.get(strategy.stock_code)
         reason = ""
         if payload is None:
@@ -120,8 +134,48 @@ def initialize_auction_states(strategies, logger, now: datetime | None = None) -
         "invalid_bid1": "买一价格无效",
         "limit_up_price_unavailable": "无法取得精确涨停价",
     }
-    for reason, failed in failures.items():
-        _log_auction_failure(logger, failed, reason_text.get(reason, reason), warning=True)
+    failed_strategies = [strategy for failed in failures.values() for strategy in failed]
+    if log_failures:
+        for reason, failed in failures.items():
+            _log_auction_failure(logger, failed, reason_text.get(reason, reason), warning=True)
+    return failed_strategies
+
+
+def run_auction_snapshot_loop(strategies, logger, stop_event: threading.Event) -> None:
+    """Freeze the auction result once, retrying ordinary snapshots until 09:25:05."""
+    now = datetime.now()
+    target = now.replace(
+        hour=AUCTION_SNAPSHOT_TIME[0], minute=AUCTION_SNAPSHOT_TIME[1],
+        second=AUCTION_SNAPSHOT_TIME[2], microsecond=0,
+    )
+    deadline = now.replace(
+        hour=AUCTION_SNAPSHOT_DEADLINE[0], minute=AUCTION_SNAPSHOT_DEADLINE[1],
+        second=AUCTION_SNAPSHOT_DEADLINE[2], microsecond=0,
+    )
+    if now >= deadline:
+        _log_auction_failure(logger, strategies, "启动时已错过竞价快照时间", warning=True)
+        return
+
+    while not stop_event.is_set() and datetime.now() < target:
+        stop_event.wait(min(0.2, max(0.0, (target - datetime.now()).total_seconds())))
+
+    while not stop_event.is_set():
+        current = datetime.now()
+        if current >= deadline:
+            break
+        failed = initialize_auction_states(strategies, logger, now=current, log_failures=False)
+        if not failed:
+            logger.info("[LARGE_ORDER] [竞价] 快照初始化完成 %d只，来源=普通行情", len(strategies))
+            return
+        stop_event.wait(1.0)
+
+    if stop_event.is_set():
+        return
+    failed = initialize_auction_states(strategies, logger, now=datetime.now(), log_failures=False)
+    if failed:
+        _log_auction_failure(logger, failed, "09:25:05前未取得有效快照", warning=True)
+    checked = len(strategies) - len(failed)
+    logger.info("[LARGE_ORDER] [竞价] 快照初始化结束 成功%d只 失败%d只，失败股票继续等待L2", checked, len(failed))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -220,10 +274,17 @@ def main() -> None:
         for config in configs:
             strategy = LargeOrderLimitUpBuyStrategy(config, ctx.get("trade_exec"), ctx.get("pos_mgr"))
             strategies.append(strategy)
-            runner.add_strategy(strategy)
-        initialize_auction_states(strategies, logger)
+            runner.add_strategy(strategy, sync_subscriptions=False)
+        runner.sync_subscriptions()
         data_thread = threading.Thread(target=data_sub.start, daemon=True, name="large-order-data-sub")
         data_thread.start()
+        auction_thread = threading.Thread(
+            target=run_auction_snapshot_loop,
+            args=(strategies, logger, stop_event),
+            daemon=True,
+            name="large-order-auction-snapshot",
+        )
+        auction_thread.start()
         _start_runtime_heartbeat(ctx, stop_event, mode="market-only")
         logger.info("[LARGE_ORDER] monitoring_started live=false l2=%s", data_sub.get_l2_subscription_map())
         next_summary = time.monotonic() + SUMMARY_INTERVAL_SECONDS
@@ -233,6 +294,7 @@ def main() -> None:
                 log_monitor_summary(logger, strategies, data_sub)
                 next_summary += SUMMARY_INTERVAL_SECONDS
     finally:
+        stop_event.set()
         runner.stop()
         data_sub.stop()
         logger.info(

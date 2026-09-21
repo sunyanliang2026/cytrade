@@ -27,9 +27,9 @@ from monitor.logger import get_log_file_path, get_logger
 from strategy.models import StrategyConfig
 from strategies.large_order_limit_up_buy import LargeOrderLimitUpBuyStrategy
 from strategies.large_order_limit_up_buy.scripts.run_market_only import (
-    initialize_auction_states,
     load_strategy_config,
     log_monitor_summary,
+    run_auction_snapshot_loop,
     session_time,
 )
 
@@ -191,10 +191,17 @@ def run_live_session(args: argparse.Namespace) -> str:
         for config in configs:
             strategy = LargeOrderLimitUpBuyStrategy(config, ctx["trade_exec"], ctx["pos_mgr"])
             strategies.append(strategy)
-            runner.add_strategy(strategy)
-        initialize_auction_states(strategies, logger)
+            runner.add_strategy(strategy, sync_subscriptions=False)
+        runner.sync_subscriptions()
         data_thread = threading.Thread(target=data_sub.start, daemon=True, name="large-order-live-data-sub")
         data_thread.start()
+        auction_thread = threading.Thread(
+            target=run_auction_snapshot_loop,
+            args=(strategies, logger, stop_event),
+            daemon=True,
+            name="large-order-live-auction-snapshot",
+        )
+        auction_thread.start()
         _start_runtime_heartbeat(ctx, stop_event, mode="live")
         logger.info(
             "[LARGE_ORDER] [启动] 实盘=true 已订阅%d只股票，L2已启动",
@@ -207,6 +214,7 @@ def run_live_session(args: argparse.Namespace) -> str:
                 log_monitor_summary(logger, strategies, data_sub)
                 next_summary += SUMMARY_INTERVAL_SECONDS
     finally:
+        stop_event.set()
         runner.stop()
         data_sub.stop()
         connection = ctx.get("conn_mgr")

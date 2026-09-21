@@ -2,6 +2,7 @@ from datetime import datetime
 import sys
 import types
 
+from core.l2_models import L2QuoteEvent, L2TransactionEvent
 from strategy.models import StrategyConfig
 from strategies.large_order_limit_up_buy.scripts import run_market_only
 from strategies.large_order_limit_up_buy.strategy import LargeOrderLimitUpBuyStrategy
@@ -110,3 +111,55 @@ def test_initialize_auction_states_reports_invalid_full_tick_response(monkeypatc
     assert logger.warning_messages == [
         "[LARGE_ORDER] [竞价] 快照失败 1只 原因=返回格式错误：600001 测试；继续使用L2行情"
     ]
+
+
+def test_initialize_auction_states_returns_only_unresolved_stocks(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_get_full_tick(codes):
+        calls.append(list(codes))
+        return {
+            "600001.SH": {"bidPrice": [8.0], "upLimitPrice": 8.0},
+            "000001.SZ": {},
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "xtquant",
+        types.SimpleNamespace(xtdata=types.SimpleNamespace(get_full_tick=fake_get_full_tick)),
+    )
+    logger = RecordingLogger()
+    sealed = make_strategy(tmp_path, "600001")
+    missing = make_strategy(tmp_path, "000001")
+    strategies = [sealed, missing]
+
+    failed = run_market_only.initialize_auction_states(
+        strategies, logger, datetime(2026, 9, 20, 9, 25), log_failures=False,
+    )
+    assert failed == [missing]
+    assert sealed._entry_phase == "WAIT_REOPEN"
+
+    failed = run_market_only.initialize_auction_states(
+        strategies, logger, datetime(2026, 9, 20, 9, 25, 1), log_failures=False,
+    )
+    assert failed == [missing]
+    assert calls == [
+        ["600001.SH", "000001.SZ"],
+        ["600001.SH", "000001.SZ"],
+    ]
+
+
+def test_l2_auction_events_are_recorded_without_changing_state(tmp_path):
+    strategy = make_strategy(tmp_path, "600001")
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=8.0,
+        event_time=datetime(2026, 9, 20, 9, 25),
+    ))
+    strategy.on_l2_transaction(L2TransactionEvent(
+        stock_code="600001", price=8.0, volume=1000,
+        event_time=datetime(2026, 9, 20, 9, 25, 1),
+    ))
+
+    assert strategy._entry_phase == "WAIT_INITIAL_QUOTE"
+    assert strategy._last_quote is None
+    assert strategy._sealed_trade_amount == 0.0

@@ -333,8 +333,12 @@ class StrategyRunner:
             "last_round_total_process_ms": float(self._last_round_total_process_ms or 0.0),
         }
 
-    def add_strategy(self, strategy: BaseStrategy) -> None:
-        """Add a strategy instance to the runner."""
+    def add_strategy(self, strategy: BaseStrategy, *, sync_subscriptions: bool = True) -> None:
+        """Add a strategy instance to the runner.
+
+        ``sync_subscriptions=False`` lets a caller register a batch of
+        strategies before paying the subscription synchronization cost.
+        """
         strategy.bind_persistence(self._data_mgr, self.request_state_persist)
         strategy_key = self._strategy_instance_key(strategy)
         with self._lock:
@@ -369,10 +373,14 @@ class StrategyRunner:
             should_subscribe = is_trading_day
 
         # Subscribe market data for this strategy.
-        if self._data_sub and is_trading_day:
+        if self._data_sub and is_trading_day and sync_subscriptions:
             self._sync_subscriptions()
         if self._running:
             self.request_state_persist(f"add_strategy:{strategy.strategy_id}")
+
+    def sync_subscriptions(self) -> None:
+        """Synchronize all registered strategy subscriptions once."""
+        self._sync_subscriptions()
 
     def remove_strategy(self, strategy_id: str) -> None:
         """Remove a strategy instance by strategy id."""
