@@ -102,6 +102,15 @@ class JuejinSellStrategy(BaseStrategy):
 
     # ------------------------------------------------------------------ Tick handling
 
+    def start(self) -> None:
+        super().start()
+        logger.info(
+            "[JUEJIN_STATUS] stock=%s nick=%s status=%s reason=initial",
+            self.stock_code,
+            self._nick,
+            self._flag,
+        )
+
     def process_tick(self, tick: TickData) -> None:
         """Process one tick without BaseStrategy's active-exit short circuit.
 
@@ -444,9 +453,10 @@ class JuejinSellStrategy(BaseStrategy):
             self._pre_up_amount = self._book_amount(bid_p, bid_v)
         if self._flag != self._pre_flag:
             logger.info(
-                "JuejinSellStrategy[%s] %s status %s -> %s",
+                "[JUEJIN_STATUS] JuejinSellStrategy[%s] %s stock=%s status %s -> %s",
                 self.strategy_id[:8],
                 self._nick,
+                self.stock_code,
                 self._pre_flag,
                 self._flag,
             )

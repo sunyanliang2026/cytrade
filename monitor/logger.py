@@ -43,6 +43,7 @@ class _SummaryFilter(logging.Filter):
             or "[TRADE]" in msg
             or "MSF_EVENT" in msg
             or "[LARGE_ORDER]" in msg
+            or "[JUEJIN_STATUS]" in msg
         )
 
 
