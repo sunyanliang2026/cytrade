@@ -29,6 +29,7 @@ from strategies.large_order_limit_up_buy import LargeOrderLimitUpBuyStrategy
 from strategies.large_order_limit_up_buy.scripts.run_market_only import (
     initialize_auction_states,
     load_strategy_config,
+    log_monitor_summary,
     session_time,
 )
 
@@ -40,9 +41,11 @@ class StrategyConsoleFilter(logging.Filter):
     """Keep live-console output focused on this strategy while files stay complete."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.levelno >= logging.WARNING:
+        if record.levelno >= logging.ERROR:
             return True
         message = record.getMessage()
+        if message.startswith("LargeOrderLimitUpBuy {"):
+            return False
         return (
             "[LARGE_ORDER]" in message
             or "LargeOrderLimitUpBuy" in message
@@ -174,10 +177,9 @@ def run_live_session(args: argparse.Namespace) -> str:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     logger.warning(
-        "%s start live=true dry_run=false pool=%s code=%s amount=%s max_order_amount=%s max_total_amount=%s stop_at=%s",
+        "%s 启动 实盘=true 股票=%s 总计划金额=%s 单票上限=%s 总额上限=%s 结束=%s",
         SESSION_EVENT_PREFIX,
-        args.pool,
-        ",".join(item.stock_code for item in configs),
+        "、".join(f"{item.stock_code} {(item.params or {}).get('stock_name') or '未命名'}" for item in configs),
         format_amount(sum(float((item.params or {}).get("plan_amount", 0.0) or 0.0) for item in configs)),
         format_amount(args.max_order_amount),
         format_amount(args.max_total_amount),
@@ -194,7 +196,10 @@ def run_live_session(args: argparse.Namespace) -> str:
         data_thread = threading.Thread(target=data_sub.start, daemon=True, name="large-order-live-data-sub")
         data_thread.start()
         _start_runtime_heartbeat(ctx, stop_event, mode="live")
-        logger.info("[LARGE_ORDER] monitoring_started live=true l2=%s", data_sub.get_l2_subscription_map())
+        logger.info(
+            "[LARGE_ORDER] [启动] 实盘=true 已订阅%d只股票，L2已启动",
+            len(data_sub.get_l2_subscription_map()),
+        )
         next_summary = time.monotonic() + SUMMARY_INTERVAL_SECONDS
         while not stop_event.is_set() and datetime.now() < stop_at:
             time.sleep(1)

@@ -49,5 +49,6 @@ def test_strategy_console_filter_hides_unrelated_runtime_info_but_keeps_strategy
     assert not console_filter.filter(record(logging.INFO, "[ORDER] 忽略无策略归属成交 xt_order_id=1"))
     assert not console_filter.filter(record(logging.INFO, "[ORDER] [TRADE] 成交回报 order_id=1"))
     assert console_filter.filter(record(logging.INFO, "[LARGE_ORDER] 002212 BUY_DECISION"))
-    assert console_filter.filter(record(logging.INFO, "LargeOrderLimitUpBuy {\"event\": \"our_order_filled\"}"))
-    assert console_filter.filter(record(logging.WARNING, "DataSubscription: data latency too high"))
+    assert not console_filter.filter(record(logging.INFO, "LargeOrderLimitUpBuy {\"event\": \"our_order_filled\"}"))
+    assert not console_filter.filter(record(logging.WARNING, "DataSubscription: data latency too high"))
+    assert console_filter.filter(record(logging.INFO, "[LARGE_ORDER] [成交] 600001 测试 已成交100股"))

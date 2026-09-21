@@ -23,6 +23,16 @@ from strategies.large_order_limit_up_buy import LargeOrderLimitUpBuyStrategy
 SUMMARY_INTERVAL_SECONDS = 600
 
 
+def _display_names(strategies) -> str:
+    return "、".join(strategy.display_name() for strategy in strategies)
+
+
+def _log_auction_failure(logger, strategies, reason: str, *, warning: bool = False) -> None:
+    message = "[LARGE_ORDER] [竞价] 快照失败 %d只 原因=%s：%s；继续使用L2行情"
+    args = (len(strategies), reason, _display_names(strategies))
+    (logger.warning if warning else logger.info)(message, *args)
+
+
 def _full_tick_first_value(payload: dict, field: str) -> float:
     value = payload.get(field)
     if value is None:
@@ -61,18 +71,10 @@ def initialize_auction_states(strategies, logger, now: datetime | None = None) -
     """Use the current ordinary tick during 09:25-09:30, with L2 fallback."""
     now = now or datetime.now()
     if now.time() < dt_time(9, 25):
-        for strategy in strategies:
-            logger.info(
-                "[LARGE_ORDER] %s 竞价快照暂未读取，原因=before_auction_window，继续等待L2行情",
-                strategy.stock_code,
-            )
+        _log_auction_failure(logger, strategies, "尚未进入竞价窗口")
         return
     if now.time() >= dt_time(9, 30):
-        for strategy in strategies:
-            logger.warning(
-                "[LARGE_ORDER] %s 竞价快照获取失败，原因=auction_window_closed，继续使用L2最新行情",
-                strategy.stock_code,
-            )
+        _log_auction_failure(logger, strategies, "竞价窗口已结束")
         return
 
     try:
@@ -85,24 +87,17 @@ def initialize_auction_states(strategies, logger, now: datetime | None = None) -
         if tick_map is None:
             tick_map = {}
     except Exception as exc:
-        for strategy in strategies:
-            logger.warning(
-                "[LARGE_ORDER] %s 竞价快照获取失败，原因=request_error:%s，继续使用L2最新行情",
-                strategy.stock_code, type(exc).__name__,
-            )
+        _log_auction_failure(logger, strategies, f"接口异常:{type(exc).__name__}", warning=True)
         return
     if not isinstance(tick_map, dict):
-        for strategy in strategies:
-            logger.warning(
-                "[LARGE_ORDER] %s 竞价快照获取失败，原因=invalid_response，继续使用L2最新行情",
-                strategy.stock_code,
-            )
+        _log_auction_failure(logger, strategies, "返回格式错误", warning=True)
         return
 
     normalized = {}
     for key, payload in tick_map.items():
         if isinstance(payload, dict):
             normalized[str(key).split(".", 1)[0]] = payload
+    failures = {}
     for strategy in strategies:
         payload = normalized.get(strategy.stock_code)
         reason = ""
@@ -119,10 +114,14 @@ def initialize_auction_states(strategies, logger, now: datetime | None = None) -
             ):
                 reason = "limit_up_price_unavailable"
         if reason:
-            logger.warning(
-                "[LARGE_ORDER] %s 竞价快照获取失败，原因=%s，继续使用L2最新行情",
-                strategy.stock_code, reason,
-            )
+            failures.setdefault(reason, []).append(strategy)
+    reason_text = {
+        "stock_not_found": "未返回该股票",
+        "invalid_bid1": "买一价格无效",
+        "limit_up_price_unavailable": "无法取得精确涨停价",
+    }
+    for reason, failed in failures.items():
+        _log_auction_failure(logger, failed, reason_text.get(reason, reason), warning=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -155,11 +154,21 @@ def log_monitor_summary(logger, strategies, data_sub) -> None:
     latest = status.get("latest_data_time") or ""
     delay = float(status.get("data_delay_ms", 0.0) or 0.0)
     l2_map = data_sub.get_l2_subscription_map()
+    submitted = sum(strategy._submitted_count for strategy in strategies)
+    filled = sum(1 for strategy in strategies if strategy._entry_filled)
+    canceled = sum(strategy._cancel_requested_count for strategy in strategies)
     logger.info(
-        "[LARGE_ORDER] SUMMARY stocks=%d l2_stocks=%d l2_kinds=%d latest_data_time=%s delay_ms=%.0f %s",
-        len(strategies), len(l2_map), sum(len(kinds) for kinds in l2_map.values()), latest, delay,
-        " ".join(strategy.console_summary() for strategy in strategies),
+        "[LARGE_ORDER] [汇总] 监控%d只 | 下单%d笔 | 成交%d笔 | 撤单%d笔 | L2%d只 | 延迟%.0f毫秒 | 行情%s",
+        len(strategies), submitted, filled, canceled, len(l2_map), delay, latest,
     )
+    groups = {}
+    for strategy in strategies:
+        groups.setdefault(strategy.console_status(), []).append(strategy)
+    order = ["已成交", "验证失败已撤单", "等待首封", "等待开板", "等待回封", "等待首条行情", "当日结束"]
+    for status in order:
+        items = groups.get(status, [])
+        if items:
+            logger.info("[LARGE_ORDER] [%s] %d只：%s", status, len(items), _display_names(items))
 
 
 def main() -> None:

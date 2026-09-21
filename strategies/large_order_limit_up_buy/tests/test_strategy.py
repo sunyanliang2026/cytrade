@@ -469,6 +469,23 @@ def test_reseal_submits_first_order_then_cancels_when_validation_fails(tmp_path)
     assert strategy._reseal_validation_result == "failed"
     assert strategy._entry_phase == "DONE"
 
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=8.0,
+        bid1_volume=130_000, event_time=datetime(2026, 9, 8, 10, 0),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=7.9,
+        event_time=datetime(2026, 9, 8, 10, 21),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, bid1=8.0,
+        bid1_volume=130_000, event_time=datetime(2026, 9, 8, 10, 25),
+    ))
+    strategy.on_l2_order(event(price=8.0, volume=100, no="after-done-reseal"))
+
+    assert strategy._entry_phase == "DONE"
+    assert len(executor.orders) == 1
+
 
 def test_reseal_keeps_order_when_two_big_orders_arrive_within_twenty(tmp_path):
     executor = FakeExecutor()

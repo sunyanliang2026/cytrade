@@ -94,6 +94,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._last_limit_up_lookup = 0.0
         self._initial_quote_checked = False
         self._entry_phase = "WAIT_INITIAL_QUOTE"
+        self._done_reason = ""
         self._sealed_since: datetime | None = None
         self._sealed_max_amount = 0.0
         self._last_seal_qualified = False
@@ -123,6 +124,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._reseal_validation_orders_seen = 0
         self._reseal_validation_big_orders_seen = 0
         self._reseal_validation_result = ""
+        self._cancel_requested_count = 0
         self._entry_filled = False
         self._trigger_count = 0
         self._sealed_trade_amount = 0.0
@@ -250,7 +252,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             self._dip_confirmed_logged = True
             logger.info(
                 "[LARGE_ORDER] %s opening_dip_confirmed open=%.3f low=%.3f ratio=%.4f",
-                self.stock_code, self._open_price, self._session_low_price,
+                self._display_name(), self._open_price, self._session_low_price,
                 self._session_low_price / self._open_price,
             )
 
@@ -301,7 +303,12 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                     sealed_max_amount=round(self._sealed_max_amount, 2),
                     qualified=self._last_seal_qualified,
                 )
-            if self._sealed_since is not None and self._last_seal_qualified:
+            if (
+                self._sealed_since is not None
+                and self._last_seal_qualified
+                and self._entry_phase != "DONE"
+                and not self._entry_filled
+            ):
                 self._entry_phase = "WAIT_RESEAL"
                 self._reopen_since = quote_time
                 self._reopen_low_price = self._quote_low_price(event)
@@ -451,7 +458,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._trigger_count += 1
         self._decision_count += 1
         logger.info(
-            "[LARGE_ORDER] %s BUY_DECISION price=%.3f volume=%d amount=%.2f trigger_entrust_no=%s",
+            "[LARGE_ORDER] [下单判断] %s 涨停价=%.3f 委托=%d股 金额=%.2f 委托号=%s",
             self.stock_code, price, int(trigger.get("volume", 0)), float(trigger.get("amount", 0.0)),
             trigger.get("entrust_no", ""),
         )
@@ -474,6 +481,11 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                 required_orders=self._reseal_validation_order_count,
                 required_big_orders=self._reseal_validation_big_order_count,
                 big_order_min_amount=self._validation_big_order_min_amount,
+            )
+            logger.info(
+                "[LARGE_ORDER] [验证] %s 回封验证开始，观察%d笔，要求大单%d笔",
+                self._display_name(), self._reseal_validation_order_count,
+                self._reseal_validation_big_order_count,
             )
         self._start_post_order_window(trigger, reseal_validation=reseal_validation)
         self._write_snapshot(order, trigger, front_volume, front_amount, now)
@@ -511,12 +523,19 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                 observed_big_orders=self._reseal_validation_big_orders_seen,
                 big_order_min_amount=self._validation_big_order_min_amount,
             )
+            logger.info(
+                "[LARGE_ORDER] [验证] %s 通过，观察%d笔，大单%d笔",
+                self._display_name(), self._reseal_validation_orders_seen,
+                self._reseal_validation_big_orders_seen,
+            )
             return
 
         self._reseal_validation_active = False
         self._reseal_validation_result = "failed"
         cancel_order = getattr(self._trade_executor, "cancel_order", None)
         requested = bool(cancel_order(self._active_order_uuid, remark="reseal validation failed")) if callable(cancel_order) else False
+        if requested:
+            self._cancel_requested_count += 1
         can_continue = (
             self._reseal_validation_continue_on_failure
             and requested
@@ -540,6 +559,12 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             cancel_requested=requested,
             continue_monitoring=can_continue,
         )
+        logger.info(
+            "[LARGE_ORDER] [撤单] %s 验证失败，观察%d笔，大单%d/%d，撤单%s",
+            self._display_name(), self._reseal_validation_orders_seen,
+            self._reseal_validation_big_orders_seen, self._reseal_validation_big_order_count,
+            "已提交" if requested else "未提交",
+        )
 
     def _on_order_update_hook(self, order) -> None:
         if str(getattr(order, "order_uuid", "")) != self._active_order_uuid:
@@ -547,7 +572,12 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         status = getattr(order, "status", None)
         if status in (OrderStatus.CANCELED, OrderStatus.PART_CANCEL, OrderStatus.JUNK, OrderStatus.UNKNOWN):
             self._active_order_uuid = ""
-            self._log_event("our_order_finished", status=str(status), can_retrigger=True)
+            self._log_event(
+                "our_order_finished",
+                status=str(status),
+                can_retrigger=self._entry_phase != "DONE" and not self._entry_filled,
+            )
+            logger.info("[LARGE_ORDER] [撤单] %s 已确认撤单", self._display_name())
         elif status == OrderStatus.SUCCEEDED or (
             status == OrderStatus.PART_SUCC and int(getattr(order, "filled_quantity", 0) or 0) > 0
         ):
@@ -555,28 +585,40 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                 self._entry_filled = True
                 self._reseal_validation_active = False
                 self._set_entry_phase("DONE", "entry_filled")
-                self._log_event(
-                    "our_order_filled",
+            self._log_event(
+                "our_order_filled",
                     status=str(status),
                     filled_quantity=int(getattr(order, "filled_quantity", 0) or 0),
                     can_retrigger=False,
                 )
+            logger.info("[LARGE_ORDER] [成交] %s 已成交%d股", self._display_name(), int(getattr(order, "filled_quantity", 0) or 0))
 
     def console_summary(self) -> str:
+        status = self.console_status()
         return (
-            f"{self.stock_code}:phase={self._entry_phase},open={self._open_price:.3f},"
-            f"low={self._session_low_price:.3f},big={self._big_order_count},"
-            f"first_seal_amount={self._first_seal_order_amount:.2f}/{self._first_seal_required_order_amount:.2f},"
-            f"decision={self._decision_count},submitted={self._submitted_count},"
-            f"reseal_verify={self._reseal_validation_orders_seen}/{self._reseal_validation_order_count},"
-            f"reseal_big={self._reseal_validation_big_orders_seen}/{self._reseal_validation_big_order_count},"
-            f"reseal_result={self._reseal_validation_result or '-'},"
-            f"entry_filled={self._entry_filled},"
-            f"seal_max={self._sealed_max_amount:.2f},reopen_low={self._reopen_low_price:.3f},"
-            f"reseal_ready={self._reseal_ready},"
-            f"blocked_dip={self._blocked_dip_count},blocked_active={self._blocked_active_count},"
-            f"blocked_position={self._blocked_position_count}"
+            f"{self._display_name()} 状态={status},开盘={self._open_price:.3f},"
+            f"最低={self._session_low_price:.3f},验证={self._reseal_validation_orders_seen}/{self._reseal_validation_order_count},"
+            f"大单={self._reseal_validation_big_orders_seen}/{self._reseal_validation_big_order_count}"
         )
+
+    def console_status(self) -> str:
+        if self._entry_filled:
+            return "已成交"
+        if self._entry_phase == "DONE" and self._reseal_validation_result == "failed":
+            return "验证失败已撤单"
+        return {
+            "READY": "等待首封",
+            "WAIT_REOPEN": "等待开板",
+            "WAIT_RESEAL": "等待回封",
+            "WAIT_INITIAL_QUOTE": "等待首条行情",
+            "DONE": "当日结束",
+        }.get(self._entry_phase, self._entry_phase)
+
+    def display_name(self) -> str:
+        return self._display_name()
+
+    def _display_name(self) -> str:
+        return f"{self.stock_code} {self._stock_name or '未命名'}"
 
     def _open_record_files(self) -> None:
         day_dir = self._record_dir / datetime.now().strftime("%Y-%m-%d")
@@ -824,9 +866,11 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             return
         previous = self._entry_phase
         self._entry_phase = phase
+        if phase == "DONE":
+            self._done_reason = reason or self._done_reason
         logger.info(
-            "[LARGE_ORDER] %s phase=%s->%s%s",
-            self.stock_code, previous, phase, f" reason={reason}" if reason else "",
+            "[LARGE_ORDER] %s 状态=%s->%s%s",
+            self._display_name(), previous, phase, f" 原因={reason}" if reason else "",
         )
 
     @staticmethod

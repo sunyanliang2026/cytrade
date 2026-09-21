@@ -87,9 +87,10 @@ def test_initialize_auction_states_reports_get_full_tick_failure_per_stock(monke
     )
 
     assert all(item._entry_phase == "WAIT_INITIAL_QUOTE" for item in strategies)
-    assert len(logger.warning_messages) == 2
-    assert all("request_error:RuntimeError" in message for message in logger.warning_messages)
-    assert all("继续使用L2最新行情" in message for message in logger.warning_messages)
+    assert len(logger.warning_messages) == 1
+    assert "接口异常:RuntimeError" in logger.warning_messages[0]
+    assert "600001 测试、000001 测试" in logger.warning_messages[0]
+    assert "继续使用L2行情" in logger.warning_messages[0]
 
 
 def test_initialize_auction_states_reports_invalid_full_tick_response(monkeypatch, tmp_path):
@@ -107,5 +108,5 @@ def test_initialize_auction_states_reports_invalid_full_tick_response(monkeypatc
 
     assert strategies[0]._entry_phase == "WAIT_INITIAL_QUOTE"
     assert logger.warning_messages == [
-        "[LARGE_ORDER] 600001 竞价快照获取失败，原因=invalid_response，继续使用L2最新行情"
+        "[LARGE_ORDER] [竞价] 快照失败 1只 原因=返回格式错误：600001 测试；继续使用L2行情"
     ]
