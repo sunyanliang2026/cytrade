@@ -12,6 +12,7 @@ set "SUBMIT_TIME=08:30:00"
 set "COUNTER_OFFSET_MS=50"
 set "RETRY_DELAY_MS=100"
 set "REJECTION_WAIT_MS=100"
+set "MAX_RETRIES=2"
 set "RUN_LIVE=true"
 set "NO_WAIT=false"
 set "MARKET_DAY_ONLY=true"
@@ -52,7 +53,8 @@ echo Repo:        %REPO_ROOT%
 echo Python:      %CYTRADE_PYTHON%
 echo Submit time: %SUBMIT_TIME%
 echo Counter offset: %COUNTER_OFFSET_MS% ms
-echo Retry delay:    %RETRY_DELAY_MS% ms (max 1 retry)
+echo Retry delay:    %RETRY_DELAY_MS% ms
+echo Max retries:    %MAX_RETRIES% (max 3 total attempts)
 echo Run live:    %RUN_LIVE%
 echo CSV file:    %CSV_FILE%
 echo State file:  %STATE_FILE%
@@ -75,6 +77,7 @@ pushd "%REPO_ROOT%"
   --counter-offset-ms "%COUNTER_OFFSET_MS%" ^
   --retry-delay-ms "%RETRY_DELAY_MS%" ^
   --rejection-wait-ms "%REJECTION_WAIT_MS%" ^
+  --max-retries "%MAX_RETRIES%" ^
   --post-submit-wait-sec "%POST_SUBMIT_WAIT_SEC%" ^
   --require-plan-confirm ^
   %MARKET_DAY_ARGS% ^

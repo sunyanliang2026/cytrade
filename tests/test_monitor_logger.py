@@ -48,6 +48,17 @@ def test_summary_filter_keeps_warnings_visible():
     assert _SummaryFilter().filter(record) is True
 
 
+def test_log_format_includes_milliseconds():
+    formatter = logging.Formatter(
+        "[%(asctime)s.%(msecs)03d] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    record = logging.LogRecord("x", logging.INFO, __file__, 1, "timed", (), None)
+    record.msecs = 123
+
+    assert ".123] timed" in formatter.format(record)
+
+
 def test_json_file_logger_preserves_chinese_text(tmp_path):
     LogManager._instance = None
     logging.getLogger("cytrade.trade").handlers.clear()

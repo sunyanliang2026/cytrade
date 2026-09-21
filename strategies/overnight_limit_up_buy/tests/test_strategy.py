@@ -36,9 +36,10 @@ class _RejectingExecutor(_FakeExecutor):
 
 
 class _RetryExecutor(_FakeExecutor):
-    def __init__(self):
+    def __init__(self, success_on=2):
         super().__init__()
         self.attempts = 0
+        self.success_on = success_on
 
     def prepare_limit_buy(self, strategy_id, strategy_name, stock_code, price, quantity, remark=""):
         return Order(
@@ -55,7 +56,7 @@ class _RetryExecutor(_FakeExecutor):
     def _submit_order(self, order):
         self.attempts += 1
         self.orders.append(order)
-        if self.attempts == 1:
+        if self.attempts < self.success_on:
             order.status = OrderStatus.JUNK
             order.status_msg = "[COUNTER] 未到开市时间,系统禁止委托"
         else:
@@ -161,3 +162,21 @@ def test_submit_once_retries_only_counter_preopen_rejection():
     assert result.status == "submitted"
     assert executor.attempts == 2
     assert executor.orders[0].order_uuid != executor.orders[1].order_uuid
+
+
+def test_submit_once_allows_configured_two_retries():
+    executor = _RetryExecutor(success_on=3)
+    strategy = _strategy(executor=executor)
+    strategy.prepare_order(11.03, 2300, trade_day=date(2026, 9, 9))
+
+    result = strategy.submit_once(
+        trade_day="2026-09-09",
+        price_lookup=lambda code: 11.03,
+        max_attempts=3,
+        retry_delay_ms=0,
+        rejection_wait_ms=0,
+    )
+
+    assert result.status == "submitted"
+    assert executor.attempts == 3
+    assert len({order.order_uuid for order in executor.orders}) == 3

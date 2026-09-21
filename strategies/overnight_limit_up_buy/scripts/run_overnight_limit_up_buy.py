@@ -141,7 +141,9 @@ def safe_disconnect(ctx: dict | None) -> None:
             get_logger("system").warning("%s live_disconnect_failed", SESSION_EVENT_PREFIX, exc_info=True)
 
 
-def build_frozen_plan(configs, provider, executor, store, trade_day: date) -> tuple[list[FrozenOrderPlan], list[str]]:
+def build_frozen_plan(
+    configs, provider, executor, store, trade_day: date, *, attempts_per_order: int = 1
+) -> tuple[list[FrozenOrderPlan], list[str]]:
     """Do all price, quantity, state, and account work before the target time."""
 
     plans: list[FrozenOrderPlan] = []
@@ -199,7 +201,7 @@ def build_frozen_plan(configs, provider, executor, store, trade_day: date) -> tu
         try:
             funding = arm_batch(
                 [(plan.stock_code, plan.limit_up_price, plan.quantity) for plan in plans],
-                attempts_per_order=2 if getattr(executor, "live_trading_enabled", False) else 1,
+                attempts_per_order=attempts_per_order if getattr(executor, "live_trading_enabled", False) else 1,
             )
         except TypeError:
             funding = arm_batch([(plan.stock_code, plan.limit_up_price, plan.quantity) for plan in plans])
@@ -314,7 +316,15 @@ def run_session(
     executor = trade_executor or build_dry_run_executor()
     store = SubmissionStateStore(state_path)
     trade_day = now.date()
-    plans, failures = build_frozen_plan(configs, provider, executor, store, trade_day)
+    max_retries = max(0, int(getattr(args, "max_retries", 2))) if live_mode else 0
+    plans, failures = build_frozen_plan(
+        configs,
+        provider,
+        executor,
+        store,
+        trade_day,
+        attempts_per_order=max_retries + 1,
+    )
     if failures:
         for failure in failures:
             logger.error("%s preflight_failed %s", SESSION_EVENT_PREFIX, failure)
@@ -352,7 +362,7 @@ def run_session(
             submission_store=store,
             record_submission=False,
             log_submission=False,
-            max_attempts=2 if live_mode else 1,
+            max_attempts=max_retries + 1,
             retry_delay_ms=getattr(args, "retry_delay_ms", 100),
             rejection_wait_ms=getattr(args, "rejection_wait_ms", 100),
         )
@@ -470,6 +480,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--counter-offset-ms", type=int, default=300, help="Delay after broker opening time before dispatch.")
     parser.add_argument("--retry-delay-ms", type=int, default=100, help="Delay before one retry after a pre-open rejection.")
     parser.add_argument("--rejection-wait-ms", type=int, default=100, help="Time to wait for an asynchronous rejection before retrying.")
+    parser.add_argument("--max-retries", type=int, default=2, help="Maximum retries after explicit pre-open rejection; total attempts are retries plus one.")
     parser.add_argument("--no-wait", action="store_true", help="Submit immediately; useful for dry-run verification.")
     parser.add_argument("--market-day-only", dest="market_day_only", action="store_true", default=True)
     parser.add_argument("--no-market-day-only", dest="market_day_only", action="store_false")

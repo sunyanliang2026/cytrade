@@ -50,6 +50,8 @@ The state file records submitted `trade_day:row:<CSV row number>` keys, so
 multiple rows for one stock remain independent while an unchanged CSV is not
 sent twice on the same day.
 
-The BAT defaults are `COUNTER_OFFSET_MS=300`, `RETRY_DELAY_MS=100`, and
-`REJECTION_WAIT_MS=100`. A retry uses a new order UUID and trace ID; only the
-accepted attempt is recorded as submitted.
+The current BAT defaults are `COUNTER_OFFSET_MS=50`, `RETRY_DELAY_MS=100`,
+`REJECTION_WAIT_MS=100`, and `MAX_RETRIES=2`. `MAX_RETRIES` means retries after
+the first attempt, so the default allows up to three total attempts. A retry
+uses a new order UUID and trace ID; only the accepted attempt is recorded as
+submitted.

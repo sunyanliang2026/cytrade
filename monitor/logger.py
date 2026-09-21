@@ -185,13 +185,13 @@ class LogManager:
 
         if _USE_JSON:
             formatter = jsonlogger.JsonFormatter(
-                fmt="%(asctime)s %(name)s %(levelname)s %(message)s",
+                fmt="%(asctime)s.%(msecs)03d %(name)s %(levelname)s %(message)s",
                 datefmt="%Y-%m-%dT%H:%M:%S",
                 json_ensure_ascii=False,
             )
         else:
             formatter = logging.Formatter(
-                fmt='{"time":"%(asctime)s","logger":"%(name)s","level":"%(levelname)s","msg":"%(message)s"}',
+                fmt='{"time":"%(asctime)s.%(msecs)03d","logger":"%(name)s","level":"%(levelname)s","msg":"%(message)s"}',
                 datefmt="%Y-%m-%dT%H:%M:%S"
             )
         fh.setFormatter(formatter)
@@ -200,7 +200,7 @@ class LogManager:
         # ---- 控制台 Handler ----
         ch = logging.StreamHandler(sys.stdout)
         ch.setFormatter(logging.Formatter(
-            "[%(asctime)s] %(levelname)-8s %(name)s | %(message)s",
+            "[%(asctime)s.%(msecs)03d] %(levelname)-8s %(name)s | %(message)s",
             datefmt="%H:%M:%S"
         ))
         if self._summary_mode:
