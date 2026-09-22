@@ -19,7 +19,7 @@ def event(code="600001", price=8.0, volume=500100, side="BUY", no="1", event_tim
         amount=price * volume,
         side=side,
         entrust_no=no,
-        event_time=event_time or datetime(2026, 9, 7, 10, 0, 0),
+        event_time=event_time or datetime(2026, 9, 8, 10, 0, 0),
     )
 
 
@@ -171,6 +171,54 @@ class FakeExecutor:
     def cancel_order(self, order_uuid, remark=""):
         self.cancels.append((order_uuid, remark))
         return True
+
+
+def test_orders_at_1457_do_not_trigger_or_cancel_existing_order(tmp_path):
+    executor = FakeExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(
+            stock_code="600001",
+            params={"plan_amount": 100000, "record_dir": str(tmp_path)},
+        ),
+        executor,
+        None,
+    )
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, pre_close=7.27,
+        last_price=7.9, bid1=7.9,
+        event_time=datetime(2026, 9, 8, 14, 56, 50),
+    ))
+    mark_open_dip(strategy)
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, pre_close=7.27,
+        last_price=8.0, bid1=8.0, bid1_volume=75001,
+        event_time=datetime(2026, 9, 8, 14, 56, 55),
+    ))
+    strategy.on_l2_order(event(
+        price=8.0, volume=700000, no="before-close-1",
+        event_time=datetime(2026, 9, 8, 14, 56, 58),
+    ))
+    strategy.on_l2_order(event(
+        price=8.0, volume=700000, no="before-close-2",
+        event_time=datetime(2026, 9, 8, 14, 56, 59),
+    ))
+
+    assert len(executor.orders) == 1
+    active_order_uuid = strategy._active_order_uuid
+
+    strategy.on_l2_order(event(
+        price=8.0, volume=700000, no="closing-auction-order",
+        event_time=datetime(2026, 9, 8, 14, 57, 0),
+    ))
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, last_price=8.0, bid1=8.0,
+        event_time=datetime(2026, 9, 8, 14, 57, 1),
+    ))
+
+    assert len(executor.orders) == 1
+    assert executor.cancels == []
+    assert strategy._active_order_uuid == active_order_uuid
+    assert strategy.console_status() == "当日结束"
 
 
 class RejectingExecutor(FakeExecutor):
@@ -505,7 +553,11 @@ def test_reseal_path_does_not_require_open_dip(tmp_path):
 def test_reseal_submits_first_order_then_cancels_when_validation_fails(tmp_path):
     executor = FakeExecutor()
     strategy = LargeOrderLimitUpBuyStrategy(
-        StrategyConfig(stock_code="600001", params={"plan_amount": 100000, "record_dir": str(tmp_path)}),
+        StrategyConfig(stock_code="600001", params={
+            "plan_amount": 100000,
+            "record_dir": str(tmp_path),
+            "reseal_validation_continue_on_failure": False,
+        }),
         executor,
         None,
     )
@@ -625,7 +677,111 @@ def test_reseal_validation_can_continue_after_successful_cancel(tmp_path):
     assert len(executor.orders) == 1
     assert len(executor.cancels) == 1
     assert strategy._reseal_validation_result == "failed"
-    assert strategy._entry_phase == "WAIT_REOPEN"
+    assert strategy._entry_phase == "LATE_RESEAL"
+
+
+def test_reseal_late_window_submits_once_after_cancel_confirmation(tmp_path):
+    executor = FakeExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(stock_code="600001", params={
+            "plan_amount": 100000,
+            "record_dir": str(tmp_path),
+            "reseal_late_window_seconds": 5,
+        }),
+        executor,
+        None,
+    )
+    _prepare_reseal_candidate(strategy)
+    strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
+    for number in range(150):
+        strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
+
+    first_order = executor.orders[0]
+    first_order.status = OrderStatus.CANCELED
+    first_order.filled_quantity = 0
+    strategy.on_order_update(first_order)
+    assert len(executor.orders) == 1
+
+    late_time = datetime(2026, 9, 8, 10, 0, 1)
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="late-big-1", event_time=late_time))
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="late-big-2",
+                                event_time=datetime(2026, 9, 8, 10, 0, 2)))
+
+    assert len(executor.orders) == 2
+    assert strategy._late_reseal_retry_used is True
+    assert strategy._entry_phase == "WAIT_RESEAL"
+
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="late-big-3",
+                                event_time=datetime(2026, 9, 8, 10, 0, 3)))
+    assert len(executor.orders) == 2
+
+
+def test_reseal_late_window_waits_for_cancel_before_follow_order(tmp_path):
+    executor = FakeExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(stock_code="600001", params={"plan_amount": 100000, "record_dir": str(tmp_path)}),
+        executor,
+        None,
+    )
+    _prepare_reseal_candidate(strategy)
+    strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
+    for number in range(150):
+        strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="late-big-1",
+                               event_time=datetime(2026, 9, 8, 10, 0, 1)))
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="late-big-2",
+                               event_time=datetime(2026, 9, 8, 10, 0, 2)))
+    assert len(executor.orders) == 1
+
+    first_order = executor.orders[0]
+    first_order.status = OrderStatus.CANCELED
+    strategy.on_order_update(first_order)
+    assert len(executor.orders) == 2
+
+
+def test_reseal_late_window_does_not_retry_after_partial_fill(tmp_path):
+    executor = FakeExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(stock_code="600001", params={"plan_amount": 100000, "record_dir": str(tmp_path)}),
+        executor,
+        None,
+    )
+    _prepare_reseal_candidate(strategy)
+    strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
+    for number in range(150):
+        strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
+    first_order = executor.orders[0]
+    first_order.status = OrderStatus.PART_CANCEL
+    first_order.filled_quantity = 100
+    strategy.on_order_update(first_order)
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="late-big-1",
+                               event_time=datetime(2026, 9, 8, 10, 0, 1)))
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="late-big-2",
+                               event_time=datetime(2026, 9, 8, 10, 0, 2)))
+    assert len(executor.orders) == 1
+    assert strategy._entry_filled is True
+
+
+def test_reseal_late_window_expires_without_two_big_orders(tmp_path):
+    executor = FakeExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(stock_code="600001", params={"plan_amount": 100000, "record_dir": str(tmp_path)}),
+        executor,
+        None,
+    )
+    _prepare_reseal_candidate(strategy)
+    strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
+    for number in range(150):
+        strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
+    first_order = executor.orders[0]
+    first_order.status = OrderStatus.CANCELED
+    strategy.on_order_update(first_order)
+    strategy.on_l2_order(event(price=8.0, volume=187500, no="late-big-1",
+                               event_time=datetime(2026, 9, 8, 10, 0, 1)))
+    strategy.on_l2_order(event(price=8.0, volume=100, no="late-expired",
+                               event_time=datetime(2026, 9, 8, 10, 0, 6)))
+    assert len(executor.orders) == 1
+    assert strategy._entry_phase == "DONE"
 
 
 def test_filled_entry_disables_all_later_entries_for_the_stock(tmp_path):
