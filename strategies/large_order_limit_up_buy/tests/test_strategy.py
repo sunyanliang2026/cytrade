@@ -173,6 +173,14 @@ class FakeExecutor:
         return True
 
 
+class RejectingExecutor(FakeExecutor):
+    def buy_limit(self, strategy_id, strategy_name, stock_code, price, quantity, remark):
+        order = super().buy_limit(strategy_id, strategy_name, stock_code, price, quantity, remark)
+        order.status = OrderStatus.JUNK
+        order.status_msg = "insufficient_cash:available_cash=849.38:required_amount=19584.00"
+        return order
+
+
 def test_big_order_submits_immediately_and_records_front_queue(tmp_path):
     executor = FakeExecutor()
     strategy = LargeOrderLimitUpBuyStrategy(
@@ -200,6 +208,64 @@ def test_big_order_submits_immediately_and_records_front_queue(tmp_path):
     assert len(snapshot_files) == 1
     assert len(neighbor_files) == 1
     assert "front" in neighbor_files[0].read_text(encoding="utf-8")
+
+
+def test_rejected_order_is_not_recorded_as_submitted(tmp_path):
+    executor = RejectingExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(
+            stock_code="600001",
+            params={"stock_name": "测试", "plan_amount": 100000, "record_dir": str(tmp_path)},
+        ),
+        executor,
+        None,
+    )
+    strategy.start()
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, pre_close=7.27,
+        last_price=7.9, bid1=7.9,
+    ))
+    mark_open_dip(strategy)
+    mark_first_seal_amount(strategy)
+    strategy.on_l2_order(event(price=8.0, volume=700000, no="rejected-1"))
+    strategy.on_l2_order(event(price=8.0, volume=700000, no="rejected-2"))
+
+    assert len(executor.orders) == 1
+    assert strategy._submitted_count == 0
+    assert strategy._active_order_uuid == ""
+    assert strategy._entry_phase == "DONE"
+    assert strategy._entry_filled is False
+
+
+def test_repeated_filled_order_updates_are_ignored_after_first_logical_update(tmp_path):
+    executor = FakeExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(
+            stock_code="600001",
+            params={"stock_name": "测试", "plan_amount": 100000, "record_dir": str(tmp_path)},
+        ),
+        executor,
+        None,
+    )
+    strategy.start()
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", limit_up_price=8.0, pre_close=7.27,
+        last_price=7.9, bid1=7.9,
+    ))
+    mark_open_dip(strategy)
+    mark_first_seal_amount(strategy)
+    strategy.on_l2_order(event(price=8.0, volume=700000, no="filled-1"))
+    strategy.on_l2_order(event(price=8.0, volume=700000, no="filled-2"))
+    order = executor.orders[0]
+    order.status = OrderStatus.SUCCEEDED
+    order.filled_quantity = order.quantity
+
+    strategy.on_order_update(order)
+    strategy.on_order_update(order)
+
+    assert strategy._entry_filled is True
+    assert strategy._entry_phase == "DONE"
+    assert strategy._active_order_uuid == ""
 
 
 def test_post_order_30s_writes_one_row_per_big_order_with_fill_and_cancel(tmp_path):

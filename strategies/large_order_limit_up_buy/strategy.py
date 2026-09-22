@@ -471,6 +471,29 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         if order is None:
             self._log_event("buy_blocked", reason="order_executor_unavailable", trigger=trigger)
             return
+        if order.status in (
+            OrderStatus.CANCELED,
+            OrderStatus.PART_CANCEL,
+            OrderStatus.JUNK,
+            OrderStatus.UNKNOWN,
+        ):
+            self._reseal_validation_active = False
+            self._active_order_uuid = ""
+            self._active_trigger_entrust_no = ""
+            reason = str(order.status_msg or order.status.value)
+            self._set_entry_phase("DONE", "order_rejected")
+            self._log_event(
+                "buy_blocked",
+                reason="order_rejected",
+                status=str(order.status),
+                status_msg=reason,
+                trigger=trigger,
+            )
+            logger.warning(
+                "[LARGE_ORDER] [下单失败] %s 原因=%s",
+                self._display_name(), reason,
+            )
+            return
         self._active_order_uuid = str(order.order_uuid or "")
         self._submitted_count += 1
         self._active_trigger_entrust_no = str(trigger.get("entrust_no", "") or "")
@@ -585,6 +608,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         elif status == OrderStatus.SUCCEEDED or (
             status == OrderStatus.PART_SUCC and int(getattr(order, "filled_quantity", 0) or 0) > 0
         ):
+            self._active_order_uuid = ""
             if not self._entry_filled:
                 self._entry_filled = True
                 self._reseal_validation_active = False

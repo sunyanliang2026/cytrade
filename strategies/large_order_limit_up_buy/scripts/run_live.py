@@ -12,7 +12,6 @@ import signal
 import sys
 import threading
 import time
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -119,20 +118,6 @@ def validate_live_confirmation(args: argparse.Namespace, configs: list[StrategyC
     if sum(planned_amounts) > float(args.max_total_amount):
         return "live_plan_exceeds_max_total_amount"
     return ""
-
-
-def log_monitor_summary(logger, strategies, data_sub) -> None:
-    status = data_sub.get_latest_data_status()
-    latest = status.get("latest_data_time") or ""
-    delay = float(status.get("data_delay_ms", 0.0) or 0.0)
-    phases = Counter(strategy._entry_phase for strategy in strategies)
-    submitted = sum(strategy._submitted_count for strategy in strategies)
-    filled = sum(1 for strategy in strategies if strategy._entry_filled)
-    phase_text = ",".join(f"{phase}:{count}" for phase, count in sorted(phases.items()))
-    logger.info(
-        "[LARGE_ORDER] 汇总 监控=%d 已下单=%d 已成交=%d 状态=%s 延迟=%.0fms 行情=%s",
-        len(strategies), submitted, filled, phase_text, delay, latest,
-    )
 
 
 def run_live_session(args: argparse.Namespace) -> str:
