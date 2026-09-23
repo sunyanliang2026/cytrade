@@ -1,52 +1,76 @@
-# JuejinSellStrategy
+# Juejin Sell Strategy
 
-Self-contained strategy package for the sell-side strategy converted from the original Juejin/GM tick strategy.
+基于 QMT tick 行情运行的卖出策略。策略按 CSV 中的每只股票创建独立实例，状态机逐 tick 判断是否提交限价卖单。
 
-Contents:
+## 文件与启动
 
-- `strategy.py`: cytrade/QMT strategy implementation. Orders are routed through the shared `TradeExecutor` and existing execution gates.
-- `data/sell_10.csv`: default stock/quantity input copied from the original Juejin strategy.
-- `scripts/run_managed_session.py`: managed-session entry point for running only this strategy from CSV.
-- `scripts/run_managed_session.bat`: one-command Windows entry point for this strategy.
-- `docs/original_juejin_main.py`: original Juejin/GM source for reference only; do not run it inside cytrade.
-- `tests/`: strategy-specific regression tests.
-- `output/`: strategy-owned run artifacts placeholder.
+- `strategy.py`：策略状态机、卖出规则和账户可卖数量校验。
+- `data/sell_10.csv`：股票列表及每笔目标卖出数量。
+- `scripts/run_managed_session.bat`：Windows 启动入口。
+- `scripts/run_managed_session.py`：托管运行入口，可配置运行时段、CSV 和控制台输出模式。
+- `tests/`：策略逻辑和运行入口回归测试。
+- `docs/original_juejin_main.py`：原始策略参考文件，不作为 cytrade 运行入口。
 
-Canonical one-command entry:
+默认启动命令：
 
 ```bat
 strategies\juejin_sell_strategy\scripts\run_managed_session.bat
 ```
 
-Strategy-specific files should stay in this package. Root-level compatibility wrappers for this strategy have been removed.
+实盘启动需要本地运行配置启用实盘，并通过启动入口的实盘确认。显式 dry-run 可运行：
 
-Behavior notes:
+```bat
+strategies\juejin_sell_strategy\scripts\run_managed_session.bat dryrun
+```
 
-- `sellvol` in CSV is treated as the strategy-side sellable quantity.
-- The strategy does not require or mock live account holdings before emitting a sell attempt.
-- If the real account has no holding, the sell order may be rejected by the execution/account layer; that is acceptable for verification and does not pause this strategy for account-position rejection messages.
-- After entering `flag=7`, the existing sell rules remain active. An additional one-lot sell is submitted when the bid falls more than 2.5% from the session high.
-- Runtime logs report limit-up confirmation and the `flag=7` thresholds/reason when no sell is submitted.
+默认策略开始时间为 `09:15`，停止时间为 `15:05`。常规 tick 卖出判断在 `09:26-14:57`；集合竞价规则单独在 `09:24:56` 后判断。
 
-## 卖出逻辑
+## CSV 与卖出数量
 
-策略从 `09:15` 起接收行情，主要卖出判断窗口为 `09:26-14:57`。所有卖出数量受 CSV 的 `sellvol` 限制；同一卖出动作有独立去重标记，不会因连续行情重复提交。
+CSV 列为 `symbol,exp,sellvol,nick`：
 
-| 场景 | 条件 | 卖出动作 |
+- `symbol`：证券代码，支持带市场后缀的代码。
+- `exp`：是否启用竞价/早盘不及预期卖出规则；`1` 启用，其他值不启用。
+- `sellvol`：每笔卖出的目标股数。
+- `nick`：日志显示名称。
+
+每次提交卖单时，策略使用 `sellvol` 作为目标数量，并按当前可卖数量封顶；可卖数量小于目标时卖出全部可卖数量。实盘优先查询 QMT 账户的 `can_use_volume`，查询失败或无可卖数量时不下单。跌停清仓规则请求卖出全部当前可卖数量。
+
+## 状态与规则
+
+涨跌幅均相对昨收计算，条件使用代码中的严格大于/小于比较。涨跌停比例按股票代码确定：主板通常为 `10%`，创业板/科创板为 `20%`，北交所为 `30%`。涨停封单金额按 `买一价 × 买一手数 × 100 股 × multiplier` 计算，阈值金额单位为元。
+
+| 状态 | 进入条件 | 主要卖出规则 |
 |---|---|---|
-| 竞价严重不及预期 | 仅 `exp=1`；`09:24:56` 后买一处于昨收 `-6%` 至 `-0.5%` | 目标数量挂跌停价，剩余数量挂昨收 `+5%` |
-| 早盘不及预期 | 仅 `exp=1`；`09:26-09:31` 买一低于昨收 `-2%` | 撤前单，目标数量按买一 `-1%` 卖出 |
-| 弱势反弹失败 | 先跌破昨收 `-2.5%`，前一笔买一曾高于 `+2%` 后又跌破 `+2%`，日内低点低于 `-3%`，且晚于 `09:33` | 目标数量按买一 `-1%` 卖出，剩余数量挂昨收 `+4%` |
-| 跌停止损 | 卖一等于跌停价，非一字跌停开盘，且跌停卖一封单金额超过 `5000 万` | 撤前单，按跌停价清仓 |
-| `+4%` 至 `+7%` 冲高回落 | 曾进入该涨幅区间；最高价超过 `+6.5%` 后买一跌破 `+5%`，或买一跌破 `+3%` | 撤前单，目标数量按买一 `-1%` 卖出；`09:31` 前首次跌破 `+5%` 且开盘未达 `+5%` 时暂不卖 |
-| 超过 `+7%` 后回落 | 曾高于 `+7%` 且未涨停；最高价超过 `+8.5%` 后买一跌破 `+7%`，或 `09:31` 前买一跌破 `+6.5%` | 撤前单，目标数量按买一约 `-1.5%` 或 `-1%` 卖出 |
-| 涨停大封单开板 | 涨停价买一封单金额超过 `1.2 亿` 后开板，或涨停封单显著走弱 | 首次开板按买一约 `-1.8%` 卖出一笔；封板后 1 分钟内开板、开盘未涨停且早于 `09:40` 时暂不卖 |
-| 开板 5 分钟未回封 | 已开板且连续 5 分钟买一仍低于涨停价 | 按当前买一价格卖出 |
+| `0` 初始/普通 | 初始状态；涨停开板超过 5 分钟后也会回到此状态 | 买一涨幅超过 `7%` 且低于涨停价时转入 `7`。低于昨收 `-2.5%` 时转入 `-3`。 |
+| `1` 竞价不及预期 | `exp=1`，09:24:56 后买一位于昨收 `-6%` 至 `-0.5%` 区间 | 按目标数量挂跌停价；剩余目标仓位另挂昨收 `+5%`。09:26 后若至 09:31 前买一位于昨收 `-6%` 至 `-2%`，撤活动单并按买一 `-1%` 提交目标数量。 |
+| `-3` 弱势 | 买一低于昨收 `-2.5%` | 前一笔买一曾达到昨收 `+2%`，当前跌回 `+2%` 以下、日内低点低于 `-3%` 且时间晚于 09:33 时，按买一 `-1%` 卖目标数量，并为剩余数量挂昨收 `+4%`。反弹到昨收 `+4%` 至 `+7%` 区间时转入 `5`。 |
+| `5` 弱势反弹后的冲高 | 仅从 `-3` 状态下买一进入昨收 `+4%` 至 `+7%` 区间进入 | 买一低于 `+5%` 时：若日内高点超过 `+6.5%`，按买一 `-1%` 卖目标数量；否则，买一低于 `+3%` 时按买一 `-1%` 卖目标数量。09:31 前若开盘价低于 `+5%`，首次跌破 `+5%` 暂不卖。 |
+| `7` 强势但未涨停 | 买一超过昨收 `+7%` 且低于涨停价，且当前状态允许进入 | 以下任一条件提交一笔目标数量卖单：① 买一较日内最高价回落超过 `2.5%`，价格为买一 `-1%`；② 日内高点超过昨收 `+8.5%` 且买一回落到 `+7%` 以下，价格为 `round(买一 × 0.985, 2) + 0.01`；③ 09:31 前买一低于 `+6.5%`，价格为买一 `-1%`。 |
+| `10` 涨停封单确认 | 买一等于涨停价，且买一封单金额超过 `1.2` 亿元 | 买一低于涨停价，或仍在涨停价但封单减少达到规则阈值时，按买一 `-1.8%` 卖第一笔目标数量。若开板首卖后买一从昨收 `+3%` 以上跌到 `+3%` 以下，再按买一 `-1%` 卖第二笔目标数量。 |
+| `99` 跌停清仓 | 卖一等于跌停价、开盘价高于昨收 `-9%`、跌停卖一金额超过 `5000` 万元 | 撤销活动单，按跌停价卖出全部当前可卖数量。 |
+| `-9` 本轮卖出已触发 | 主要卖出分支提交成功后设置 | 用于阻止相应卖出状态继续重复触发；是否成交以订单/成交回报为准。 |
 
-涨停价和跌停价按股票所属市场的涨跌停幅度从昨收计算。实盘订单仍须通过统一的账户连接、可用持仓和交易就绪校验。
+### 涨停封单与开板细节
 
-Safety notes:
+在涨停价的封单金额满足 `> 1.2 亿元` 后，策略确认 `flag=10`。确认后，以下情况判定封板打开或明显减弱：
 
-- The managed BAT defaults to live mode when double-clicked. It sets the live switch only for that process and requires an interactive `1` confirmation before starting.
-- Use `run_managed_session.bat dryrun` for an explicit dry-run session.
-- Account credentials, QMT paths, `.env`, and `config/local_runtime.json` are outside this package and must not be changed by this strategy migration.
+- 买一价低于涨停价；
+- 买一仍在涨停价，但封单低于 `1 亿元` 且较上一笔减少超过 `2500 万元`；
+- 买一仍在涨停价，但封单低于 `1.6 亿元` 且较上一笔减少超过 `8000 万元`。
+
+涨停打开后首笔卖单的委托价为买一 `×0.982`。若距离最近一次涨停买一不足 60 秒、当前时间早于 09:40，且开盘价低于涨停价，首笔卖出暂缓；开板状态仍会记录。开板首卖之后，价格跌破昨收 `+3%` 时触发第二笔。开板持续超过 5 分钟仍未回封时，策略把状态恢复为普通价格逻辑，**不会仅因 5 分钟未回封而直接卖出**。
+
+## 委托、撤单与成交
+
+- 卖单统一通过共享 `TradeExecutor` 提交限价单，具体是否接受、成交与成交价格由 QMT 和市场决定。
+- 触发条件成立时可能先撤销已有活动卖单，再提交新价格的卖单。
+- 实盘每次提交前按 QMT 当前可卖数量裁剪；查询持仓失败时禁止提交。
+- 同一动作使用独立 action key 去重，避免连续 tick 重复提交相同动作。
+- “提交卖单”表示委托已发起，不代表已成交；应结合订单状态和成交回报确认结果。
+
+## 控制台日志
+
+控制台会显示 `[JUEJIN_STATUS]` 初始状态和状态变化。进入 `flag=7` 时会输出当前买一、涨幅、日内高点、旧有 `+8.5%/+7%` 条件阈值及等待/未触发原因。涨停封单确认和卖单提交也会记录关键价格、数量及原因。
+
+默认使用摘要模式，其他详细日志仍写入 `logs/`。启动时输出的 system/trade 日志路径可用于核对完整委托和成交事件。
