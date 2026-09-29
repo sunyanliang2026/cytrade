@@ -50,7 +50,7 @@ def _full_tick_first_value(payload: dict, field: str) -> float:
         return 0.0
 
 
-def _full_tick_time(payload: dict, fallback: datetime) -> datetime:
+def _full_tick_time(payload: dict) -> datetime | None:
     value = payload.get("time") or payload.get("sysTime")
     try:
         numeric = float(value)
@@ -58,7 +58,13 @@ def _full_tick_time(payload: dict, fallback: datetime) -> datetime:
             numeric /= 1000.0
         return datetime.fromtimestamp(numeric)
     except (TypeError, ValueError, OSError, OverflowError):
-        return fallback
+        return None
+
+
+def _is_final_auction_result_time(value: datetime | None) -> bool:
+    if not isinstance(value, datetime):
+        return False
+    return dt_time(9, 25) <= value.time() <= dt_time(9, 25, 5)
 
 
 def _full_tick_limit_up(payload: dict) -> float:
@@ -121,17 +127,22 @@ def initialize_auction_states(
             bid1 = _full_tick_first_value(payload, "bidPrice")
             if bid1 <= 0:
                 reason = "invalid_bid1"
-            elif not strategy.initialize_from_auction_tick(
-                bid1=bid1,
-                limit_up_price=_full_tick_limit_up(payload),
-                event_time=_full_tick_time(payload, now),
-            ):
-                reason = "limit_up_price_unavailable"
+            else:
+                event_time = _full_tick_time(payload)
+                if event_time is None or event_time.date() != now.date() or not _is_final_auction_result_time(event_time):
+                    reason = "auction_result_not_final"
+                elif not strategy.initialize_from_auction_tick(
+                    bid1=bid1,
+                    limit_up_price=_full_tick_limit_up(payload),
+                    event_time=event_time,
+                ):
+                    reason = "limit_up_price_unavailable"
         if reason:
             failures.setdefault(reason, []).append(strategy)
     reason_text = {
         "stock_not_found": "未返回该股票",
         "invalid_bid1": "买一价格无效",
+        "auction_result_not_final": "行情时间不是09:25最终竞价结果",
         "limit_up_price_unavailable": "无法取得精确涨停价",
     }
     failed_strategies = [strategy for failed in failures.values() for strategy in failed]

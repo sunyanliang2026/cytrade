@@ -222,8 +222,13 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         limit_up_price: float = 0.0,
         event_time: datetime | None = None,
     ) -> bool:
-        """Initialize the opening state from a pre-open ordinary tick."""
+        """Initialize the opening state from the final 09:25 auction result."""
         if self._initial_quote_checked or float(bid1 or 0.0) <= 0:
+            return False
+        if (
+            isinstance(event_time, datetime)
+            and not (dt_time(9, 25) <= event_time.time() <= dt_time(9, 25, 5))
+        ):
             return False
         if float(limit_up_price or 0.0) > 0:
             self._limit_up_price = float(limit_up_price)
@@ -234,24 +239,24 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         if self._limit_up_price <= 0:
             return False
         self._initial_quote_checked = True
-        if self._is_limit_up_price(float(bid1)):
-            self._set_entry_phase("WAIT_REOPEN", "auction_tick_limit_up")
-            self._log_event(
-                "auction_tick_initialized",
-                bid1=float(bid1),
-                limit_up_price=self._limit_up_price,
-                result="WAIT_REOPEN",
-                event_time=event_time,
-            )
+        is_final_auction_result = (
+            isinstance(event_time, datetime)
+            and dt_time(9, 25) <= event_time.time() <= dt_time(9, 25, 5)
+        )
+        if is_final_auction_result and self._is_limit_up_price(float(bid1)):
+            self._set_entry_phase("WAIT_REOPEN", "auction_result_limit_up")
+            result = "WAIT_REOPEN"
         else:
-            self._set_entry_phase("READY", "auction_tick_not_limit_up")
-            self._log_event(
-                "auction_tick_initialized",
-                bid1=float(bid1),
-                limit_up_price=self._limit_up_price,
-                result="READY",
-                event_time=event_time,
-            )
+            self._set_entry_phase("READY", "auction_result_not_limit_up")
+            result = "READY"
+        self._log_event(
+            "auction_tick_initialized",
+            bid1=float(bid1),
+            limit_up_price=self._limit_up_price,
+            auction_bid_at_limit_up=self._is_limit_up_price(float(bid1)),
+            result=result,
+            event_time=event_time,
+        )
         return True
 
     def on_tick(self, tick: TickData) -> None:

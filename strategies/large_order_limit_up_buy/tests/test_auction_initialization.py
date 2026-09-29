@@ -29,19 +29,32 @@ def make_strategy(tmp_path, code):
     )
 
 
-def test_initialize_from_auction_tick_uses_bid1_only(tmp_path):
-    sealed = make_strategy(tmp_path, "600001")
+def test_initialize_from_final_auction_result_uses_limit_up_as_wait_reopen(tmp_path):
+    sealed_in_auction = make_strategy(tmp_path, "600001")
     unsealed = make_strategy(tmp_path, "000001")
 
-    assert sealed.initialize_from_auction_tick(
+    assert sealed_in_auction.initialize_from_auction_tick(
         bid1=8.0,
         limit_up_price=8.0,
-        event_time=datetime(2026, 9, 20, 9, 26),
+        event_time=datetime(2026, 9, 20, 9, 25),
     )
-    assert sealed._entry_phase == "WAIT_REOPEN"
+    assert sealed_in_auction._entry_phase == "WAIT_REOPEN"
 
-    assert unsealed.initialize_from_auction_tick(bid1=7.9, limit_up_price=8.0)
+    assert unsealed.initialize_from_auction_tick(
+        bid1=7.9, limit_up_price=8.0, event_time=datetime(2026, 9, 20, 9, 25, 1),
+    )
     assert unsealed._entry_phase == "READY"
+
+
+def test_initialize_from_stale_auction_snapshot_is_not_final(tmp_path):
+    strategy = make_strategy(tmp_path, "002640")
+
+    assert not strategy.initialize_from_auction_tick(
+        bid1=4.36,
+        limit_up_price=4.36,
+        event_time=datetime(2026, 9, 20, 9, 24, 48),
+    )
+    assert strategy._entry_phase == "WAIT_INITIAL_QUOTE"
 
 
 def test_initialize_auction_states_batches_full_tick_and_falls_back_per_stock(monkeypatch, tmp_path):
@@ -50,8 +63,8 @@ def test_initialize_auction_states_batches_full_tick_and_falls_back_per_stock(mo
     def fake_get_full_tick(codes):
         calls.append(list(codes))
         return {
-            "600001.SH": {"bidPrice": [8.0, 7.9], "upLimitPrice": 8.0},
-            "000001.SZ": {"bidPrice": [7.9], "upLimitPrice": 8.0},
+            "600001.SH": {"bidPrice": [8.0, 7.9], "upLimitPrice": 8.0, "time": datetime(2026, 9, 20, 9, 25).timestamp() * 1000},
+            "000001.SZ": {"bidPrice": [7.9], "upLimitPrice": 8.0, "time": datetime(2026, 9, 20, 9, 25).timestamp() * 1000},
         }
 
     monkeypatch.setitem(
@@ -63,7 +76,7 @@ def test_initialize_auction_states_batches_full_tick_and_falls_back_per_stock(mo
     strategies = [make_strategy(tmp_path, "600001"), make_strategy(tmp_path, "000001")]
 
     run_market_only.initialize_auction_states(
-        strategies, logger, datetime(2026, 9, 20, 9, 26),
+        strategies, logger, datetime(2026, 9, 20, 9, 25),
     )
 
     assert calls == [["600001.SH", "000001.SZ"]]
@@ -119,7 +132,7 @@ def test_initialize_auction_states_returns_only_unresolved_stocks(monkeypatch, t
     def fake_get_full_tick(codes):
         calls.append(list(codes))
         return {
-            "600001.SH": {"bidPrice": [8.0], "upLimitPrice": 8.0},
+            "600001.SH": {"bidPrice": [8.0], "upLimitPrice": 8.0, "time": datetime(2026, 9, 20, 9, 25).timestamp() * 1000},
             "000001.SZ": {},
         }
 
@@ -147,6 +160,30 @@ def test_initialize_auction_states_returns_only_unresolved_stocks(monkeypatch, t
         ["600001.SH", "000001.SZ"],
         ["600001.SH", "000001.SZ"],
     ]
+
+
+def test_initialize_auction_states_rejects_missing_or_old_timestamp(monkeypatch, tmp_path):
+    def fake_get_full_tick(codes):
+        return {
+            "600001.SH": {"bidPrice": [8.0], "upLimitPrice": 8.0},
+            "000001.SZ": {"bidPrice": [8.0], "upLimitPrice": 8.0,
+                          "time": datetime(2026, 9, 19, 9, 25).timestamp() * 1000},
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "xtquant",
+        types.SimpleNamespace(xtdata=types.SimpleNamespace(get_full_tick=fake_get_full_tick)),
+    )
+    logger = RecordingLogger()
+    strategies = [make_strategy(tmp_path, "600001"), make_strategy(tmp_path, "000001")]
+
+    failed = run_market_only.initialize_auction_states(
+        strategies, logger, datetime(2026, 9, 20, 9, 25), log_failures=False,
+    )
+
+    assert failed == strategies
+    assert all(item._entry_phase == "WAIT_INITIAL_QUOTE" for item in strategies)
 
 
 def test_l2_auction_events_are_recorded_without_changing_state(tmp_path):
