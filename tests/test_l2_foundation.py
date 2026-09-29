@@ -10,6 +10,16 @@ from strategy.models import StrategyConfig
 from strategy.runner import StrategyRunner, _select_configs_in_subprocess
 
 
+def test_l2_callback_profiler_preserves_callback_result():
+    manager = DataSubscriptionManager()
+    payload = {"000001.SZ": {"time": 1}}
+    received = []
+    callback = manager._profile_l2_callback("l2quote", lambda raw: received.append(raw) or "ok")
+
+    assert callback(payload) == "ok"
+    assert received == [payload]
+
+
 class _FakeDataSubscription:
     def __init__(self):
         self.tick_codes = set()

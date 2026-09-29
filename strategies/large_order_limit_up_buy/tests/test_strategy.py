@@ -1,4 +1,5 @@
-from datetime import datetime
+import csv
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -55,6 +56,29 @@ def mark_first_seal_amount(strategy):
         bid1_volume=75001,
         event_time=datetime(2026, 9, 8, 9, 30),
     ))
+
+
+def test_l2_latency_diagnostic_separates_callback_and_raw_write(tmp_path):
+    strategy = make_strategy(tmp_path)
+    strategy.start()
+    callback_time = datetime.now()
+    order = event(price=7.9, no="diagnostic", event_time=callback_time - timedelta(seconds=1))
+    strategy.on_l2_order(order)
+    strategy.on_l2_quote(L2QuoteEvent(
+        stock_code="600001", bid1=7.9, limit_up_price=8.0,
+        event_time=callback_time - timedelta(seconds=2), recv_time=callback_time,
+    ))
+
+    path = next(tmp_path.rglob("*.l2_latency.csv"))
+    with path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["source_to_callback_ms"] == "2000.0"
+    assert float(rows[0]["callback_to_strategy_ms"]) >= 0
+    assert rows[0]["order_count"] == "1"
+    assert float(rows[0]["order_raw_total_ms"]) >= 0
+    assert rows[0]["transaction_count"] == "0"
+    strategy.stop()
 
 
 def test_select_stocks_accepts_minimal_manual_pool_without_name(tmp_path):

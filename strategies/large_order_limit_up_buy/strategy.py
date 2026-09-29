@@ -46,6 +46,13 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         "front_amount", "match_confidence", "trigger_entrust_no",
         "sealed_trade_amount", "recent_trade_amount", "recent_trade_rate",
     ]
+    LATENCY_HEADERS = [
+        "code", "event_time", "callback_time", "strategy_time", "raw_done_time",
+        "source_to_callback_ms", "callback_to_strategy_ms", "quote_raw_ms",
+        "order_count", "order_raw_total_ms", "order_raw_max_ms",
+        "transaction_count", "transaction_raw_total_ms", "transaction_raw_max_ms",
+        "queue_count", "queue_raw_total_ms", "queue_raw_max_ms",
+    ]
     POST_ORDER_HEADERS = ["类型", "序号", "大单时间", "委托编号", "委托金额", "成交金额", "撤单金额", "剩余金额", "状态"]
 
     def __init__(self, config: StrategyConfig, trade_executor=None, position_manager=None):
@@ -144,6 +151,11 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._neighbor_handle = None
         self._snapshot_handle = None
         self._post_order_handle = None
+        self._latency_handle = None
+        self._latency_failed_logged = False
+        self._raw_write_stats = {
+            kind: [0, 0.0, 0.0] for kind in ("l2order", "l2transaction", "l2orderqueue")
+        }
         self._post_order_started_at: datetime | None = None
         self._post_order_big_orders: dict[str, dict[str, Any]] = {}
         self._post_order_sequence = 0
@@ -270,7 +282,11 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
     def on_l2_quote(self, event: L2QuoteEvent) -> None:
         if event.stock_code != self.stock_code:
             return
+        strategy_time = datetime.now()
+        write_start = time.perf_counter()
         self._write_raw("l2quote", event.event_time, event.raw_xt_fields)
+        raw_done_time = datetime.now()
+        self._write_latency_diagnostic(event, strategy_time, raw_done_time, time.perf_counter() - write_start)
         quote_time = event.event_time or event.recv_time
         if isinstance(quote_time, datetime) and quote_time.time() < dt_time(9, 30):
             return
@@ -369,6 +385,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
     def on_l2_order(self, event: L2OrderEvent) -> None:
         if event.stock_code != self.stock_code:
             return
+        strategy_time = datetime.now()
         self._write_raw("l2order", event.event_time, event.raw_xt_fields)
         if not self._is_continuous_trading_time(event.event_time):
             return
@@ -387,7 +404,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             return
         volume = max(0, int(event.volume or 0))
         amount = float(event.amount or 0.0) or price * volume
-        record = self._order_record(event, volume, amount, side)
+        record = self._order_record(event, volume, amount, side, strategy_time)
         self._orders_by_no[entrust_no] = record if entrust_no else record
         self._queue_orders.append(record)
         post_window_active = self._post_order_started_at is not None
@@ -806,10 +823,17 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         neighbor_path = day_dir / f"{stem}.queue_neighbors.csv"
         snapshot_path = day_dir / f"{stem}.queue_snapshots.csv"
         post_order_path = day_dir / f"{stem}.post_order_30s_orders.csv"
+        latency_path = day_dir / f"{stem}.l2_latency.csv"
         self._raw_handle = raw_path.open("a", encoding="utf-8")
         self._neighbor_handle = neighbor_path.open("a", encoding="utf-8", newline="")
         self._snapshot_handle = snapshot_path.open("a", encoding="utf-8", newline="")
         self._post_order_handle = post_order_path.open("a", encoding="utf-8-sig", newline="")
+        try:
+            self._latency_handle = latency_path.open("a", encoding="utf-8", newline="")
+            if latency_path.stat().st_size == 0:
+                csv.writer(self._latency_handle).writerow(self.LATENCY_HEADERS)
+        except OSError as exc:
+            self._disable_latency_diagnostic(exc)
         if neighbor_path.stat().st_size == 0:
             csv.writer(self._neighbor_handle).writerow(self.NEIGHBOR_HEADERS)
         if snapshot_path.stat().st_size == 0:
@@ -819,7 +843,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
 
     def stop(self) -> None:
         self._finish_post_order_window()
-        for attr in ("_raw_handle", "_neighbor_handle", "_snapshot_handle", "_post_order_handle"):
+        for attr in ("_raw_handle", "_neighbor_handle", "_snapshot_handle", "_post_order_handle", "_latency_handle"):
             handle = getattr(self, attr, None)
             try:
                 if handle:
@@ -832,10 +856,52 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
     def _write_raw(self, kind: str, event_time: datetime | None, payload: dict[str, Any]) -> None:
         if self._raw_handle is None:
             return
+        started = time.perf_counter()
         self._raw_handle.write(json.dumps({"kind": kind, "code": self.stock_code, "name": self._stock_name,
                                             "event_time": self._format_time(event_time), "recv_time": datetime.now().isoformat(),
                                             "raw": payload or {}}, ensure_ascii=False, default=str) + "\n")
         self._raw_handle.flush()
+        if kind in self._raw_write_stats:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            stats = self._raw_write_stats[kind]
+            stats[0] += 1
+            stats[1] += elapsed_ms
+            stats[2] = max(stats[2], elapsed_ms)
+
+    def _write_latency_diagnostic(
+        self, event: L2QuoteEvent, strategy_time: datetime, raw_done_time: datetime, quote_raw_seconds: float
+    ) -> None:
+        if self._latency_handle is None:
+            return
+        callback_time = event.recv_time if isinstance(event.recv_time, datetime) else None
+        event_time = event.event_time if isinstance(event.event_time, datetime) else None
+        row = [
+            self.stock_code, self._format_time(event_time), self._format_time(callback_time),
+            strategy_time.isoformat(), raw_done_time.isoformat(),
+            round((callback_time - event_time).total_seconds() * 1000, 3) if callback_time and event_time else "",
+            round((strategy_time - callback_time).total_seconds() * 1000, 3) if callback_time else "",
+            round(quote_raw_seconds * 1000, 3),
+        ]
+        for kind in ("l2order", "l2transaction", "l2orderqueue"):
+            count, total_ms, max_ms = self._raw_write_stats[kind]
+            row.extend((count, round(total_ms, 3), round(max_ms, 3)))
+            self._raw_write_stats[kind] = [0, 0.0, 0.0]
+        try:
+            csv.writer(self._latency_handle).writerow(row)
+            self._latency_handle.flush()
+        except OSError as exc:
+            self._disable_latency_diagnostic(exc)
+
+    def _disable_latency_diagnostic(self, exc: OSError) -> None:
+        if self._latency_handle is not None:
+            try:
+                self._latency_handle.close()
+            except OSError:
+                pass
+            self._latency_handle = None
+        if not self._latency_failed_logged:
+            logger.warning("L2 latency diagnostic disabled for %s: %s", self.stock_code, exc)
+            self._latency_failed_logged = True
 
     def _start_post_order_window(
         self,
@@ -978,8 +1044,11 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             return side
         return {1: "BUY", 2: "SELL", 3: "CANCEL_BUY", 4: "CANCEL_SELL"}.get(int(event.entrust_direction or 0), "")
 
-    def _order_record(self, event: L2OrderEvent, volume: int, amount: float, side: str) -> dict[str, Any]:
+    def _order_record(
+        self, event: L2OrderEvent, volume: int, amount: float, side: str, strategy_time: datetime
+    ) -> dict[str, Any]:
         return {"entrust_no": str(event.entrust_no or ""), "event_time": event.event_time,
+                "callback_time": self._format_time(event.recv_time), "strategy_time": strategy_time.isoformat(),
                 "price": float(event.price or 0.0), "side": side, "volume": volume, "amount": amount,
                 "is_big_order": self._is_big_order(float(event.price or 0.0), volume, amount),
                 "filled_volume": 0, "cancelled_volume": 0, "remaining_volume": volume}

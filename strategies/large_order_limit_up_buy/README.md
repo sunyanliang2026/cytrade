@@ -1,5 +1,31 @@
 # LargeOrderLimitUpBuy
 
+The unimplemented reseal early-signal discussion is in
+[`docs/reseal_early_signal_idea.md`](docs/reseal_early_signal_idea.md).
+
+## Next-day L2 latency review
+
+Each stock writes `<code>_<instance>.l2_latency.csv` under `data/runtime_records/YYYY-MM-DD/`.
+For each L2 quote it records exchange event time, xtdata callback entry time,
+strategy entry time, and completion of the raw JSONL write. The three millisecond
+columns separate source-to-callback age, callback-to-strategy wait, and quote
+raw-write cost. The order/transaction/queue columns summarize raw-write counts,
+total time, and worst time since the previous quote. Missing event or callback
+timestamps remain blank; do not treat them as zero latency.
+L2 quote event times are sampled on the feed's roughly three-second cadence;
+millisecond values show local timing stages, not millisecond exchange quote precision.
+
+During 09:29-09:35, `logs/system.*.log` also contains one `L2 callback 10s
+profile` about every ten seconds. Its per-kind tuple is callback count, total
+execution milliseconds, and maximum single-callback milliseconds. Compare this
+with the per-stock CSV before attributing a late quote to QMT or local processing.
+`source_to_callback_ms` includes any backlog inside xtdata before Python callback
+entry, so it cannot alone separate QMT/network delay from that internal backlog.
+The diagnostic files do not participate in entry or order decisions.
+For an actual buy, the existing `buy_submitted` trade-log event also includes
+`trigger.callback_time` and `trigger.strategy_time`; compare these with the
+trigger's exchange `event_time` and the order submission log time.
+
 ## Current Entry Rules
 
 - First-seal entries require `bid1 == exact limit-up price`, a bid-one seal above 60 million yuan, then more than 10 million yuan cumulatively across limit-up BUY `l2order` records of at least 2 million yuan each. The opening-dip requirement remains in effect.

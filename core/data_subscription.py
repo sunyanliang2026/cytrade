@@ -62,6 +62,9 @@ class DataSubscriptionManager:
         self._whole_market = False
         self._whole_market_subscribe_id: Optional[int] = None
         self._lock = threading.Lock()
+        self._l2_profile_lock = threading.Lock()
+        self._l2_profile_started = 0.0
+        self._l2_profile_stats: dict[str, list[float]] = {}
         self._last_recv_time: Optional[datetime] = None
         self._latest_data_time: Optional[datetime] = None
         self._latest_latency_ms: float = 0.0
@@ -186,7 +189,7 @@ class DataSubscriptionManager:
                         subscribe_key=(code, kind),
                         xt_code=xt_code,
                         period=kind,
-                        callback=self._get_l2_callback(kind),
+                        callback=self._profile_l2_callback(kind, self._get_l2_callback(kind)),
                         subscription_ids=self._l2_subscription_ids,
                     )
                     end = datetime.now()
@@ -639,6 +642,37 @@ class DataSubscriptionManager:
             "l2orderqueue": self._on_l2_orderqueue_data,
         }
         return callback_map[kind]
+
+    def _profile_l2_callback(self, kind: str, callback):
+        def measured(raw_data):
+            started_at = datetime.now()
+            if not (started_at.hour == 9 and 29 <= started_at.minute <= 35):
+                return callback(raw_data)
+            started = time.perf_counter()
+            try:
+                return callback(raw_data)
+            finally:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                summary = None
+                with self._l2_profile_lock:
+                    stats = self._l2_profile_stats.setdefault(kind, [0.0, 0.0, 0.0])
+                    stats[0] += 1
+                    stats[1] += elapsed_ms
+                    stats[2] = max(stats[2], elapsed_ms)
+                    now = time.monotonic()
+                    if self._l2_profile_started == 0.0:
+                        self._l2_profile_started = now
+                    if now - self._l2_profile_started >= 10.0:
+                        summary = {key: tuple(value) for key, value in self._l2_profile_stats.items()}
+                        self._l2_profile_stats.clear()
+                        self._l2_profile_started = now
+                if summary:
+                    logger.info("DataSubscription: L2 callback 10s profile count/total_ms/max_ms=%s", {
+                        key: (int(value[0]), round(value[1], 1), round(value[2], 1))
+                        for key, value in sorted(summary.items())
+                    })
+
+        return measured
 
     def _ensure_xtdata_connected(self):
         if not _XT_AVAILABLE or self._xtdata_connected:
