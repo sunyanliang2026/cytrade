@@ -1,5 +1,6 @@
 import csv
 from datetime import datetime, timedelta
+from threading import Event, Timer as RealTimer
 
 import pytest
 
@@ -10,6 +11,46 @@ from strategy.models import StrategyConfig
 from trading.models import Order
 from strategies.large_order_limit_up_buy.strategy import LargeOrderLimitUpBuyStrategy
 import strategies.large_order_limit_up_buy.strategy as strategy_module
+
+
+@pytest.fixture(autouse=True)
+def validation_clock(monkeypatch):
+    clock = [100.0]
+    timers = []
+
+    class ManualTimer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    class ClockMeta(type):
+        def __instancecheck__(cls, value):
+            return isinstance(value, datetime)
+
+    class LocalTime(datetime, metaclass=ClockMeta):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 8, 10, 0) + timedelta(seconds=clock[0] - 100.0)
+
+    monkeypatch.setattr(strategy_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(strategy_module.threading, "Timer", ManualTimer)
+    monkeypatch.setattr(strategy_module, "datetime", LocalTime)
+    return clock, timers
+
+
+def finish_validation_second(strategy, validation_clock):
+    clock, _ = validation_clock
+    clock[0] = strategy._reseal_validation_started_monotonic + 1.0
+    strategy._check_reseal_validation()
 
 
 def event(code="600001", price=8.0, volume=500100, side="BUY", no="1", event_time=None):
@@ -61,7 +102,7 @@ def mark_first_seal_amount(strategy):
 def test_l2_latency_diagnostic_separates_callback_and_raw_write(tmp_path):
     strategy = make_strategy(tmp_path)
     strategy.start()
-    callback_time = datetime.now()
+    callback_time = strategy_module.datetime.now()
     order = event(price=7.9, no="diagnostic", event_time=callback_time - timedelta(seconds=1))
     strategy.on_l2_order(order)
     strategy.on_l2_quote(L2QuoteEvent(
@@ -574,7 +615,7 @@ def test_reseal_path_does_not_require_open_dip(tmp_path):
     assert strategy._trigger_count == 1
 
 
-def test_reseal_submits_first_order_then_cancels_when_validation_fails(tmp_path):
+def test_reseal_submits_first_order_then_cancels_when_validation_fails(tmp_path, validation_clock):
     executor = FakeExecutor()
     strategy = LargeOrderLimitUpBuyStrategy(
         StrategyConfig(stock_code="600001", params={
@@ -606,6 +647,8 @@ def test_reseal_submits_first_order_then_cancels_when_validation_fails(tmp_path)
     for number in range(150):
         strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
 
+    assert executor.cancels == []
+    finish_validation_second(strategy, validation_clock)
     assert len(executor.orders) == 1
     assert len(executor.cancels) == 1
     assert strategy._reseal_validation_result == "failed"
@@ -663,7 +706,7 @@ def test_reseal_keeps_order_when_two_big_orders_arrive_within_twenty(tmp_path):
     assert strategy._reseal_validation_result == "passed"
 
 
-def test_reseal_validation_can_continue_after_successful_cancel(tmp_path):
+def test_reseal_validation_can_continue_after_successful_cancel(tmp_path, validation_clock):
     executor = FakeExecutor()
     strategy = LargeOrderLimitUpBuyStrategy(
         StrategyConfig(
@@ -698,13 +741,14 @@ def test_reseal_validation_can_continue_after_successful_cancel(tmp_path):
     for number in range(150):
         strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
 
+    finish_validation_second(strategy, validation_clock)
     assert len(executor.orders) == 1
     assert len(executor.cancels) == 1
     assert strategy._reseal_validation_result == "failed"
     assert strategy._entry_phase == "LATE_RESEAL"
 
 
-def test_reseal_late_window_submits_once_after_cancel_confirmation(tmp_path):
+def test_reseal_late_window_submits_once_after_cancel_confirmation(tmp_path, validation_clock):
     executor = FakeExecutor()
     strategy = LargeOrderLimitUpBuyStrategy(
         StrategyConfig(stock_code="600001", params={
@@ -720,6 +764,7 @@ def test_reseal_late_window_submits_once_after_cancel_confirmation(tmp_path):
     for number in range(150):
         strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
 
+    finish_validation_second(strategy, validation_clock)
     first_order = executor.orders[0]
     first_order.status = OrderStatus.CANCELED
     first_order.filled_quantity = 0
@@ -740,7 +785,7 @@ def test_reseal_late_window_submits_once_after_cancel_confirmation(tmp_path):
     assert len(executor.orders) == 2
 
 
-def test_reseal_late_window_waits_for_cancel_before_follow_order(tmp_path):
+def test_reseal_late_window_waits_for_cancel_before_follow_order(tmp_path, validation_clock):
     executor = FakeExecutor()
     strategy = LargeOrderLimitUpBuyStrategy(
         StrategyConfig(stock_code="600001", params={"plan_amount": 100000, "record_dir": str(tmp_path)}),
@@ -751,6 +796,7 @@ def test_reseal_late_window_waits_for_cancel_before_follow_order(tmp_path):
     strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
     for number in range(150):
         strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
+    finish_validation_second(strategy, validation_clock)
     strategy.on_l2_order(event(price=8.0, volume=187500, no="late-big-1",
                                event_time=datetime(2026, 9, 8, 10, 0, 1)))
     strategy.on_l2_order(event(price=8.0, volume=187500, no="late-big-2",
@@ -763,7 +809,7 @@ def test_reseal_late_window_waits_for_cancel_before_follow_order(tmp_path):
     assert len(executor.orders) == 2
 
 
-def test_reseal_late_window_does_not_retry_after_partial_fill(tmp_path):
+def test_reseal_late_window_does_not_retry_after_partial_fill(tmp_path, validation_clock):
     executor = FakeExecutor()
     strategy = LargeOrderLimitUpBuyStrategy(
         StrategyConfig(stock_code="600001", params={"plan_amount": 100000, "record_dir": str(tmp_path)}),
@@ -774,6 +820,7 @@ def test_reseal_late_window_does_not_retry_after_partial_fill(tmp_path):
     strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
     for number in range(150):
         strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
+    finish_validation_second(strategy, validation_clock)
     first_order = executor.orders[0]
     first_order.status = OrderStatus.PART_CANCEL
     first_order.filled_quantity = 100
@@ -786,7 +833,7 @@ def test_reseal_late_window_does_not_retry_after_partial_fill(tmp_path):
     assert strategy._entry_filled is True
 
 
-def test_reseal_late_window_expires_without_two_big_orders(tmp_path):
+def test_reseal_late_window_expires_without_two_big_orders(tmp_path, validation_clock):
     executor = FakeExecutor()
     strategy = LargeOrderLimitUpBuyStrategy(
         StrategyConfig(stock_code="600001", params={"plan_amount": 100000, "record_dir": str(tmp_path)}),
@@ -797,6 +844,7 @@ def test_reseal_late_window_expires_without_two_big_orders(tmp_path):
     strategy.on_l2_order(event(price=8.0, volume=100, no="reseal-first"))
     for number in range(150):
         strategy.on_l2_order(event(price=8.0, volume=100, no=f"small-{number}"))
+    finish_validation_second(strategy, validation_clock)
     first_order = executor.orders[0]
     first_order.status = OrderStatus.CANCELED
     strategy.on_order_update(first_order)
@@ -806,6 +854,119 @@ def test_reseal_late_window_expires_without_two_big_orders(tmp_path):
                                event_time=datetime(2026, 9, 8, 10, 0, 6)))
     assert len(executor.orders) == 1
     assert strategy._entry_phase == "DONE"
+
+
+def make_validation_candidate(tmp_path):
+    executor = FakeExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(stock_code="600001", params={
+            "plan_amount": 100000, "record_dir": str(tmp_path),
+            "reseal_validation_order_count": 150,
+        }), executor, None,
+    )
+    _prepare_reseal_candidate(strategy)
+    strategy.on_l2_order(event(volume=100, no="trigger"))
+    return strategy, executor
+
+
+def test_validation_waits_one_second_then_timer_cancels_without_new_quotes(tmp_path, validation_clock):
+    strategy, executor = make_validation_candidate(tmp_path)
+    clock, timers = validation_clock
+    deadline = timers[-1]
+    for number in range(150):
+        strategy.on_l2_order(event(volume=100, no=f"small-{number}"))
+    clock[0] += 0.999
+    strategy._check_reseal_validation()
+    assert executor.cancels == []
+    assert strategy._reseal_validation_active
+    clock[0] = strategy._reseal_validation_started_monotonic + 1.0
+    deadline.function(*deadline.args)
+    assert len(executor.cancels) == 1
+    assert strategy._reseal_validation_result == "failed"
+    assert strategy._late_reseal_started_at == datetime(2026, 9, 8, 10, 0, 1)
+    deadline.function(*deadline.args)
+    assert len(executor.cancels) == 1
+
+
+def test_validation_counts_big_orders_after_150_before_one_second(tmp_path, validation_clock):
+    strategy, executor = make_validation_candidate(tmp_path)
+    clock, timers = validation_clock
+    for number in range(150):
+        strategy.on_l2_order(event(volume=100, no=f"small-{number}"))
+    clock[0] += 0.8
+    strategy.on_l2_order(event(volume=187500, no="big-151"))
+    strategy.on_l2_order(event(volume=187500, no="big-152"))
+    assert strategy._reseal_validation_result == "passed"
+    assert strategy._reseal_validation_orders_seen == 152
+    assert timers[-1].cancelled
+    assert executor.cancels == []
+
+
+def test_validation_two_big_orders_pass_immediately(tmp_path, validation_clock):
+    strategy, executor = make_validation_candidate(tmp_path)
+    strategy.on_l2_order(event(volume=187500, no="big-1"))
+    strategy.on_l2_order(event(volume=187500, no="big-2"))
+    assert strategy._reseal_validation_result == "passed"
+    assert strategy._reseal_validation_orders_seen == 2
+    assert executor.cancels == []
+
+
+def test_validation_real_timer_checks_without_market_callback(tmp_path, validation_clock, monkeypatch):
+    monkeypatch.setattr(strategy_module.threading, "Timer", RealTimer)
+    strategy, executor = make_validation_candidate(tmp_path)
+    cancelled = Event()
+    original_cancel = executor.cancel_order
+
+    def notify_cancel(*args, **kwargs):
+        result = original_cancel(*args, **kwargs)
+        cancelled.set()
+        return result
+
+    executor.cancel_order = notify_cancel
+    try:
+        for number in range(150):
+            strategy.on_l2_order(event(volume=100, no=f"small-{number}"))
+        validation_clock[0][0] += 1.0
+        assert cancelled.wait(3.0)
+        assert len(executor.cancels) == 1
+    finally:
+        strategy.stop()
+
+
+def test_validation_after_one_second_still_requires_150_orders(tmp_path, validation_clock):
+    strategy, executor = make_validation_candidate(tmp_path)
+    clock, timers = validation_clock
+    for number in range(100):
+        strategy.on_l2_order(event(volume=100, no=f"small-{number}"))
+    clock[0] += 1.0
+    timers[-1].function(*timers[-1].args)
+    assert executor.cancels == []
+    for number in range(100, 150):
+        strategy.on_l2_order(event(volume=100, no=f"small-{number}"))
+    assert len(executor.cancels) == 1
+
+
+@pytest.mark.parametrize("finish", ["filled", "stopped", "stale_timer", "cutoff"])
+def test_validation_deadline_does_not_cancel_finished_or_different_order(tmp_path, validation_clock, finish):
+    strategy, executor = make_validation_candidate(tmp_path)
+    clock, timers = validation_clock
+    deadline = timers[-1]
+    for number in range(150):
+        strategy.on_l2_order(event(volume=100, no=f"small-{number}"))
+    clock[0] += 1.0
+    if finish == "filled":
+        order = executor.orders[0]
+        order.status = OrderStatus.PART_SUCC
+        order.filled_quantity = 100
+        strategy.on_order_update(order)
+    elif finish == "stopped":
+        strategy.stop()
+    elif finish == "stale_timer":
+        strategy._active_order_uuid = "another-order"
+    else:
+        clock[0] += 5 * 3600
+    deadline.function(*deadline.args)
+    assert executor.cancels == []
 
 
 def test_filled_entry_disables_all_later_entries_for_the_stock(tmp_path):

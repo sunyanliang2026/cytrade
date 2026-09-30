@@ -9,9 +9,11 @@ from __future__ import annotations
 import csv
 import json
 import math
+import threading
 import time
 from collections import deque
 from datetime import datetime, time as dt_time
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,14 @@ from strategy.models import StrategyConfig
 from strategies.overnight_limit_up_buy.limit_price import LimitUpPriceProvider
 
 logger = get_logger("trade")
+
+
+def _serialized(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._event_lock:
+            return method(self, *args, **kwargs)
+    return guarded
 
 
 class LargeOrderLimitUpBuyStrategy(BaseStrategy):
@@ -57,6 +67,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
 
     def __init__(self, config: StrategyConfig, trade_executor=None, position_manager=None):
         super().__init__(config, trade_executor, position_manager)
+        self._event_lock = threading.RLock()
         params = dict(config.params or {})
         self._csv_path = Path(str(params.get("csv_path") or self.DEFAULT_POOL))
         self._stock_name = str(params.get("stock_name") or params.get("name") or "").strip()
@@ -76,10 +87,13 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             params.get("reseal_validation_big_order_min_amount", 1_500_000.0) or 1_500_000.0
         )
         self._reseal_validation_order_count = max(
-            1, int(params.get("reseal_validation_order_count", 50) or 50)
+            1, int(params.get("reseal_validation_order_count", 150) or 150)
         )
         self._reseal_validation_big_order_count = max(
             1, int(params.get("reseal_validation_big_order_count", 2) or 2)
+        )
+        self._reseal_validation_min_seconds = max(
+            1.0, float(params.get("reseal_validation_min_seconds", 1.0))
         )
         self._reseal_validation_continue_on_failure = bool(
             params.get("reseal_validation_continue_on_failure", True)
@@ -134,6 +148,9 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._reseal_validation_orders_seen = 0
         self._reseal_validation_big_orders_seen = 0
         self._reseal_validation_result = ""
+        self._reseal_validation_started_monotonic = 0.0
+        self._reseal_validation_last_record: dict[str, Any] = {}
+        self._reseal_validation_timer = None
         self._cancel_requested_count = 0
         self._late_reseal_active = False
         self._late_reseal_started_at: datetime | None = None
@@ -199,6 +216,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                         "reseal_validation_big_order_min_amount": self._validation_big_order_min_amount,
                         "reseal_validation_order_count": self._reseal_validation_order_count,
                         "reseal_validation_big_order_count": self._reseal_validation_big_order_count,
+                        "reseal_validation_min_seconds": self._reseal_validation_min_seconds,
                         "reseal_validation_continue_on_failure": self._reseal_validation_continue_on_failure,
                         "reseal_late_window_seconds": self._reseal_late_window_seconds,
                         "reseal_min_prior_seal_amount": self._reseal_min_prior_seal_amount,
@@ -259,6 +277,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         )
         return True
 
+    @_serialized
     def on_tick(self, tick: TickData) -> None:
         if tick.stock_code != self.stock_code:
             return
@@ -284,6 +303,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                 self._session_low_price / self._open_price,
             )
 
+    @_serialized
     def on_l2_quote(self, event: L2QuoteEvent) -> None:
         if event.stock_code != self.stock_code:
             return
@@ -387,6 +407,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             # The transition is handled above only after a qualifying observed seal.
             if self._last_seal_qualified:
                 self._set_entry_phase("WAIT_RESEAL", "limit_up_reopened")
+    @_serialized
     def on_l2_order(self, event: L2OrderEvent) -> None:
         if event.stock_code != self.stock_code:
             return
@@ -446,6 +467,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         if post_window_active:
             self._observe_post_order_record(record)
 
+    @_serialized
     def on_l2_transaction(self, event: L2TransactionEvent) -> None:
         if event.stock_code != self.stock_code:
             return
@@ -480,6 +502,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             self._update_post_order_record(ref)
         self._maybe_finish_post_order_window(event.event_time)
 
+    @_serialized
     def on_l2_orderqueue(self, event: L2OrderQueueEvent) -> None:
         if event.stock_code == self.stock_code:
             self._last_queue = event
@@ -522,6 +545,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         )
         remark = f"L2涨停大单打板 trigger={trigger.get('entrust_no', '')} front={front_volume}股"
         order = self.add_position(price, quantity, remark)
+        submit_monotonic = time.monotonic()
         if order is None:
             self._log_event("buy_blocked", reason="order_executor_unavailable", trigger=trigger)
             return
@@ -556,16 +580,21 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             self._reseal_validation_orders_seen = 0
             self._reseal_validation_big_orders_seen = 0
             self._reseal_validation_result = "pending"
+            self._reseal_validation_started_monotonic = submit_monotonic
+            self._reseal_validation_last_record = trigger
+            self._schedule_reseal_validation_check()
             self._log_event(
                 "reseal_validation_started",
                 order_uuid=self._active_order_uuid,
                 required_orders=self._reseal_validation_order_count,
                 required_big_orders=self._reseal_validation_big_order_count,
                 big_order_min_amount=self._validation_big_order_min_amount,
+                min_observation_seconds=self._reseal_validation_min_seconds,
             )
             logger.info(
-                "[LARGE_ORDER] [验证] %s 回封验证开始，观察%d笔，要求大单%d笔",
+                "[LARGE_ORDER] [验证] %s 回封验证开始，至少%d笔且%.1f秒，大单%d笔即通过",
                 self._display_name(), self._reseal_validation_order_count,
+                self._reseal_validation_min_seconds,
                 self._reseal_validation_big_order_count,
             )
         self._start_post_order_window(
@@ -592,21 +621,65 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
     def _observe_reseal_validation(self, record: dict[str, Any]) -> None:
         """Evaluate only orders received after our reseal order was submitted."""
         self._reseal_validation_orders_seen += 1
+        self._reseal_validation_last_record = record
         if bool(record.get("is_big_order")):
             self._reseal_validation_big_orders_seen += 1
             self._big_order_count += 1
 
-        if self._reseal_validation_orders_seen < self._reseal_validation_order_count:
+        self._check_reseal_validation()
+
+    def _cancel_reseal_validation_timer(self) -> None:
+        if self._reseal_validation_timer is not None:
+            self._reseal_validation_timer.cancel()
+            self._reseal_validation_timer = None
+
+    def _schedule_reseal_validation_check(self) -> None:
+        self._cancel_reseal_validation_timer()
+        remaining = self._reseal_validation_min_seconds - (
+            time.monotonic() - self._reseal_validation_started_monotonic
+        )
+        self._reseal_validation_timer = threading.Timer(
+            max(0.001, remaining), self._on_reseal_validation_deadline,
+            args=(self._active_order_uuid,),
+        )
+        self._reseal_validation_timer.daemon = True
+        self._reseal_validation_timer.start()
+
+    @_serialized
+    def _on_reseal_validation_deadline(self, order_uuid: str) -> None:
+        if not self._reseal_validation_active or order_uuid != self._active_order_uuid:
             return
+        self._reseal_validation_timer = None
+        self._check_reseal_validation(from_timer=True)
+        if (
+            self._reseal_validation_active
+            and time.monotonic() - self._reseal_validation_started_monotonic < self._reseal_validation_min_seconds
+        ):
+            self._schedule_reseal_validation_check()
+
+    def _check_reseal_validation(self, *, from_timer: bool = False) -> None:
+        if not self._reseal_validation_active:
+            return
+        if self._entry_filled or not self._active_order_uuid or self._entry_phase == "DONE":
+            self._reseal_validation_active = False
+            self._cancel_reseal_validation_timer()
+            return
+        if from_timer and datetime.now().time() >= dt_time(14, 57):
+            self._reseal_validation_active = False
+            self._cancel_reseal_validation_timer()
+            return
+        elapsed = max(0.0, time.monotonic() - self._reseal_validation_started_monotonic)
 
         if self._reseal_validation_big_orders_seen >= self._reseal_validation_big_order_count:
             self._reseal_validation_active = False
+            self._cancel_reseal_validation_timer()
             self._reseal_validation_result = "passed"
             self._log_event(
                 "reseal_validation_passed",
                 observed_orders=self._reseal_validation_orders_seen,
                 observed_big_orders=self._reseal_validation_big_orders_seen,
                 big_order_min_amount=self._validation_big_order_min_amount,
+                observation_seconds=round(elapsed, 3),
             )
             logger.info(
                 "[LARGE_ORDER] [验证] %s 通过，观察%d笔，大单%d笔",
@@ -615,7 +688,13 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             )
             return
 
+        if (
+            self._reseal_validation_orders_seen < self._reseal_validation_order_count
+            or elapsed < self._reseal_validation_min_seconds
+        ):
+            return
         self._reseal_validation_active = False
+        self._cancel_reseal_validation_timer()
         self._reseal_validation_result = "failed"
         cancel_order = getattr(self._trade_executor, "cancel_order", None)
         requested = bool(cancel_order(self._active_order_uuid, remark="reseal validation failed")) if callable(cancel_order) else False
@@ -628,6 +707,9 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             and bool(self._active_order_uuid)
         )
         if can_continue:
+            record = self._reseal_validation_last_record
+            if from_timer:
+                record = {**record, "event_time": datetime.now()}
             self._start_late_reseal_window(record)
         else:
             self._late_reseal_active = False
@@ -636,6 +718,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._log_event(
             "reseal_validation_failed",
             observed_orders=self._reseal_validation_orders_seen,
+            observation_seconds=round(elapsed, 3),
             observed_big_orders=self._reseal_validation_big_orders_seen,
             required_big_orders=self._reseal_validation_big_order_count,
             cancel_requested=requested,
@@ -643,8 +726,9 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             late_window_seconds=self._reseal_late_window_seconds if can_continue else 0.0,
         )
         logger.info(
-            "[LARGE_ORDER] [撤单] %s 验证失败，观察%d笔，大单%d/%d，撤单%s",
+            "[LARGE_ORDER] [撤单] %s 验证失败，观察%d笔/%.3f秒，大单%d/%d，撤单%s",
             self._display_name(), self._reseal_validation_orders_seen,
+            elapsed,
             self._reseal_validation_big_orders_seen, self._reseal_validation_big_order_count,
             "已提交" if requested else "未提交",
         )
@@ -746,11 +830,17 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             self._display_name(), int(getattr(order, "filled_quantity", 0) or 0),
         )
 
+    @_serialized
     def _on_order_update_hook(self, order) -> None:
         if str(getattr(order, "order_uuid", "")) != self._active_order_uuid:
             return
         status = getattr(order, "status", None)
         filled_quantity = int(getattr(order, "filled_quantity", 0) or 0)
+        if filled_quantity > 0 or status in (
+            OrderStatus.SUCCEEDED, OrderStatus.CANCELED, OrderStatus.PART_CANCEL,
+            OrderStatus.PARTSUCC_CANCEL, OrderStatus.JUNK, OrderStatus.UNKNOWN,
+        ):
+            self._cancel_reseal_validation_timer()
         if status in (OrderStatus.PARTSUCC_CANCEL, OrderStatus.CANCELED, OrderStatus.PART_CANCEL) and filled_quantity > 0:
             self._mark_entry_filled(order)
             return
@@ -846,7 +936,10 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         if post_order_path.stat().st_size == 0:
             csv.writer(self._post_order_handle).writerow(self.POST_ORDER_HEADERS)
 
+    @_serialized
     def stop(self) -> None:
+        self._reseal_validation_active = False
+        self._cancel_reseal_validation_timer()
         self._finish_post_order_window()
         for attr in ("_raw_handle", "_neighbor_handle", "_snapshot_handle", "_post_order_handle", "_latency_handle"):
             handle = getattr(self, attr, None)

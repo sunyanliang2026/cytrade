@@ -29,7 +29,7 @@ trigger's exchange `event_time` and the order submission log time.
 ## Current Entry Rules
 
 - First-seal entries require `bid1 == exact limit-up price`, a bid-one seal above 60 million yuan, then more than 10 million yuan cumulatively across limit-up BUY `l2order` records of at least 2 million yuan each. The opening-dip requirement remains in effect.
-- Reseal entries submit on the first observed limit-up BUY `l2order`, then inspect the next 50 limit-up BUY orders. The order is retained only when at least two are 1.5 million yuan orders; otherwise the strategy requests cancellation of the unfilled order and disables further entries for that stock instance.
+- 回封先卡位再验证：下单后累计出现两笔不低于150万元的大单即通过。大单不足时，必须同时观察至少150笔（配置值）且本地下单后至少1秒，才撤销未成交单；不足1秒时继续统计后续大单，超过1秒但不足150笔时继续等笔数。`reseal_validation_min_seconds` 默认1秒，单调时钟和独立定时器负责到时检查，无新行情也会检查。失败后沿用5秒补充观察及撤单确认后最多追随一次的规则；成交、停止和14:57后不会因该定时器撤单。
 - After either entry, the next 30 seconds of 1.5 million yuan limit-up buy orders are written to a Chinese, one-order-per-row CSV with order, fill, cancel, remaining amount, and status.
 - A reseal is eligible only after the prior sealed period was observed above 100 million yuan and longer than 10 seconds. The reopened period must last at least 3 seconds; no reopened-low-price condition applies.
 - Planned rule: when a pool stock's opening gain is below 3.5%, its monitoring will stop for that trading day. This rule is documented but not implemented yet.
