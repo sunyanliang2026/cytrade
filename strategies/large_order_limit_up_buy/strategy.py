@@ -138,6 +138,8 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._blocked_active_count = 0
         self._blocked_position_count = 0
         self._pre_close = 0.0
+        self._excluded_low_gain = False
+        self._exclusion_low_price = 0.0
         self._last_quote: L2QuoteEvent | None = None
         self._orders_by_no: dict[str, dict[str, Any]] = {}
         self._queue_orders: deque[dict[str, Any]] = deque(maxlen=2000)
@@ -183,7 +185,37 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         return {"tick", "l2quote", "l2order", "l2transaction", "l2orderqueue"}
 
     def current_data_kinds(self) -> set[str]:
+        if self._excluded_low_gain:
+            return set()
         return self.required_data_kinds()
+
+    def _check_low_gain_exclusion(self, low_price: float, pre_close: float) -> bool:
+        if self._excluded_low_gain:
+            return True
+        if pre_close > 0:
+            self._pre_close = pre_close
+        if low_price > 0:
+            self._exclusion_low_price = self._min_positive(self._exclusion_low_price, low_price)
+        low_price = self._exclusion_low_price
+        if low_price <= 0 or self._pre_close <= 0:
+            return False
+        if low_price >= self._pre_close * 1.015 - 1e-8:
+            return False
+        self._excluded_low_gain = True
+        self._reseal_validation_active = False
+        self._cancel_reseal_validation_timer()
+        self._late_reseal_active = False
+        self._reseal_ready = False
+        self._set_entry_phase("DONE", "session_low_gain_below_1_5_percent")
+        self._finish_post_order_window()
+        gain = (low_price / self._pre_close - 1.0) * 100.0
+        self._log_event("low_gain_excluded", low_price=low_price, pre_close=self._pre_close,
+                        lowest_gain_percent=round(gain, 4), cancel_requested=False)
+        logger.info(
+            "[LARGE_ORDER] [停止监控] %s 最低价=%.3f 最低涨幅=%.2f%%，低于1.5%%；取消行情订阅，已有挂单保留",
+            self._display_name(), low_price, gain,
+        )
+        return True
 
     def select_stocks(self) -> list[StrategyConfig]:
         path = self._csv_path
@@ -284,6 +316,8 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         event_time = tick.data_time or tick.recv_time
         if not self._is_continuous_trading_time(event_time):
             return
+        if self._check_low_gain_exclusion(float(tick.low or 0.0), float(tick.pre_close or 0.0)):
+            return
         open_price = float(tick.open or 0.0)
         low_price = float(tick.low or 0.0)
         if open_price > 0 and self._open_price <= 0:
@@ -314,6 +348,10 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._write_latency_diagnostic(event, strategy_time, raw_done_time, time.perf_counter() - write_start)
         quote_time = event.event_time or event.recv_time
         if isinstance(quote_time, datetime) and quote_time.time() < dt_time(9, 30):
+            return
+        if self._check_low_gain_exclusion(
+            float((event.raw_xt_fields or {}).get("low") or 0.0), float(event.pre_close or 0.0),
+        ):
             return
         self._last_quote = event
         if isinstance(quote_time, datetime) and quote_time.time() >= dt_time(14, 57):
@@ -410,6 +448,8 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
     @_serialized
     def on_l2_order(self, event: L2OrderEvent) -> None:
         if event.stock_code != self.stock_code:
+            return
+        if self._excluded_low_gain:
             return
         strategy_time = datetime.now()
         self._write_raw("l2order", event.event_time, event.raw_xt_fields)
@@ -515,7 +555,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         reseal_validation: bool = False,
         late_reseal_follow: bool = False,
     ) -> None:
-        if self._entry_filled:
+        if self._entry_filled or self._excluded_low_gain:
             return
         if self._active_order_uuid:
             self._blocked_active_count += 1
@@ -892,6 +932,8 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         )
 
     def console_status(self) -> str:
+        if self._excluded_low_gain:
+            return "最低涨幅不足已剔除"
         if self._entry_filled:
             return "已成交"
         if self._entry_phase == "DONE" and self._reseal_validation_result == "failed":

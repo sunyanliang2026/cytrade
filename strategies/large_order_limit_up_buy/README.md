@@ -28,6 +28,7 @@ trigger's exchange `event_time` and the order submission log time.
 
 ## Current Entry Rules
 
+- 连续竞价开始后，当日最低价严格低于 `昨收价 × 1.015`（最低涨幅不足+1.5%）时，首封和回封都停止后续买入，并在订阅同步时取消该实例的 tick/L2 行情需求。等于+1.5%不剔除；最低价或昨收价缺失时暂不判断。已有挂单不撤销，成交回报仍正常处理；若其他策略需要同一股票，保留其订阅。
 - First-seal entries require `bid1 == exact limit-up price`, a bid-one seal above 60 million yuan, then more than 10 million yuan cumulatively across limit-up BUY `l2order` records of at least 2 million yuan each. The opening-dip requirement remains in effect.
 - 回封先卡位再验证：下单后累计出现两笔不低于150万元的大单即通过。大单不足时，必须同时观察至少150笔（配置值）且本地下单后至少1秒，才撤销未成交单；不足1秒时继续统计后续大单，超过1秒但不足150笔时继续等笔数。`reseal_validation_min_seconds` 默认1秒，单调时钟和独立定时器负责到时检查，无新行情也会检查。失败后沿用5秒补充观察及撤单确认后最多追随一次的规则；成交、停止和14:57后不会因该定时器撤单。
 - After either entry, the next 30 seconds of 1.5 million yuan limit-up buy orders are written to a Chinese, one-order-per-row CSV with order, fill, cancel, remaining amount, and status.

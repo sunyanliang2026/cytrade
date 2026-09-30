@@ -869,6 +869,53 @@ def make_validation_candidate(tmp_path):
     return strategy, executor
 
 
+@pytest.mark.parametrize("low,excluded", [(10.14, True), (10.15, False), (10.16, False), (0.0, False)])
+def test_session_low_gain_exclusion_boundary(tmp_path, low, excluded):
+    strategy = make_strategy(tmp_path)
+    strategy.on_tick(TickData(stock_code="600001", low=low, pre_close=10.0,
+                              data_time=datetime(2026, 9, 8, 9, 30)))
+    assert strategy._excluded_low_gain is excluded
+    assert (strategy.current_data_kinds() == set()) is excluded
+    if excluded:
+        assert strategy.console_status() == "最低涨幅不足已剔除"
+
+
+def test_low_gain_exclusion_ignores_auction_and_waits_for_preclose(tmp_path):
+    strategy = make_strategy(tmp_path)
+    strategy.on_tick(TickData(stock_code="600001", low=10.0, pre_close=10.0,
+                              data_time=datetime(2026, 9, 8, 9, 25)))
+    assert not strategy._excluded_low_gain
+    strategy.on_tick(TickData(stock_code="600001", low=10.14,
+                              data_time=datetime(2026, 9, 8, 9, 30)))
+    assert not strategy._excluded_low_gain
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", pre_close=10.0, bid1=10.14,
+                                     event_time=datetime(2026, 9, 8, 9, 30)))
+    assert strategy._excluded_low_gain
+
+
+def test_low_gain_exclusion_preserves_order_and_receives_fill(tmp_path, validation_clock):
+    strategy, executor = make_validation_candidate(tmp_path)
+    timer = validation_clock[1][-1]
+    order = executor.orders[0]
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", pre_close=7.9, bid1=8.0,
+                                     raw_xt_fields={"low": 7.9},
+                                     event_time=datetime(2026, 9, 8, 10, 0)))
+    assert strategy._excluded_low_gain
+    assert timer.cancelled
+    assert strategy._active_order_uuid == order.order_uuid
+    for number in range(160):
+        strategy.on_l2_order(event(volume=187500, no=f"after-exclusion-{number}"))
+    validation_clock[0][0] += 1.0
+    timer.function(*timer.args)
+    assert executor.cancels == []
+    assert len(executor.orders) == 1
+    order.status = OrderStatus.SUCCEEDED
+    order.filled_quantity = order.quantity
+    strategy.on_order_update(order)
+    assert strategy._entry_filled
+    assert strategy.current_data_kinds() == set()
+
+
 def test_validation_waits_one_second_then_timer_cancels_without_new_quotes(tmp_path, validation_clock):
     strategy, executor = make_validation_candidate(tmp_path)
     clock, timers = validation_clock

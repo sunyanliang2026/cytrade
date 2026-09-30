@@ -229,7 +229,7 @@ def log_monitor_summary(logger, strategies, data_sub) -> None:
     groups = {}
     for strategy in strategies:
         groups.setdefault(strategy.console_status(), []).append(strategy)
-    order = ["已成交", "验证失败已撤单", "等待首封", "等待开板", "等待回封", "等待首条行情", "当日结束"]
+    order = ["已成交", "最低涨幅不足已剔除", "验证失败已撤单", "等待首封", "等待开板", "等待回封", "等待首条行情", "当日结束"]
     for status in order:
         items = groups.get(status, [])
         if items:

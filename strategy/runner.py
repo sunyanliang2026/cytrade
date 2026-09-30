@@ -1013,6 +1013,8 @@ class StrategyRunner:
         current_data_kinds = getattr(strategy, "current_data_kinds", None)
         if callable(current_data_kinds):
             raw_kinds = current_data_kinds()
+            if raw_kinds is not None and not raw_kinds:
+                return set()
         else:
             raw_kinds = getattr(strategy.__class__, "required_data_kinds", lambda: {"tick"})()
         normalized = {str(kind or "").strip().lower() for kind in (raw_kinds or {"tick"})}

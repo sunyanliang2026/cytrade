@@ -422,6 +422,24 @@ def test_runner_can_register_batch_before_one_subscription_sync():
     assert set(fake_data_sub.l2_map) == {"000001", "600001"}
 
 
+def test_runner_unsubscribes_explicit_empty_kinds_but_keeps_strategy_and_shared_subscriptions():
+    fake_data_sub = _FakeDataSubscription()
+    runner = StrategyRunner(data_subscription=fake_data_sub)
+    strategy = _DummyL2Strategy(StrategyConfig(stock_code="000001"))
+    runner.add_strategy(strategy)
+    runner.sync_subscriptions()
+    strategy.current_data_kinds = lambda: set()
+    runner.sync_subscriptions()
+    assert fake_data_sub.tick_codes == set()
+    assert fake_data_sub.l2_map == {}
+    assert runner.get_strategy(strategy.strategy_id) is strategy
+    other = _DummyTickStrategy(StrategyConfig(stock_code="000001"))
+    runner.add_strategy(other)
+    runner.sync_subscriptions()
+    assert fake_data_sub.tick_codes == {"000001"}
+    assert fake_data_sub.l2_map == {}
+
+
 def test_runner_expands_dynamic_l2_subscription_after_quote():
     fake_data_sub = _FakeDataSubscription()
     runner = StrategyRunner(data_subscription=fake_data_sub)
