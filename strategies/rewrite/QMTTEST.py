@@ -34,7 +34,7 @@ RESEAL_VALIDATION_MIN_SECONDS = 1.0
 RESEAL_VALIDATION_CONTINUE_ON_FAILURE = True
 RESEAL_LATE_WINDOW_SECONDS = 5.0
 
-PERIODS = ("tick", "l2quote", "l2quoteaux", "l2transaction", "l2order", "l2transactioncount", "l2orderqueue")
+PERIODS = ("tick", "l2quote", "l2order")
 L2_PERIODS = set(PERIODS[1:])
 STATE_WAIT_INITIAL = "WAIT_INITIAL_QUOTE"
 STATE_READY = "READY"
@@ -108,7 +108,13 @@ def _event_time(value=None):
     """Return HHMMSS from QMT time/stime values; never use it for elapsed time."""
     if value is None:
         return ""
-    text = str(value)
+    text = str(value).strip()
+    if "." in text:
+        integer = text.split(".", 1)[0]
+        if integer.isdigit() and len(integer) >= 14:
+            return integer[8:14]
+        if integer.isdigit() and len(integer) <= 6:
+            return integer.zfill(6)
     if text.isdigit():
         if len(text) >= 14 and len(text) <= 18:
             return text[8:14]
@@ -574,7 +580,9 @@ def _handle_quote(code, period, payload):
         if not inst:
             return
         data = _owned_payload(code, payload)
-        inst["last_tick"] = data
+        is_l2quote = period == "l2quote"
+        if is_l2quote:
+            inst["last_tick"] = data
         event_time = _event_time(_field(data, "stime", "time", "timestamp"))
         if event_time:
             inst["last_event_time"] = event_time
@@ -582,22 +590,26 @@ def _handle_quote(code, period, payload):
         limit_up = _limit_price(inst, data)
         is_continuous = bool(event_time and _in_continuous(event_time))
         bid, bid_vol, ask, last, low = _quote_values(inst, data, track_day=is_continuous)
-        if not limit_up or not bid:
-            return
         if inst["last_close"] is None:
             inst["last_close"] = _safe_float(_field(data, "lastClose", "preClose", "pre_close"))
-        if event_time and _in_auction(event_time):
-            return
-        if event_time and not _in_continuous(event_time):
-            _check_validation(inst)
+        if not is_continuous:
+            if is_l2quote:
+                _check_validation(inst)
             return
         if _skip_low_gain(inst):
+            return
+        if not is_l2quote:
+            return
+        if not limit_up or not bid:
             return
         bid_at_limit = abs(bid - limit_up) < 1e-8
         seal_amount = _amount(bid, bid_vol)
         inst["last_tick"]["bid_at_limit"] = bid_at_limit
         if inst["state"] == STATE_WAIT_INITIAL:
-            _set_state(inst, STATE_READY, "收到连续竞价有效行情")
+            if bid_at_limit:
+                _set_state(inst, STATE_WAIT_REOPEN, "盘中启动时已在涨停价，等待回封")
+            else:
+                _set_state(inst, STATE_READY, "收到连续竞价有效行情")
         if inst["state"] == STATE_READY:
             if bid_at_limit:
                 if inst["seal_started"] is None:
