@@ -229,12 +229,22 @@ def _schedule_auction_retry():
         _log("[竞价] 重试定时器创建失败 %r" % (exc,))
 
 
+def _script_root():
+    """Return the script directory when running as a file, else an empty path."""
+    script_file = globals().get("__file__")
+    if script_file:
+        try:
+            return os.path.dirname(os.path.abspath(script_file))
+        except Exception:
+            pass
+    return ""
+
+
 def _paths():
     roots = []
-    try:
-        roots.append(os.path.dirname(os.path.abspath(__file__)))
-    except Exception:
-        pass
+    script_root = _script_root()
+    if script_root:
+        roots.append(script_root)
     roots.extend([os.getcwd(), os.path.dirname(os.getcwd()), r"C:\光大证券金阳光QMT实盘"])
     seen = set()
     for root in roots:
@@ -751,8 +761,10 @@ def init(C):
             except Exception as exc:
                 _log("[初始化] 交易账户注册失败 %r" % (exc,))
         _DAY = _dt.datetime.now().strftime("%Y%m%d")
-        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "userdata", "log")
-        if not os.path.isdir(log_dir):
+        script_root = _script_root()
+        log_dir = (os.path.join(script_root, "..", "userdata", "log")
+                   if script_root else "")
+        if not log_dir or not os.path.isdir(log_dir):
             log_dir = os.path.join(os.getcwd(), "userdata", "log")
         try:
             if not os.path.isdir(log_dir):
@@ -859,4 +871,3 @@ def stop(C):
                     handle.close()
             except Exception:
                 pass
-
