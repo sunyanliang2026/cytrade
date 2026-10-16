@@ -41,10 +41,14 @@ C.cancel_schedule_run(task_id_or_name)
 ```python
 passorder(23, ORDER_TYPE_BUY, ACCOUNT_ID, code,
           PRICE_TYPE_LIMIT, price, quantity,
-          STRATEGY_NAME, 1, user_order_id, {}, C)
+          STRATEGY_NAME, 1, user_order_id, C)
 ```
 
+`user_order_id` is the investment remark (`userOrderId`) used to associate order or deal callbacks; pass `ContextInfo` immediately after it.
+
 回报回调签名为 `order_callback(ContextInfo, orderInfo)` 和 `deal_callback(ContextInfo, dealInfo)`。订单号异步查询使用 `get_last_order_id(accountID, strAccountType, strDatatype, strategyName)`；撤单使用 `cancel(orderId, accountId, accountType, ContextInfo)`。这些接口的字段名可能随 QMT 版本不同，脚本对常见字典键和对象属性做了兼容读取，但仍需以当前券商版本的实际回调为准。
+
+订单和成交回调需要分别确认 `m_nOrderID`、证券代码及市场、订单累计成交量和成交回报单笔数量。回调可能先于订单号查询到达；订单号未知时，只能用唯一的待提交订单及代码、价格、数量进行关联。成交回报用 `m_nVolume` 等单笔成交量累计，并用 `m_nVolumeTraded` 作为订单侧累计量交叉核验。
 
 ## 编码、路径和日志
 
@@ -53,5 +57,11 @@ passorder(23, ORDER_TYPE_BUY, ACCOUNT_ID, code,
 ## 验证重点
 
 订阅接口返回成功只代表订阅请求被接受，不代表已经收到行情。交易时段应分别确认：普通 tick、`l2quote`、`l2order` 的首条回调，原始 JSONL 的持续增长，以及回调时间与 QMT 主日志时间的关系。盘后出现“无法连接行情服务”不能单独证明脚本写法错误。
+
+调试阶段可从控制台或 `qmt_strategy_YYYYMMDD.log` 查找 `[运行]`、`[股票池]`、`[订阅]`、`[回调首条]` 和 `[汇总]`。`[运行] subscriptions=...` 只能证明订阅调用返回了正数；三个周期都出现 `[回调首条]` 且汇总计数持续增加，才证明实际行情回调正常。`event_time` 与日志行时间或 JSONL 的 `received_at` 之间的差值用于后续延迟分析，不应在策略回调中做同步等待。
+
+当前调试脚本对超过 1000ms 的事件时间延时输出 `[延时警告]`，同一周期最多每 10 秒输出一次。汇总的 `延时=` 字段分别统计 `tick`、`l2quote`、`l2order` 的有效样本/总样本、超时次数、平均值、最大值和最近值，并附带逐股票聚合的回调间隔均值/最大值。计算延时优先用 QMT `time` 字段，交易时段状态仍看 `stime`。比较 tick 与 l2quote 时应使用相同时段的累计统计，并检查有效样本数；延时只对毫秒精度的事件时间计算，结果依赖 QMT 行情时钟与运行主机时钟同步，负延时或无效时间戳会排除在统计之外。
+
+判断哪路先收到涨停买一时，查找 `[LIMIT_UP_FIRST]` 和 `[LIMIT_UP_COMPARE]`：每只股票分别记录订阅后首次 `bid1 == 涨停价` 的 `tick` 与 `l2quote` 回调接收时刻，配对时打印先到者与毫秒差。`[涨停首报汇总]` 给出覆盖、配对、胜出次数和差值范围。它不补录启动前已经发生的首封；需要多个交易日的配对结果才能比较稳定性。
 
 策略可以盘中启动。若错过 09:25 竞价窗口，不应把盘中快照当作竞价结果；连续竞价中第一条有效 `l2quote` 若已在涨停价，模型从 `WAIT_REOPEN` 开始观察，等待启动后可验证的开板和回封。

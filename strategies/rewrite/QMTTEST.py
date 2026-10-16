@@ -35,6 +35,9 @@ RESEAL_VALIDATION_CONTINUE_ON_FAILURE = True
 RESEAL_LATE_WINDOW_SECONDS = 5.0
 
 PERIODS = ("tick", "l2quote", "l2order")
+DEBUG_SUMMARY_INTERVAL_SECONDS = 60
+DEBUG_LATENCY_WARN_THRESHOLD_MS = 1000.0
+DEBUG_LATENCY_WARN_INTERVAL_SECONDS = 10.0
 L2_PERIODS = set(PERIODS[1:])
 STATE_WAIT_INITIAL = "WAIT_INITIAL_QUOTE"
 STATE_READY = "READY"
@@ -56,15 +59,28 @@ _LOCK = _NoopLock()
 _C = None
 _INSTANCES = {}
 _SUBSCRIPTIONS = []
+_SUB_SUCCESS = 0
+_SUB_FAILED = 0
 _LOG = None
 _RAW_LOG = None
+_LOG_PATH = ""
+_RAW_LOG_PATH = ""
 _DAY = ""
 _LAST_SUMMARY = 0.0
 _COUNTERS = {"orders": 0, "deals": 0, "cancels": 0, "l2": 0, "quotes": 0}
+_PERIOD_COUNTS = {}
+_FIRST_CALLBACKS = {}
+_LAST_EVENT_TIMES = {}
+_LATENCY_STATS = {}
+_LATENCY_LAST_WARN = {}
+_LAST_RECEIVED_AT = {}
+_GAP_STATS = {}
+_LIMIT_UP_FIRSTS = {}
 _RAW_BUFFER = []
 _RAW_FLUSH_TIMER = None
 _RAW_DROPPED = 0
 _AUCTION_RETRY_TIMER = None
+_POOL_PATH = ""
 
 
 def _now():
@@ -134,6 +150,70 @@ def _event_time(value=None):
     return text.replace(":", "")[-6:]
 
 
+def _event_seconds(value=None):
+    """Return seconds since midnight, retaining milliseconds when available."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    integer, dot, fraction = text.partition(".")
+    digits = "".join(ch for ch in integer if ch.isdigit())
+    fraction = "".join(ch for ch in fraction if ch.isdigit()) if dot else ""
+    if len(digits) == 13:
+        try:
+            stamp = _dt.datetime.fromtimestamp(int(digits) / 1000.0)
+            return (stamp.hour * 3600.0 + stamp.minute * 60.0 + stamp.second +
+                    stamp.microsecond / 1000000.0)
+        except Exception:
+            return None
+    if len(digits) >= 14:
+        hhmmss = digits[8:14]
+        extra = digits[14:] + fraction
+    elif len(digits) >= 9:
+        hhmmss = digits[:6]
+        extra = digits[6:] + fraction
+    elif len(digits) >= 6:
+        hhmmss = digits[-6:]
+        extra = fraction
+    else:
+        return None
+    try:
+        hour, minute, second = int(hhmmss[:2]), int(hhmmss[2:4]), int(hhmmss[4:6])
+        if hour > 23 or minute > 59 or second > 59:
+            return None
+        milliseconds = int((extra + "000")[:3]) if extra else 0
+        return hour * 3600.0 + minute * 60.0 + second + milliseconds / 1000.0
+    except Exception:
+        return None
+
+
+def _event_has_milliseconds(value=None):
+    if value is None:
+        return False
+    text = str(value).strip()
+    integer, dot, fraction = text.partition(".")
+    digits = "".join(ch for ch in integer if ch.isdigit())
+    if dot and any(ch.isdigit() for ch in fraction):
+        return True
+    if len(digits) == 13 or len(digits) >= 17:
+        return True
+    return 9 <= len(digits) <= 12
+
+
+def _latency_ms(event_value, received_at):
+    if not _event_has_milliseconds(event_value):
+        return None
+    event_seconds = _event_seconds(event_value)
+    if event_seconds is None:
+        return None
+    received = _dt.datetime.fromtimestamp(received_at)
+    received_seconds = (received.hour * 3600.0 + received.minute * 60.0 +
+                        received.second + received.microsecond / 1000000.0)
+    delay_ms = (received_seconds - event_seconds) * 1000.0
+    # A negative value means the two clocks are not directly comparable. Do not
+    # turn clock skew into a false low-latency result or a warning.
+    return delay_ms if delay_ms >= 0 else None
+
+
 def _in_continuous(event_time):
     return "093000" <= event_time < "145700"
 
@@ -166,8 +246,54 @@ def _json_default(value):
 
 def _write_raw(code, period, payload):
     global _RAW_DROPPED
+    received_at = time.time()
+    event_value = _field(payload, "stime", "time")
+    latency_value = _field(payload, "time", "stime")
+    event_time = _event_time(event_value)
+    latency_ms = _latency_ms(latency_value, received_at)
     _COUNTERS["l2" if period in L2_PERIODS else "quotes"] += 1
-    record = {"received_at": time.time(), "code": code, "period": period, "data": payload}
+    _PERIOD_COUNTS[period] = _PERIOD_COUNTS.get(period, 0) + 1
+    _LAST_EVENT_TIMES[period] = event_time or ""
+    stats = _LATENCY_STATS.setdefault(period, {
+        "samples": 0, "valid": 0, "over_threshold": 0,
+        "sum_ms": 0.0, "max_ms": None, "last_ms": None,
+    })
+    stats["samples"] += 1
+    gap_key = (period, code)
+    previous_received_at = _LAST_RECEIVED_AT.get(gap_key)
+    if previous_received_at is not None:
+        gap_ms = max(0.0, (received_at - previous_received_at) * 1000.0)
+        gap_stats = _GAP_STATS.setdefault(period, {"count": 0, "sum_ms": 0.0, "max_ms": 0.0})
+        gap_stats["count"] += 1
+        gap_stats["sum_ms"] += gap_ms
+        gap_stats["max_ms"] = max(gap_stats["max_ms"], gap_ms)
+    _LAST_RECEIVED_AT[gap_key] = received_at
+    if latency_ms is not None:
+        stats["valid"] += 1
+        stats["sum_ms"] += latency_ms
+        stats["last_ms"] = latency_ms
+        stats["max_ms"] = latency_ms if stats["max_ms"] is None else max(stats["max_ms"], latency_ms)
+        if latency_ms > DEBUG_LATENCY_WARN_THRESHOLD_MS:
+            stats["over_threshold"] += 1
+            now = _now()
+            if now - _LATENCY_LAST_WARN.get(period, 0.0) >= DEBUG_LATENCY_WARN_INTERVAL_SECONDS:
+                _LATENCY_LAST_WARN[period] = now
+                _log("[延时警告] period=%s code=%s delay=%.0fms event_time=%s received_at=%.3f" %
+                     (period, code, latency_ms, event_time or "", received_at))
+    if period not in _FIRST_CALLBACKS:
+        _FIRST_CALLBACKS[period] = {
+            "code": code, "event_time": event_time, "received_at": received_at,
+            "latency_ms": latency_ms,
+        }
+        _log("[回调首条] period=%s code=%s event_time=%s received_at=%.3f" %
+             (period, code, event_time or "", received_at))
+    record = {
+        "received_at": received_at, "event_time": event_time,
+        "event_time_raw": str(event_value) if event_value is not None else "",
+        "latency_time_raw": str(latency_value) if latency_value is not None else "",
+        "latency_ms": latency_ms,
+        "code": code, "period": period, "data": payload,
+    }
     try:
         line = json.dumps(record, ensure_ascii=True, default=_json_default) + "\n"
         if len(_RAW_BUFFER) >= 20000:
@@ -176,6 +302,36 @@ def _write_raw(code, period, payload):
         _RAW_BUFFER.append(line)
     except Exception:
         pass
+    return received_at
+
+
+def _observe_first_limit_up(code, period, event_time, event_raw, received_at, limit_up, bid):
+    if period not in ("tick", "l2quote") or not _in_continuous(event_time):
+        return
+    if not limit_up or not bid or abs(bid - limit_up) >= 1e-8:
+        return
+    observed = _LIMIT_UP_FIRSTS.setdefault(code, {})
+    if period in observed:
+        return
+    observed[period] = {
+        "received_at": received_at,
+        "event_time": event_time,
+        "event_raw": str(event_raw) if event_raw is not None else "",
+    }
+    _log("[LIMIT_UP_FIRST] code=%s period=%s bid1=%.3f limit_up=%.3f event_time=%s event_raw=%s received_at=%.3f" %
+         (code, period, bid, limit_up, event_time, observed[period]["event_raw"], received_at))
+    if "tick" not in observed or "l2quote" not in observed or observed.get("compared"):
+        return
+    tick_at = observed["tick"]["received_at"]
+    l2quote_at = observed["l2quote"]["received_at"]
+    delta_ms = (tick_at - l2quote_at) * 1000.0
+    winner = "tick" if delta_ms < 0 else "l2quote" if delta_ms > 0 else "tie"
+    observed["compared"] = True
+    observed["winner"] = winner
+    observed["gap_ms"] = abs(delta_ms)
+    _log("[LIMIT_UP_COMPARE] code=%s winner=%s gap_ms=%.3f tick_event=%s l2quote_event=%s tick_received_at=%.3f l2quote_received_at=%.3f" %
+         (code, winner, abs(delta_ms), observed["tick"]["event_raw"],
+          observed["l2quote"]["event_raw"], tick_at, l2quote_at))
 
 
 def _flush_raw(max_records=1000):
@@ -262,10 +418,14 @@ def _paths():
 
 
 def _load_pool():
-    path = next((p for p in _paths() if os.path.isfile(p)), None)
+    global _POOL_PATH
+    candidates = list(_paths())
+    path = next((p for p in candidates if os.path.isfile(p)), None)
     if not path:
-        _log("[初始化] 未找到 data/manual_pool.csv")
+        _POOL_PATH = ""
+        _log("[股票池] 未找到 data/manual_pool.csv，已搜索=%s" % " | ".join(candidates))
         return []
+    _POOL_PATH = os.path.abspath(path)
     result = []
     try:
         with open(path, "r", encoding="utf-8-sig", newline="") as handle:
@@ -278,7 +438,8 @@ def _load_pool():
                     _log("[初始化] 忽略无效CSV记录 %r" % row)
     except Exception as exc:
         _log("[初始化] CSV读取失败 %r" % (exc,))
-    _log("[初始化] 股票池 %d 只: %s" % (len(result), ",".join(x["code"] for x in result)))
+    _log("[股票池] path=%s count=%d codes=%s" %
+         (_POOL_PATH, len(result), ",".join(x["code"] for x in result)))
     return result
 
 
@@ -295,6 +456,8 @@ def _new_instance(code, amount):
         "cancel_confirmed": False, "cancel_failed": False, "late_large_count": 0,
         "late_large_ids": set(), "follow_sent": False, "our_order_id": None,
         "our_order_qty": 0, "our_traded_qty": 0, "our_order_status": "",
+        "order_reported_traded_qty": 0, "deal_traded_qty": 0,
+        "seen_deal_ids": set(), "pending_deal_infos": [],
         "previous_order_ids": set(), "validation_passed": False,
         "submission_pending": False, "submit_token": None, "submit_reason": None,
         "order_lookup_timer": None, "order_lookup_attempts": 0,
@@ -419,12 +582,14 @@ def _bind_order_id(inst, order_id):
     order_id = str(order_id or "")
     if not order_id or order_id in ("-1", "0") or order_id in inst["previous_order_ids"]:
         return False
+    if order_id == str(inst.get("our_order_id") or ""):
+        return True
     old_order_id = inst.get("our_order_id")
     if old_order_id:
         inst["previous_order_ids"].add(str(old_order_id))
     inst["our_order_id"] = order_id
     inst["submission_pending"] = False
-    inst["order_lookup_timer"] = None
+    _cancel_order_lookup(inst)
     inst["our_order_status"] = "submitted"
     _COUNTERS["orders"] += 1
     _log("[下单] %s %s 委托=%s" % (inst["code"], inst.get("submit_reason", ""), order_id))
@@ -435,6 +600,8 @@ def _bind_order_id(inst, order_id):
     pending = inst.pop("pending_order_info", None)
     if pending:
         _apply_order_update(inst, pending)
+    for deal in inst.pop("pending_deal_infos", []):
+        _apply_deal_update(inst, deal)
     return True
 
 
@@ -476,14 +643,52 @@ def _resolve_order_id(code, token):
 
 
 def _order_fields(obj):
+    code = str(_field(obj, "m_strInstrumentID", "stockCode", "stock_code") or "").strip().upper()
+    exchange = str(_field(obj, "m_strExchangeID", "exchangeID", "exchange_id") or "").strip().upper()
+    if code and "." not in code and exchange:
+        exchange = {"SSE": "SH", "SZSE": "SZ", "BSE": "BJ"}.get(exchange, exchange)
+        code = "%s.%s" % (code, exchange)
     return {
         "id": str(_field(obj, "m_strOrderID", "m_nOrderID", "orderID", "order_id") or ""),
-        "code": str(_field(obj, "m_strInstrumentID", "stockCode", "stock_code") or ""),
+        "code": code,
+        "deal_id": str(_field(obj, "m_strTradeID", "m_strDealID", "tradeID", "dealID", "tradedID") or ""),
+        "user_order_id": str(_field(obj, "m_strRemark", "m_strUserOrderID", "userOrderId", "user_order_id", "remark") or ""),
         "status": _field(obj, "m_nOrderStatus", "m_strOrderStatus", "status"),
-        "total": _safe_float(_field(obj, "m_nVolumeTotalOriginal", "volume", "orderVolume")) or 0,
+        "total": _safe_float(_field(obj, "m_nVolumeTotalOriginal", "m_nVolumeTotal", "orderVolume", "totalVolume")) or 0,
         "traded": _safe_float(_field(obj, "m_nVolumeTraded", "tradedVolume", "volumeTraded")) or 0,
+        "deal_volume": _safe_float(_field(obj, "m_nVolume", "m_nTradeVolume", "deal_volume", "m_nVolumeTraded", "tradedVolume", "volume")) or 0,
         "price": _safe_float(_field(obj, "m_dPrice", "price")) or 0,
     }
+
+
+def _same_stock_code(left, right):
+    left = str(left or "").upper()
+    right = str(right or "").upper()
+    if left == right:
+        return True
+    return bool(left and right and "." not in left and left == right.split(".", 1)[0])
+
+
+def _pending_order_matches(inst, item):
+    if not inst.get("submission_pending"):
+        return False
+    if item.get("id") and item["id"] in inst.get("previous_order_ids", set()):
+        return False
+    token = item.get("user_order_id") or ""
+    if token:
+        return token == str(inst.get("submit_token") or "")
+    if not _same_stock_code(item.get("code"), inst.get("code")):
+        return False
+    price = item.get("price") or 0
+    expected_price = inst.get("limit_up") or 0
+    if price and expected_price and abs(price - expected_price) > 0.001:
+        return False
+    matched = bool(price)
+    total = item.get("total") or 0
+    expected_total = inst.get("our_order_qty") or 0
+    if total and expected_total and total != expected_total:
+        return False
+    return matched or bool(total)
 
 
 def _submit(inst, reason):
@@ -509,12 +714,17 @@ def _submit(inst, reason):
         inst["submit_token"] = "%s_%s" % (inst["code"], int(time.time() * 1000))
         inst["submit_reason"] = reason
         inst["order_lookup_attempts"] = 0
-        order_result = passorder(23, ORDER_TYPE_BUY, ACCOUNT_ID, inst["code"], PRICE_TYPE_LIMIT,
-                                 price, qty, STRATEGY_NAME, 1, inst["submit_token"], {}, _C)
         inst["our_order_qty"] = qty
-        if isinstance(order_result, str) and order_result not in ("", "-1"):
+        inst["our_traded_qty"] = 0
+        inst["order_reported_traded_qty"] = 0
+        inst["deal_traded_qty"] = 0
+        inst["seen_deal_ids"].clear()
+        inst["pending_deal_infos"] = []
+        order_result = passorder(23, ORDER_TYPE_BUY, ACCOUNT_ID, inst["code"], PRICE_TYPE_LIMIT,
+                                 price, qty, STRATEGY_NAME, 1, inst["submit_token"], _C)
+        if isinstance(order_result, (str, int)) and not isinstance(order_result, bool) and str(order_result).strip() not in ("", "0", "-1"):
             _bind_order_id(inst, order_result)
-        else:
+        elif inst["submission_pending"]:
             _schedule_order_lookup(inst)
         _log("[下单提交] %s %s 价格=%.3f 数量=%d 返回=%r" % (inst["code"], reason, price, qty, order_result))
         return True
@@ -586,10 +796,13 @@ def _handle_quote(code, period, payload):
         event_time = _event_time(_field(data, "stime", "time", "timestamp"))
         if event_time:
             inst["last_event_time"] = event_time
-        _write_raw(code, period, data)
+        received_at = _write_raw(code, period, data)
         limit_up = _limit_price(inst, data)
         is_continuous = bool(event_time and _in_continuous(event_time))
         bid, bid_vol, ask, last, low = _quote_values(inst, data, track_day=is_continuous)
+        _observe_first_limit_up(
+            code, period, event_time, _field(data, "time", "stime", "timestamp"),
+            received_at, limit_up, bid)
         if inst["last_close"] is None:
             inst["last_close"] = _safe_float(_field(data, "lastClose", "preClose", "pre_close"))
         if not is_continuous:
@@ -696,15 +909,20 @@ def _handle_l2order(code, payload):
 
 
 def _subscribe(C, code, period):
+    global _SUB_SUCCESS, _SUB_FAILED
     callback = (lambda data, c=code: _handle_l2order(c, data)) if period == "l2order" else (lambda data, c=code, p=period: _handle_quote(c, p, data))
     try:
         sub_id = C.subscribe_quote(code, period=period, dividend_type="follow", result_type="dict", callback=callback)
         if sub_id and sub_id > 0:
+            _SUB_SUCCESS += 1
             _SUBSCRIPTIONS.append(sub_id)
             _INSTANCES[code]["sub_ids"].append(sub_id)
+            _log("[订阅] code=%s period=%s sub_id=%s" % (code, period, sub_id))
         else:
+            _SUB_FAILED += 1
             _log("[订阅失败] %s %s 返回=%r" % (code, period, sub_id))
     except Exception as exc:
+        _SUB_FAILED += 1
         _log("[订阅失败] %s %s %r" % (code, period, exc))
 
 
@@ -751,6 +969,33 @@ def _initial_quote_batch(C, instances):
         _initial_quote(C, inst, full_ticks)
 
 
+def _limit_up_first_summary():
+    tick_seen = sum(1 for value in _LIMIT_UP_FIRSTS.values() if "tick" in value)
+    l2quote_seen = sum(1 for value in _LIMIT_UP_FIRSTS.values() if "l2quote" in value)
+    paired = [value for value in _LIMIT_UP_FIRSTS.values() if value.get("compared")]
+    tick_first = sum(1 for value in paired if value["winner"] == "tick")
+    l2quote_first = sum(1 for value in paired if value["winner"] == "l2quote")
+    ties = sum(1 for value in paired if value["winner"] == "tie")
+    gaps = [value["gap_ms"] for value in paired]
+    average = sum(gaps) / len(gaps) if gaps else None
+    minimum = min(gaps) if gaps else None
+    maximum = max(gaps) if gaps else None
+    tick_only = sum(1 for value in _LIMIT_UP_FIRSTS.values()
+                    if "tick" in value and "l2quote" not in value)
+    l2quote_only = sum(1 for value in _LIMIT_UP_FIRSTS.values()
+                       if "l2quote" in value and "tick" not in value)
+    unseen = max(0, len(_INSTANCES) - len(_LIMIT_UP_FIRSTS))
+    return ("stocks=%d tick_seen=%d l2quote_seen=%d paired=%d tick_first=%d "
+            "l2quote_first=%d tie=%d gap_avg/min/max_ms=%s/%s/%s "
+            "tick_only=%d l2quote_only=%d unseen=%d" %
+            (len(_INSTANCES), tick_seen, l2quote_seen, len(paired), tick_first,
+             l2quote_first, ties,
+             "%.1f" % average if average is not None else "n/a",
+             "%.1f" % minimum if minimum is not None else "n/a",
+             "%.1f" % maximum if maximum is not None else "n/a",
+             tick_only, l2quote_only, unseen))
+
+
 def _summary():
     by_state = {}
     for inst in _INSTANCES.values():
@@ -758,13 +1003,42 @@ def _summary():
         if inst.get("our_order_id") and display_state not in (STATE_DONE, STATE_SKIPPED):
             display_state = "已下单，等待成交"
         by_state.setdefault(display_state, []).append(inst["code"])
-    _log("[汇总] 监控=%d 下单=%d 成交=%d 撤单=%d L2=%d 行情=%d 状态=%s" %
+    period_counts = ",".join("%s:%d" % (period, _PERIOD_COUNTS.get(period, 0)) for period in PERIODS)
+    first_callbacks = ",".join(sorted(_FIRST_CALLBACKS)) or "无"
+    last_events = ",".join("%s:%s" % (period, _LAST_EVENT_TIMES.get(period, "")) for period in PERIODS)
+    latency_parts = []
+    for period in PERIODS:
+        stats = _LATENCY_STATS.get(period, {})
+        samples = stats.get("samples", 0)
+        valid = stats.get("valid", 0)
+        average = stats.get("sum_ms", 0.0) / valid if valid else None
+        maximum = stats.get("max_ms")
+        latest = stats.get("last_ms")
+        latency_parts.append("%s:%d/%d,>1s=%d,avg=%s,max=%s,last=%s" %
+                             (period, valid, samples, stats.get("over_threshold", 0),
+                              "%.0fms" % average if average is not None else "n/a",
+                              "%.0fms" % maximum if maximum is not None else "n/a",
+                              "%.0fms" % latest if latest is not None else "n/a"))
+        gaps = _GAP_STATS.get(period, {})
+        gap_count = gaps.get("count", 0)
+        gap_average = gaps.get("sum_ms", 0.0) / gap_count if gap_count else None
+        latency_parts[-1] += ",gap=%s/%s,codes=%d" % (
+            "%.0fms" % gap_average if gap_average is not None else "n/a",
+            "%.0fms" % gaps.get("max_ms") if gap_count else "n/a",
+            len([key for key in _LAST_RECEIVED_AT if key[0] == period]))
+    _log("[汇总] 监控=%d 下单=%d 成交=%d 撤单=%d L2=%d 行情=%d 订阅=%d成功/%d失败 "
+         "回调=%s 首条=%s 延时=%s 缓冲=%d 丢弃=%d 最近事件=%s 状态=%s" %
          (len(_INSTANCES), _COUNTERS["orders"], _COUNTERS["deals"], _COUNTERS["cancels"],
-          _COUNTERS["l2"], _COUNTERS["quotes"], ";".join("%s:%s" % (k, ",".join(v)) for k, v in sorted(by_state.items()))))
+          _COUNTERS["l2"], _COUNTERS["quotes"], _SUB_SUCCESS, _SUB_FAILED,
+          period_counts, "%d/%d[%s]" % (len(_FIRST_CALLBACKS), len(PERIODS), first_callbacks),
+          ";".join(latency_parts), len(_RAW_BUFFER), _RAW_DROPPED, last_events,
+          ";".join("%s:%s" % (k, ",".join(v)) for k, v in sorted(by_state.items()))))
+    _log("[涨停首报汇总] %s" % _limit_up_first_summary())
 
 
 def init(C):
-    global _C, _LOG, _RAW_LOG, _DAY, _LAST_SUMMARY, _RAW_FLUSH_TIMER, _RAW_DROPPED, _AUCTION_RETRY_TIMER
+    global _C, _LOG, _RAW_LOG, _LOG_PATH, _RAW_LOG_PATH, _DAY, _LAST_SUMMARY
+    global _RAW_FLUSH_TIMER, _RAW_DROPPED, _AUCTION_RETRY_TIMER, _SUB_SUCCESS, _SUB_FAILED
     with _LOCK:
         _C = C
         if ACCOUNT_ID:
@@ -774,23 +1048,47 @@ def init(C):
                 _log("[初始化] 交易账户注册失败 %r" % (exc,))
         _DAY = _dt.datetime.now().strftime("%Y%m%d")
         script_root = _script_root()
+        script_file = globals().get("__file__")
         log_dir = (os.path.join(script_root, "..", "userdata", "log")
                    if script_root else "")
         if not log_dir or not os.path.isdir(log_dir):
             log_dir = os.path.join(os.getcwd(), "userdata", "log")
+        _LOG_PATH = ""
+        _RAW_LOG_PATH = ""
         try:
             if not os.path.isdir(log_dir):
                 os.makedirs(log_dir)
-            _LOG = open(os.path.join(log_dir, "qmt_strategy_%s.log" % _DAY), "a")
-            _RAW_LOG = open(os.path.join(log_dir, "qmt_strategy_raw_%s.jsonl" % _DAY), "a")
+            _LOG_PATH = os.path.abspath(os.path.join(log_dir, "qmt_strategy_%s.log" % _DAY))
+            _RAW_LOG_PATH = os.path.abspath(os.path.join(log_dir, "qmt_strategy_raw_%s.jsonl" % _DAY))
+            _LOG = open(_LOG_PATH, "a")
+            _RAW_LOG = open(_RAW_LOG_PATH, "a")
         except Exception:
             _LOG = None
             _RAW_LOG = None
+        _log("[运行] script_root=%s" % (script_root or "<empty>"))
+        _log("[运行] cwd=%s" % os.getcwd())
+        _log("[运行] __file__=%s" % (os.path.abspath(script_file) if script_file else "absent"))
+        _log("[运行] log_path=%s" % (_LOG_PATH or "<unavailable>"))
+        _log("[运行] raw_log_path=%s" % (_RAW_LOG_PATH or "<unavailable>"))
+        _log("[运行] ENABLE_LIVE_ORDERS=%s PERIODS=%s" %
+             (ENABLE_LIVE_ORDERS, ",".join(PERIODS)))
+        _log("[运行] latency_warning_threshold=%.0fms warn_interval=%ss" %
+             (DEBUG_LATENCY_WARN_THRESHOLD_MS, DEBUG_LATENCY_WARN_INTERVAL_SECONDS))
         _COUNTERS.update({"orders": 0, "deals": 0, "cancels": 0, "l2": 0, "quotes": 0})
+        _PERIOD_COUNTS.clear()
+        _FIRST_CALLBACKS.clear()
+        _LAST_EVENT_TIMES.clear()
+        _LATENCY_STATS.clear()
+        _LATENCY_LAST_WARN.clear()
+        _LAST_RECEIVED_AT.clear()
+        _GAP_STATS.clear()
+        _LIMIT_UP_FIRSTS.clear()
         del _RAW_BUFFER[:]
         _RAW_FLUSH_TIMER = None
         _RAW_DROPPED = 0
         _AUCTION_RETRY_TIMER = None
+        _SUB_SUCCESS = 0
+        _SUB_FAILED = 0
         _INSTANCES.clear()
         _SUBSCRIPTIONS[:] = []
         for item in _load_pool():
@@ -799,10 +1097,14 @@ def init(C):
         for inst in _INSTANCES.values():
             for period in PERIODS:
                 _subscribe(C, inst["code"], period)
+        _log("[运行] subscriptions=%d success=%d failed=%d expected=%d" %
+             (len(_SUBSCRIPTIONS), _SUB_SUCCESS, _SUB_FAILED,
+              len(_INSTANCES) * len(PERIODS)))
         _schedule_raw_flush()
         _schedule_auction_retry()
         _LAST_SUMMARY = _now()
-        _log("[初始化] 原生模型启动，ENABLE_LIVE_ORDERS=%s" % ENABLE_LIVE_ORDERS)
+        _log("[运行] 原生模型启动完成，股票池=%d，调试汇总间隔=%ss" %
+             (len(_INSTANCES), DEBUG_SUMMARY_INTERVAL_SECONDS))
 
 
 def handlebar(C):
@@ -810,16 +1112,18 @@ def handlebar(C):
     with _LOCK:
         for inst in _INSTANCES.values():
             _check_validation(inst)
-        if _now() - _LAST_SUMMARY >= 600:
+        if _now() - _LAST_SUMMARY >= DEBUG_SUMMARY_INTERVAL_SECONDS:
             _summary()
             _LAST_SUMMARY = _now()
 
 
 def _apply_order_update(inst, item):
     inst["our_order_status"] = item["status"]
-    inst["our_traded_qty"] = item["traded"]
+    inst["order_reported_traded_qty"] = max(
+        inst.get("order_reported_traded_qty", 0), item["traded"])
+    inst["our_traded_qty"] = max(
+        inst.get("deal_traded_qty", 0), inst["order_reported_traded_qty"])
     if item["traded"] > 0:
-        _COUNTERS["deals"] += 1
         _cancel_timer(inst)
         _set_state(inst, STATE_DONE, "订单已成交")
     elif str(item["status"]).lower() in ("5", "6", "canceled", "cancelled", "撤单", "废单"):
@@ -831,14 +1135,55 @@ def _apply_order_update(inst, item):
             _set_state(inst, STATE_DONE, "订单结束")
 
 
+def _apply_deal_update(inst, item):
+    deal_id = item.get("deal_id") or ""
+    if deal_id and deal_id in inst["seen_deal_ids"]:
+        return
+    volume = item.get("deal_volume") or 0
+    if volume <= 0:
+        _log("[DEAL_CALLBACK_INVALID] id=%s code=%s deal_id=%s volume=%s" % (
+            item.get("id", ""), item.get("code", ""), deal_id, volume))
+        return
+    if deal_id:
+        inst["seen_deal_ids"].add(deal_id)
+    inst["deal_traded_qty"] = inst.get("deal_traded_qty", 0) + volume
+    inst["our_traded_qty"] = max(
+        inst["deal_traded_qty"], inst.get("order_reported_traded_qty", 0))
+    _COUNTERS["deals"] += 1
+    _cancel_timer(inst)
+    _set_state(inst, STATE_DONE, "成交回报")
+    _log("[DEAL_CALLBACK] id=%s code=%s deal_id=%s volume=%s cum_volume=%s price=%s" % (
+        item.get("id", ""), item.get("code", ""), deal_id, volume,
+        inst["our_traded_qty"], item.get("price", 0)))
+
+
 def order_callback(ContextInfo, orderInfo):
     with _LOCK:
         item = _order_fields(orderInfo)
         for inst in _INSTANCES.values():
             if item["id"] and item["id"] == str(inst.get("our_order_id")):
                 _apply_order_update(inst, item)
-            elif inst.get("submission_pending") and item["code"] == inst["code"]:
+                _log("[ORDER_CALLBACK] id=%s code=%s token=%s status=%s total=%s traded=%s price=%s" % (
+                    item["id"], item["code"], item["user_order_id"], item["status"],
+                    item["total"], item["traded"], item["price"]))
+                return
+        candidates = [inst for inst in _INSTANCES.values() if _pending_order_matches(inst, item)]
+        if len(candidates) == 1:
+            inst = candidates[0]
+            if item["id"] and _bind_order_id(inst, item["id"]):
+                _apply_order_update(inst, item)
+                event = "ORDER_CALLBACK_ASSOCIATED"
+            else:
                 inst["pending_order_info"] = item
+                event = "ORDER_CALLBACK_PENDING"
+            _log("[%s] id=%s code=%s token=%s status=%s total=%s traded=%s price=%s" % (
+                event,
+                item["id"], item["code"], item["user_order_id"], item["status"],
+                item["total"], item["traded"], item["price"]))
+            return
+        _log("[ORDER_CALLBACK_UNMATCHED] id=%s code=%s token=%s status=%s total=%s traded=%s price=%s" % (
+            item["id"], item["code"], item["user_order_id"], item["status"],
+            item["total"], item["traded"], item["price"]))
 
 
 def deal_callback(ContextInfo, dealInfo):
@@ -846,10 +1191,23 @@ def deal_callback(ContextInfo, dealInfo):
         item = _order_fields(dealInfo)
         for inst in _INSTANCES.values():
             if item["id"] and item["id"] == str(inst.get("our_order_id")):
-                _COUNTERS["deals"] += 1
-                inst["our_traded_qty"] += item["traded"] or 1
-                _cancel_timer(inst)
-                _set_state(inst, STATE_DONE, "成交回报")
+                _apply_deal_update(inst, item)
+                return
+        candidates = [inst for inst in _INSTANCES.values() if _pending_order_matches(inst, item)]
+        if len(candidates) == 1:
+            inst = candidates[0]
+            inst["pending_deal_infos"].append(item)
+            if item["id"]:
+                _bind_order_id(inst, item["id"])
+            event = "DEAL_CALLBACK_ASSOCIATED" if item["id"] else "DEAL_CALLBACK_PENDING"
+            _log("[%s] id=%s code=%s token=%s deal_id=%s volume=%s" % (
+                event,
+                item["id"], item["code"], item["user_order_id"],
+                item["deal_id"], item["deal_volume"]))
+            return
+        _log("[DEAL_CALLBACK_UNMATCHED] id=%s code=%s token=%s deal_id=%s volume=%s" % (
+            item["id"], item["code"], item["user_order_id"],
+            item["deal_id"], item["deal_volume"]))
 
 
 def stop(C):
