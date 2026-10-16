@@ -52,7 +52,7 @@ passorder(23, ORDER_TYPE_BUY, ACCOUNT_ID, code,
 
 ## 编码、路径和日志
 
-`QMTTEST.py` 保持 `# coding: gbk`，以兼容现有 QMT 原生 Python 编辑器。股票池用 UTF-8-SIG CSV 读取；日志和原始 JSONL 使用脚本运行目录、当前工作目录及 QMT 根目录逐级查找可用路径。实盘验证时应记录实际生成的文件路径，不要凭默认路径推断“没有回调”。
+`QMT_LARGE_ORDER_LIMIT_UP_BUY.py` 保持 `# coding: gbk`，以兼容现有 QMT 原生 Python 编辑器。股票池用 UTF-8-SIG CSV 读取；日志和原始 JSONL 使用脚本运行目录、当前工作目录及 QMT 根目录逐级查找可用路径。实盘验证时应记录实际生成的文件路径，不要凭默认路径推断“没有回调”。
 
 ## 验证重点
 

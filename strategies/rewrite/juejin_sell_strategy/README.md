@@ -1,6 +1,6 @@
 # Juejin Sell Native QMT Model
 
-这是 `juejin_sell_strategy` 的 QMT 原生 Python 重写版本，独立于上级目录的大单涨停买入模型 `QMTTEST.py`。
+这是 `juejin_sell_strategy` 的 QMT 原生 Python 重写版本，独立于上级目录的大单涨停买入模型 `QMT_LARGE_ORDER_LIMIT_UP_BUY.py`。
 
 ## 当前范围
 

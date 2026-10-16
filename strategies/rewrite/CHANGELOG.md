@@ -83,3 +83,11 @@
 - 验证命令和结果：
 - 是否触及下单、撤单、账户或仓位：
 ```
+## 2026-10-16 (repository layout)
+
+- Moved the large order limit-up buy native model into `large_order_limit_up_buy/` beside the Juejin and overnight models.
+- Renamed the QMT entry point to `QMT_LARGE_ORDER_LIMIT_UP_BUY.py` and updated its offline tests and documentation references.
+- The historical `QMTTEST.py` references above are retained as release history.
+## 2026-10-16 (rewrite playbook)
+
+- Added `REWRITE_PLAYBOOK.md` with reusable guidance for native QMT constraints, path fallback, minimal subscriptions, latency comparison, asynchronous order callbacks, overnight scheduling, and verification.

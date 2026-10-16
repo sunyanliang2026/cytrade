@@ -3,7 +3,7 @@ from pathlib import Path
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "QMTTEST.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "QMT_LARGE_ORDER_LIMIT_UP_BUY.py"
 SPEC = importlib.util.spec_from_file_location("qmt_rewrite", SCRIPT)
 QMT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(QMT)

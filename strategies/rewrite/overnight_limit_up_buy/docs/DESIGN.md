@@ -20,7 +20,7 @@ QMT 的 `[quote] start simulation mode` 只用于仿真，不代表实盘委托�
 
 ## 部署
 
-1. 在 QMT “模型研究”中创建独立的原生 Python 模型，不覆盖现有 `QMTTEST.py`。
+1. 在 QMT “模型研究”中创建独立的原生 Python 模型，不覆盖现有 `QMT_LARGE_ORDER_LIMIT_UP_BUY.py`。
 2. 将 `QMT_OVERNIGHT_LIMIT_UP_BUY.py` 作为独立文件部署到 QMT 的 Python 模型目录。
 3. 将 `data/overnight_orders.csv.example` 复制到上述 `overnight_orders.csv` 路径并填写当天订单。
 4. 先保持实盘开关关闭，在 QMT `[quote]` 模式检查 `INIT`/`PATHS`、`TRADING_DAY_CHECK_SKIPPED`、`PREFLIGHT_OK`、逐行 `PLAN` 和 `DRY_RUN` 日志。
