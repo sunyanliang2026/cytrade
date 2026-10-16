@@ -1,0 +1,1343 @@
+# coding: gbk
+"""Native QMT sell model for the Juejin tick strategy.
+
+The model deliberately keeps the signal rules separate from QMT callbacks.
+It uses l2quote as the canonical signal stream and ordinary tick data to keep
+the session high/low/open values current.  Live orders are disabled by
+default; the operator must verify the sell order type and account fields in
+the installed QMT version before enabling them.
+"""
+
+import copy
+import csv
+import datetime as _dt
+import io
+import os
+import time
+import uuid
+
+
+# ------------------------- operator configuration -------------------------
+ENABLE_LIVE_ORDERS = False
+ACCOUNT_ID = ""
+ACCOUNT_TYPE = "stock"
+STRATEGY_NAME = "juejin_sell_native"
+OP_TYPE_SELL = 24
+ORDER_TYPE_LIMIT = 1101
+PRICE_TYPE_LIMIT = 11
+QUICK_TRADE = 1
+
+QMT_HOME = u"C:/\u5149\u5927\u8bc1\u5238\u91d1\u9633\u5149QMT\u5b9e\u76d8"
+CSV_PATH = os.path.join(QMT_HOME, "python", "sell_10.csv")
+
+LIMIT_UP_CONFIRM_AMOUNT = 120000000.0
+LIMIT_UP_WEAK_AMOUNT = 100000000.0
+LIMIT_UP_WEAK_REDUCE_AMOUNT = 25000000.0
+LIMIT_UP_LARGE_AMOUNT = 160000000.0
+LIMIT_UP_LARGE_REDUCE_AMOUNT = 80000000.0
+LIMIT_DOWN_CLEAR_AMOUNT = 50000000.0
+LIMIT_OPEN_GRACE_SECONDS = 60.0
+LIMIT_OPEN_RECOVERY_SECONDS = 300.0
+CANCEL_WAIT_SECONDS = 2.0
+SUMMARY_INTERVAL_SECONDS = 60.0
+
+FLAG_NORMAL = 0
+FLAG_AUCTION_UNDER_EXPECTATION = 1
+FLAG_WEAK = -3
+FLAG_REBOUND = 5
+FLAG_STRONG = 7
+FLAG_LIMIT_UP = 10
+FLAG_LIMIT_DOWN_CLEAR = 99
+FLAG_SELL_DONE = -9
+LIMIT_UP_FIRST_SELL_DONE = 99
+
+ORDER_SUBMITTING = "SUBMITTING"
+ORDER_ACTIVE = "ACTIVE"
+ORDER_PARTIAL = "PARTIAL"
+ORDER_CANCEL_REQUESTED = "CANCEL_REQUESTED"
+ORDER_CANCELED = "CANCELED"
+ORDER_FILLED = "FILLED"
+ORDER_REJECTED = "REJECTED"
+ORDER_UNKNOWN = "UNKNOWN"
+ORDER_SIMULATED = "SIMULATED"
+
+PERIODS = ("tick", "l2quote")
+
+
+# ------------------------------- model state ------------------------------
+class _NoopLock(object):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+
+_LOCK = _NoopLock()
+_C = None
+_INSTANCES = {}
+_SUBSCRIPTIONS = []
+_SUB_SUCCESS = 0
+_SUB_FAILED = 0
+_LOG = None
+_LOG_PATH = ""
+_CSV_USED = ""
+_LAST_SUMMARY = 0.0
+
+
+def _now():
+    return time.monotonic()
+
+
+def _safe_float(value):
+    try:
+        number = float(value)
+        if number == number and number > 0 and number < float("inf"):
+            return number
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return 0.0
+
+
+def _field(source, *names):
+    if isinstance(source, dict):
+        for name in names:
+            if name in source and source.get(name) not in (None, ""):
+                return source.get(name)
+    else:
+        for name in names:
+            try:
+                value = getattr(source, name)
+            except Exception:
+                continue
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _first_value(value):
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
+def _stock_code(value):
+    text = str(value or "").strip().upper()
+    if "." in text:
+        left, right = text.split(".", 1)
+        if len(left) == 6 and left.isdigit():
+            digits = left
+        elif len(right) == 6 and right.isdigit():
+            digits = right
+        else:
+            digits = "".join(ch for ch in text if ch.isdigit())
+    else:
+        digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) != 6:
+        return ""
+    if digits.startswith(("5", "6", "9")):
+        market = "SH"
+    elif digits.startswith(("8", "4", "92")):
+        market = "BJ"
+    else:
+        market = "SZ"
+    return digits + "." + market
+
+
+def _event_seconds(value=None):
+    if value is None:
+        return None
+    text = str(value).strip()
+    integer, dot, fraction = text.partition(".")
+    digits = "".join(ch for ch in integer if ch.isdigit())
+    fraction = "".join(ch for ch in fraction if ch.isdigit()) if dot else ""
+    if len(digits) == 13:
+        try:
+            stamp = _dt.datetime.fromtimestamp(int(digits) / 1000.0)
+            return stamp.hour * 3600.0 + stamp.minute * 60.0 + stamp.second + stamp.microsecond / 1000000.0
+        except (ValueError, OSError, OverflowError):
+            return None
+    if len(digits) >= 14:
+        hhmmss = digits[8:14]
+        extra = digits[14:] + fraction
+    elif len(digits) >= 9:
+        hhmmss = digits[:6]
+        extra = digits[6:] + fraction
+    elif len(digits) >= 6:
+        hhmmss = digits[-6:]
+        extra = fraction
+    else:
+        return None
+    try:
+        hour = int(hhmmss[:2])
+        minute = int(hhmmss[2:4])
+        second = int(hhmmss[4:6])
+        if hour > 23 or minute > 59 or second > 59:
+            return None
+        milliseconds = int((extra + "000")[:3]) if extra else 0
+        return hour * 3600.0 + minute * 60.0 + second + milliseconds / 1000.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _event_time(value=None):
+    seconds = _event_seconds(value)
+    if seconds is None:
+        return ""
+    hour = int(seconds // 3600)
+    minute = int((seconds - hour * 3600) // 60)
+    second = int(seconds - hour * 3600 - minute * 60)
+    return "%02d%02d%02d" % (hour, minute, second)
+
+
+def _in_auction(seconds):
+    return seconds is not None and 9 * 3600 + 15 * 60 <= seconds < 9 * 3600 + 25 * 60
+
+
+def _in_regular_session(seconds):
+    return seconds is not None and 9 * 3600 + 26 * 60 <= seconds <= 14 * 3600 + 57 * 60
+
+
+def _log(message):
+    line = "%s %s" % (_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], message)
+    try:
+        print(line)
+    except Exception:
+        pass
+    if _LOG:
+        try:
+            _LOG.write(line + "\n")
+            _LOG.flush()
+        except Exception:
+            pass
+
+
+def _owned_payload(code, payload):
+    try:
+        if isinstance(payload, dict) and code in payload:
+            payload = payload.get(code)
+        return copy.deepcopy(payload if isinstance(payload, dict) else {})
+    except Exception:
+        return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _price_equal(left, right):
+    return bool(left and right and abs(float(left) - float(right)) <= 0.005)
+
+
+def _limit_ratio(code):
+    digits = str(code or "").split(".", 1)[0]
+    if digits.startswith(("300", "301", "688", "689")):
+        return 0.20
+    if digits.startswith(("4", "8", "92")):
+        return 0.30
+    return 0.10
+
+
+def _limit_from(data, up=True):
+    names = (
+        ("upLimit", "up_limit", "upperLimit", "limitUp", "upLimitPrice",
+         "upStopPrice", "UpStopPrice", "\u6da8\u505c\u4ef7")
+        if up else
+        ("downLimit", "down_limit", "lowerLimit", "limitDown", "downLimitPrice",
+         "downStopPrice", "DownStopPrice", "\u8dcc\u505c\u4ef7")
+    )
+    return _safe_float(_first_value(_field(data, *names)))
+
+
+def _quote_values(data):
+    raw_bid = _first_value(_field(data, "bidPrice", "bid", "bid1", "bidPrice1"))
+    raw_bid_volume = _first_value(_field(data, "bidVol", "bidVolume", "bid1_volume", "bidVolume1"))
+    raw_ask = _first_value(_field(data, "askPrice", "ask", "ask1", "askPrice1"))
+    raw_ask_volume = _first_value(_field(data, "askVol", "askVolume", "ask1_volume", "askVolume1"))
+    return {
+        "bid": _safe_float(raw_bid),
+        "bid_volume": int(_safe_float(raw_bid_volume)),
+        "ask": _safe_float(raw_ask),
+        "ask_volume": int(_safe_float(raw_ask_volume)),
+        "last": _safe_float(_first_value(_field(data, "lastPrice", "last", "price", "close"))),
+        "open": _safe_float(_first_value(_field(data, "open", "openPrice", "Open"))),
+        "high": _safe_float(_first_value(_field(data, "high", "highest", "highPrice", "High"))),
+        "low": _safe_float(_first_value(_field(data, "low", "lowest", "lowPrice", "Low"))),
+        "pre_close": _safe_float(_first_value(_field(
+            data, "lastClose", "preClose", "pre_close", "PreClose", "LastClose"
+        ))),
+        "limit_up": _limit_from(data, up=True),
+        "limit_down": _limit_from(data, up=False),
+    }
+
+
+def _new_instance(plan):
+    return {
+        "code": plan["code"],
+        "nick": plan["nick"],
+        "exp": plan["exp"],
+        "sell_quantity": plan["sell_quantity"],
+        "flag": FLAG_NORMAL,
+        "previous_flag": FLAG_NORMAL,
+        "open_flag": 0,
+        "up_sell": 0,
+        "limit_open_second_sell_done": False,
+        "pre_bid": 0.0,
+        "pre_up_amount": 0.0,
+        "limit_up_seen_at": None,
+        "limit_open_started_at": None,
+        "pre_close": 0.0,
+        "limit_up": 0.0,
+        "limit_down": 0.0,
+        "open_price": 0.0,
+        "day_high": 0.0,
+        "day_low": 0.0,
+        "last_event_time": "",
+        "last_quote": {},
+        "submitted_actions": set(),
+        "orders": [],
+        "pending_after_cancel": None,
+        "flag7_condition_state": None,
+        "seen_deal_ids": set(),
+    }
+
+
+def _set_flag(inst, flag, reason):
+    if inst["flag"] == flag:
+        return
+    old = inst["flag"]
+    inst["flag"] = flag
+    _log("[JUEJIN_STATUS] code=%s nick=%s status=%s->%s reason=%s" % (
+        inst["code"], inst["nick"], old, flag, reason
+    ))
+
+
+def _update_market(inst, data, event_time):
+    values = _quote_values(data)
+    if values["pre_close"] > 0:
+        inst["pre_close"] = values["pre_close"]
+    if values["limit_up"] > 0:
+        inst["limit_up"] = values["limit_up"]
+    if values["limit_down"] > 0:
+        inst["limit_down"] = values["limit_down"]
+    if inst["pre_close"] > 0 and inst["limit_up"] <= 0:
+        inst["limit_up"] = round(inst["pre_close"] * (1.0 + _limit_ratio(inst["code"])), 2)
+    if inst["pre_close"] > 0 and inst["limit_down"] <= 0:
+        inst["limit_down"] = round(inst["pre_close"] * (1.0 - _limit_ratio(inst["code"])), 2)
+    if values["open"] > 0 and inst["open_price"] <= 0:
+        inst["open_price"] = values["open"]
+    candidates_high = [values["high"], values["last"], values["bid"]]
+    candidates_low = [values["low"], values["last"], values["bid"]]
+    for value in candidates_high:
+        if value > 0:
+            inst["day_high"] = max(inst["day_high"], value)
+    positive_lows = [value for value in candidates_low if value > 0]
+    if positive_lows:
+        inst["day_low"] = min(positive_lows) if inst["day_low"] <= 0 else min(inst["day_low"], min(positive_lows))
+    if event_time:
+        inst["last_event_time"] = event_time
+    inst["last_quote"] = values
+    return values
+
+
+def _book_amount(price, volume):
+    return float(price or 0.0) * float(volume or 0) * 100.0
+
+
+def _is_order_active(order):
+    return order.get("status") in (
+        ORDER_SUBMITTING, ORDER_ACTIVE, ORDER_PARTIAL, ORDER_CANCEL_REQUESTED
+    )
+
+
+def _has_active_orders(inst):
+    return any(_is_order_active(order) for order in inst["orders"])
+
+
+def _action_known(inst, action):
+    if action in inst["submitted_actions"]:
+        return True
+    pending = inst.get("pending_after_cancel") or {}
+    return any(item.get("action") == action for item in pending.get("requests", []))
+
+
+def _position_records():
+    getter = globals().get("get_trade_detail_data")
+    if not callable(getter):
+        return None
+    try:
+        records = getter(ACCOUNT_ID, ACCOUNT_TYPE, "POSITION")
+    except Exception as exc:
+        _log("[POSITION_QUERY_FAILED] error=%r" % (exc,))
+        return None
+    if records is None:
+        return []
+    if isinstance(records, dict):
+        return list(records.values())
+    if isinstance(records, (list, tuple)):
+        return list(records)
+    return [records]
+
+
+def _available_for_sell(inst):
+    if not ENABLE_LIVE_ORDERS:
+        return inst["sell_quantity"]
+    records = _position_records()
+    if records is None:
+        _log("[SELL_SKIP] code=%s reason=position_query_unavailable" % inst["code"])
+        return 0
+    for record in records:
+        code = _stock_code(_field(
+            record, "m_strInstrumentID", "m_strOrderCode", "stockCode", "stock_code", "code"
+        ))
+        if code != inst["code"]:
+            continue
+        available = _field(
+            record,
+            "m_nCanUseVolume", "can_use_volume", "canUseVolume",
+            "available_quantity", "m_nVolumeAvailable", "m_nAvailable",
+        )
+        return max(0, int(_safe_float(available)))
+    return 0
+
+
+def _order_record(inst, action, price, quantity, token):
+    return {
+        "action": action,
+        "price": float(price),
+        "quantity": int(quantity),
+        "traded_quantity": 0,
+        "order_reported_traded_quantity": 0,
+        "deal_traded_quantity": 0,
+        "token": token,
+        "order_id": "",
+        "status": ORDER_SUBMITTING,
+        "status_raw": "",
+        "created_at": _now(),
+        "cancel_requested_at": None,
+        "pending_update": None,
+    }
+
+
+def _order_matches(record, item):
+    if item.get("order_id") and item["order_id"] == record.get("order_id"):
+        return True
+    if item.get("token") and item["token"] == record.get("token"):
+        return True
+    if record.get("status") not in (ORDER_SUBMITTING, ORDER_ACTIVE, ORDER_PARTIAL, ORDER_CANCEL_REQUESTED):
+        return False
+    if item.get("code") != record.get("code", item.get("code")):
+        return False
+    if item.get("price", 0) > 0 and abs(item["price"] - record["price"]) > 0.005:
+        return False
+    if item.get("quantity", 0) > 0 and int(item["quantity"]) != record["quantity"]:
+        return False
+    return True
+
+
+def _callback_identity(info):
+    token = str(_field(
+        info, "m_strRemark", "m_strUserOrderID", "m_strUserOrderId", "userOrderId",
+        "user_order_id", "order_remark", "orderRemark", "remark"
+    ) or "").strip()
+    order_id = str(_field(
+        info, "m_strOrderID", "m_nOrderID", "m_strOrderSysID", "orderID", "order_id", "orderId"
+    ) or "").strip()
+    return token, order_id
+
+
+def _order_fields(info):
+    token, order_id = _callback_identity(info)
+    code = str(_field(
+        info, "m_strInstrumentID", "stockCode", "stock_code", "code"
+    ) or "").strip().upper()
+    exchange = str(_field(
+        info, "m_strExchangeID", "exchangeID", "exchange_id"
+    ) or "").strip().upper()
+    if code and "." not in code and exchange:
+        exchange = {"SSE": "SH", "SZSE": "SZ", "BSE": "BJ"}.get(exchange, exchange)
+        code = "%s.%s" % (code, exchange)
+    return {
+        "token": token,
+        "order_id": order_id,
+        "code": _stock_code(code),
+        "deal_id": str(_field(
+            info, "m_strTradeID", "m_strDealID", "tradeID", "dealID", "tradedID",
+            "traded_id"
+        ) or "").strip(),
+        "status": _field(info, "m_nOrderStatus", "m_strOrderStatus", "status", "order_status"),
+        "message": _field(info, "m_strStatusMsg", "m_strErrorMsg", "status_msg", "error_msg", "message"),
+        "quantity": int(_safe_float(_field(
+            info, "m_nVolumeTotalOriginal", "m_nVolumeTotal", "orderVolume",
+            "order_volume", "totalVolume", "quantity"
+        ))),
+        "traded": int(_safe_float(_field(
+            info, "m_nVolumeTraded", "tradedVolume", "traded_volume",
+            "volumeTraded", "deal_volume"
+        ))),
+        "deal_volume": int(_safe_float(_field(
+            info, "m_nVolume", "m_nTradeVolume", "deal_volume", "m_nVolumeTraded",
+            "tradedVolume", "traded_volume", "volume"
+        ))),
+        "price": _safe_float(_field(
+            info, "m_dPrice", "price", "order_price", "traded_price"
+        )),
+    }
+
+
+def _find_order(inst, item):
+    exact = [order for order in inst["orders"] if _order_matches(order, item)]
+    if len(exact) == 1:
+        return exact[0]
+    return None
+
+
+def _is_cancel_status(status, message):
+    value = str(status or "").lower()
+    text = str(message or "").lower()
+    return value in (
+        "5", "6", "53", "54", "canceled", "cancelled", "\u64a4\u5355", "\u5e9f\u5355"
+    ) or any(
+        marker in text for marker in ("\u64a4\u5355", "\u5e9f\u5355", "cancel", "cancelled")
+    )
+
+
+def _is_rejected_status(status, message):
+    value = str(status or "").lower()
+    text = str(message or "").lower()
+    return value in ("57", "rejected", "reject", "junk", "invalid", "error") or any(
+        marker in text for marker in ("\u62d2", "\u5e9f", "\u5931\u8d25", "\u4e0d\u8db3", "reject", "invalid", "error")
+    )
+
+
+def _is_cancel_pending_status(status):
+    return str(status or "").lower() in (
+        "51", "52", "reported_cancel", "partsucc_cancel", "cancel_pending"
+    )
+
+
+def _apply_order_update(inst, order, item):
+    if item.get("order_id") and not order.get("order_id"):
+        order["order_id"] = item["order_id"]
+    if item.get("traded", 0) > order.get("order_reported_traded_quantity", 0):
+        order["order_reported_traded_quantity"] = item["traded"]
+    order["traded_quantity"] = max(
+        order.get("order_reported_traded_quantity", 0),
+        order.get("deal_traded_quantity", 0),
+    )
+    order["status_raw"] = item.get("status")
+    status = str(item.get("status") or "").lower()
+    if (
+        order.get("traded_quantity", 0) >= order["quantity"] and order["quantity"] > 0
+    ) or status in ("56", "succeeded", "filled"):
+        order["status"] = ORDER_FILLED
+    elif _is_rejected_status(item.get("status"), item.get("message")):
+        order["status"] = ORDER_REJECTED
+    elif _is_cancel_pending_status(item.get("status")):
+        order["status"] = ORDER_CANCEL_REQUESTED
+    elif _is_cancel_status(item.get("status"), item.get("message")):
+        order["status"] = ORDER_CANCELED
+    elif order.get("traded_quantity", 0) > 0:
+        order["status"] = ORDER_PARTIAL
+    else:
+        order["status"] = ORDER_ACTIVE
+    _log("[ORDER_UPDATE] code=%s action=%s id=%s status=%s traded=%s/%s message=%s" % (
+        inst["code"], order["action"], order.get("order_id", ""), order["status"],
+        order.get("traded_quantity", 0), order["quantity"], item.get("message", "")
+    ))
+    if order["status"] == ORDER_CANCELED:
+        _drain_pending_after_cancel(inst)
+
+
+def _bind_order_id(inst, order, order_id):
+    order_id = str(order_id or "")
+    if not order_id or order_id in ("0", "-1"):
+        return False
+    order["order_id"] = order_id
+    if order["status"] == ORDER_SUBMITTING:
+        order["status"] = ORDER_ACTIVE
+    pending = order.pop("pending_update", None)
+    if pending:
+        _apply_order_update(inst, order, pending)
+    pending_deals = order.pop("pending_deal_infos", [])
+    for pending_deal in pending_deals:
+        if pending_deal.get("token") == order.get("token") or not pending_deal.get("token"):
+            _apply_deal_update(inst, order, pending_deal)
+        else:
+            inst.setdefault("pending_deal_infos", []).append(pending_deal)
+    return True
+
+
+def _apply_deal_update(inst, order, item):
+    deal_id = str(item.get("deal_id") or "").strip()
+    if deal_id and deal_id in inst["seen_deal_ids"]:
+        _log("[DEAL_DUPLICATE] code=%s action=%s deal_id=%s" % (
+            inst["code"], order["action"], deal_id
+        ))
+        return
+    if deal_id:
+        inst["seen_deal_ids"].add(deal_id)
+    volume = int(item.get("deal_volume", 0) or 0)
+    if volume <= 0:
+        _log("[DEAL_INVALID] code=%s action=%s deal_id=%s volume=%s" % (
+            inst["code"], order["action"], deal_id, volume
+        ))
+        return
+    order["deal_traded_quantity"] = order.get("deal_traded_quantity", 0) + volume
+    order["traded_quantity"] = max(
+        order.get("order_reported_traded_quantity", 0),
+        order.get("deal_traded_quantity", 0),
+    )
+    if order["traded_quantity"] >= order["quantity"]:
+        order["status"] = ORDER_FILLED
+    else:
+        order["status"] = ORDER_PARTIAL
+    _log("[DEAL] code=%s action=%s id=%s deal_id=%s traded=%s/%s" % (
+        inst["code"], order["action"], order.get("order_id", ""), deal_id,
+        order["traded_quantity"], order["quantity"]
+    ))
+
+
+def _schedule_order_lookup(inst, order):
+    if _C is None:
+        return
+    scheduler = getattr(_C, "schedule_run", None)
+    if not callable(scheduler):
+        return
+    token = order["token"]
+    code = inst["code"]
+    try:
+        order["lookup_timer"] = scheduler(
+            lambda ContextInfo, c=code, t=token: _resolve_order_id(c, t),
+            _dt.datetime.now() + _dt.timedelta(milliseconds=200),
+            repeat_times=0,
+            name="juejin_sell_order_lookup_%s" % code,
+        )
+    except Exception as exc:
+        _log("[ORDER_LOOKUP_FAILED] code=%s error=%r" % (code, exc))
+
+
+def _resolve_order_id(code, token):
+    with _LOCK:
+        inst = _INSTANCES.get(code)
+        if not inst:
+            return
+        order = next((item for item in inst["orders"] if item.get("token") == token), None)
+        if not order or order.get("status") != ORDER_SUBMITTING:
+            return
+        order["lookup_attempts"] = order.get("lookup_attempts", 0) + 1
+        getter = globals().get("get_last_order_id")
+        order_id = ""
+        if callable(getter):
+            try:
+                order_id = getter(ACCOUNT_ID, ACCOUNT_TYPE, "order", STRATEGY_NAME)
+            except TypeError:
+                try:
+                    order_id = getter(ACCOUNT_ID, ACCOUNT_TYPE, "order")
+                except Exception:
+                    order_id = ""
+            except Exception:
+                order_id = ""
+        if _bind_order_id(inst, order, order_id):
+            return
+        if order["lookup_attempts"] < 10:
+            _schedule_order_lookup(inst, order)
+        else:
+            order["status"] = ORDER_UNKNOWN
+            _log("[ORDER_UNKNOWN] code=%s action=%s reason=order_id_not_found" % (code, order["action"]))
+
+
+def _submit_sell(inst, quantity, price, reason, action):
+    if _action_known(inst, action):
+        return None
+    available = _available_for_sell(inst)
+    requested = available if quantity is None else max(0, int(quantity))
+    sell_quantity = min(requested, available)
+    if sell_quantity <= 0 or price <= 0:
+        _log("[SELL_SKIP] code=%s action=%s reason=no_available_volume" % (inst["code"], action))
+        return None
+
+    token = "%s_%s_%s" % (inst["code"], action, uuid.uuid4().hex[:8])
+    order = _order_record(inst, action, price, sell_quantity, token)
+    order["code"] = inst["code"]
+    inst["orders"].append(order)
+    # Once a live submission has been attempted, block the same action for
+    # this session even when QMT returns an unknown result. Retrying blindly
+    # could create a duplicate sell order.
+    inst["submitted_actions"].add(action)
+    sender = globals().get("passorder")
+    if not ENABLE_LIVE_ORDERS:
+        order["status"] = ORDER_SIMULATED
+        _log("[SELL_DRY_RUN] code=%s action=%s qty=%d price=%.3f reason=%s" % (
+            inst["code"], action, sell_quantity, price, reason
+        ))
+        return order
+    if not ACCOUNT_ID or not callable(sender):
+        order["status"] = ORDER_UNKNOWN
+        _log("[SELL_UNKNOWN] code=%s action=%s reason=account_or_passorder_unavailable" % (
+            inst["code"], action
+        ))
+        return None
+    try:
+        result = sender(
+            OP_TYPE_SELL, ORDER_TYPE_LIMIT, ACCOUNT_ID, inst["code"], PRICE_TYPE_LIMIT,
+            float(price), sell_quantity, STRATEGY_NAME, QUICK_TRADE, token, _C
+        )
+    except Exception as exc:
+        order["status"] = ORDER_UNKNOWN
+        _log("[SELL_UNKNOWN] code=%s action=%s error=%r" % (inst["code"], action, exc))
+        return None
+    if result is False or (isinstance(result, (int, float)) and result < 0) or str(result) == "-1":
+        order["status"] = ORDER_REJECTED
+        _log("[SELL_REJECTED] code=%s action=%s return=%r" % (inst["code"], action, result))
+        return None
+    if str(result) not in ("", "0"):
+        _bind_order_id(inst, order, result)
+    else:
+        _schedule_order_lookup(inst, order)
+    _log("[SELL_SUBMIT] code=%s action=%s qty=%d price=%.3f reason=%s return=%r" % (
+        inst["code"], action, sell_quantity, price, reason, result
+    ))
+    return order
+
+
+def _cancel_active_orders(inst, reason):
+    cancel_fn = globals().get("cancel")
+    canceled = 0
+    for order in inst["orders"]:
+        if not _is_order_active(order) or order["status"] == ORDER_CANCEL_REQUESTED:
+            continue
+        order["cancel_requested_at"] = _now()
+        order["status"] = ORDER_CANCEL_REQUESTED
+        if not ENABLE_LIVE_ORDERS:
+            order["status"] = ORDER_CANCELED
+            canceled += 1
+            continue
+        if not order.get("order_id") or not callable(cancel_fn):
+            _log("[CANCEL_WAIT] code=%s action=%s reason=order_id_or_cancel_unavailable" % (
+                inst["code"], order["action"]
+            ))
+            continue
+        try:
+            result = cancel_fn(order["order_id"], ACCOUNT_ID, ACCOUNT_TYPE, _C)
+            canceled += 1
+            _log("[CANCEL_REQUEST] code=%s action=%s id=%s reason=%s return=%r" % (
+                inst["code"], order["action"], order["order_id"], reason, result
+            ))
+        except Exception as exc:
+            _log("[CANCEL_FAILED] code=%s action=%s id=%s error=%r" % (
+                inst["code"], order["action"], order.get("order_id", ""), exc
+            ))
+    if _has_active_orders(inst):
+        pending = inst.get("pending_after_cancel")
+        if pending:
+            pending["deadline"] = _now() + CANCEL_WAIT_SECONDS
+    return canceled
+
+
+def _queue_after_cancel(inst, requests, reason, next_flag=None, next_reason="", set_exp=None):
+    if not requests:
+        return
+    if any(_action_known(inst, item["action"]) for item in requests):
+        return
+    inst["pending_after_cancel"] = {
+        "requests": list(requests),
+        "reason": reason,
+        "deadline": _now() + CANCEL_WAIT_SECONDS,
+        "next_flag": next_flag,
+        "next_reason": next_reason,
+        "set_exp": set_exp,
+    }
+    _cancel_active_orders(inst, reason)
+    _drain_pending_after_cancel(inst)
+
+
+def _drain_pending_after_cancel(inst):
+    pending = inst.get("pending_after_cancel")
+    if not pending or _has_active_orders(inst):
+        return
+    if pending.get("deadline", 0) < _now():
+        _log("[PENDING_SELL_ABORTED] code=%s reason=cancel_timeout" % inst["code"])
+        inst["pending_after_cancel"] = None
+        return
+    inst["pending_after_cancel"] = None
+    accepted = False
+    for request in pending["requests"]:
+        order = _submit_sell(
+            inst,
+            request.get("quantity"),
+            request["price"],
+            request["reason"],
+            request["action"],
+        )
+        if order is not None:
+            accepted = True
+            if request.get("set_second"):
+                inst["limit_open_second_sell_done"] = True
+    if accepted and pending.get("set_exp") is not None:
+        inst["exp"] = pending["set_exp"]
+    if accepted and pending.get("next_flag") is not None:
+        _set_flag(inst, pending["next_flag"], pending.get("next_reason", ""))
+
+
+def _handle_auction(inst, quote, seconds):
+    if not (
+        seconds is not None
+        and 9 * 3600 + 24 * 60 + 56 <= seconds < 9 * 3600 + 25 * 60
+        and quote["bid"] > inst["pre_close"] * 0.94
+        and quote["bid"] < inst["pre_close"] * 0.995
+        and inst["exp"] == 1
+        and inst["flag"] == FLAG_NORMAL
+    ):
+        return
+    first_quantity = inst["sell_quantity"]
+    first = _submit_sell(
+        inst, first_quantity, inst["limit_down"],
+        "auction_under_expectation_primary", "auction_under_expectation_primary"
+    )
+    remaining = max(0, inst["sell_quantity"] - first_quantity)
+    _submit_sell(
+        inst, remaining, round(inst["pre_close"] * 1.05, 2),
+        "auction_under_expectation_rebound", "auction_under_expectation_rebound"
+    )
+    if first is not None or remaining > 0:
+        _set_flag(inst, FLAG_AUCTION_UNDER_EXPECTATION, "auction_under_expectation")
+
+
+def _handle_early_under_expectation(inst, quote, seconds):
+    if not (
+        inst["exp"] == 1
+        and quote["bid"] > inst["pre_close"] * 0.94
+        and quote["bid"] < inst["pre_close"] * 0.98
+        and seconds is not None
+        and seconds < 9 * 3600 + 31 * 60
+    ):
+        return
+    request = {
+        "quantity": inst["sell_quantity"],
+        "price": round(quote["bid"] * 0.99, 2),
+        "reason": "early_under_expectation",
+        "action": "early_under_expectation",
+    }
+    _queue_after_cancel(
+        inst, [request], "early_under_expectation_cancel",
+        set_exp=-1,
+    )
+
+
+def _confirm_limit_up(inst, quote):
+    at_limit_up = _price_equal(quote["bid"], inst["limit_up"])
+    if at_limit_up and inst["flag"] != FLAG_LIMIT_UP:
+        inst["limit_up_seen_at"] = _now()
+    amount = _book_amount(quote["bid"], quote["bid_volume"])
+    if at_limit_up and amount > LIMIT_UP_CONFIRM_AMOUNT and inst["flag"] != FLAG_LIMIT_DOWN_CLEAR:
+        _set_flag(inst, FLAG_LIMIT_UP, "limit_up_sealed_amount=%.0f" % amount)
+        inst["open_flag"] = 0
+        _log("[LIMIT_UP_CONFIRMED] code=%s bid=%.3f bid_volume=%d amount=%.0f" % (
+            inst["code"], quote["bid"], quote["bid_volume"], amount
+        ))
+
+
+def _mark_weak_state(inst, quote):
+    if quote["bid"] < inst["pre_close"] * 0.975 and inst["flag"] not in (
+        FLAG_LIMIT_DOWN_CLEAR, FLAG_WEAK, 66
+    ):
+        _set_flag(inst, FLAG_WEAK, "bid_below_minus_2_5_percent")
+
+
+def _handle_weak_rebound_failure(inst, quote, seconds):
+    if not (
+        inst["flag"] == FLAG_WEAK
+        and inst["pre_bid"] >= inst["pre_close"] * 1.02
+        and quote["bid"] < inst["pre_close"] * 1.02
+        and inst["day_low"] < inst["pre_close"] * 0.97
+        and seconds is not None
+        and seconds > 9 * 3600 + 33 * 60
+    ):
+        return
+    request = {
+        "quantity": inst["sell_quantity"],
+        "price": round(quote["bid"] * 0.99, 2),
+        "reason": "weak_rebound_failure_primary",
+        "action": "weak_rebound_primary",
+    }
+    remaining = max(0, inst["sell_quantity"] - inst["sell_quantity"])
+    if remaining > 0:
+        request2 = {
+            "quantity": remaining,
+            "price": round(inst["pre_close"] * 1.04, 2),
+            "reason": "weak_rebound_failure_remainder",
+            "action": "weak_rebound_remainder",
+        }
+        requests = [request, request2]
+    else:
+        requests = [request]
+    _queue_after_cancel(
+        inst, requests, "weak_rebound_failure_cancel",
+        next_flag=FLAG_NORMAL, next_reason="weak_rebound_failure",
+    )
+
+
+def _handle_limit_down_clear(inst, quote):
+    if not (
+        _price_equal(quote["ask"], inst["limit_down"])
+        and inst["open_price"] > inst["pre_close"] * 0.91
+        and inst["flag"] != FLAG_LIMIT_DOWN_CLEAR
+        and _book_amount(quote["ask"], quote["ask_volume"]) > LIMIT_DOWN_CLEAR_AMOUNT
+    ):
+        return
+    request = {
+        "quantity": None,
+        "price": inst["limit_down"],
+        "reason": "limit_down_clear",
+        "action": "limit_down_clear",
+    }
+    _queue_after_cancel(
+        inst, [request], "limit_down_clear_cancel",
+        next_flag=FLAG_LIMIT_DOWN_CLEAR, next_reason="limit_down_clear",
+    )
+
+
+def _handle_flag_five(inst, quote, seconds):
+    if inst["flag"] != FLAG_REBOUND or quote["bid"] >= inst["pre_close"] * 1.05:
+        return
+    if seconds is not None and seconds < 9 * 3600 + 31 * 60 and inst["open_price"] < inst["pre_close"] * 1.05:
+        _log("[FLAG5_WAIT] code=%s reason=first_minute_below_5_percent" % inst["code"])
+        return
+    if inst["day_high"] > inst["pre_close"] * 1.065:
+        reason = "flag5_high_above_6_5_break_5"
+        action = "flag5_high_pullback"
+    elif quote["bid"] < inst["pre_close"] * 1.03:
+        reason = "flag5_break_3"
+        action = "flag5_break3"
+    else:
+        return
+    request = {
+        "quantity": inst["sell_quantity"],
+        "price": round(quote["bid"] * 0.99, 2),
+        "reason": reason,
+        "action": action,
+    }
+    _queue_after_cancel(inst, [request], reason + "_cancel", next_flag=FLAG_SELL_DONE, next_reason=reason)
+
+
+def _handle_flag_seven(inst, quote, seconds):
+    if inst["flag"] != FLAG_STRONG:
+        return
+    if inst["day_high"] > 0 and quote["bid"] < inst["day_high"] * 0.975:
+        request = {
+            "quantity": inst["sell_quantity"],
+            "price": round(quote["bid"] * 0.99, 2),
+            "reason": "flag7_high_pullback_2_5",
+            "action": "flag7_high_pullback_25",
+        }
+        _queue_after_cancel(inst, [request], "flag7_high_pullback_cancel", next_flag=FLAG_SELL_DONE, next_reason="flag7_high_pullback_2_5")
+    if (
+        inst["flag"] == FLAG_STRONG
+        and inst["day_high"] > inst["pre_close"] * 1.085
+        and quote["bid"] < inst["pre_close"] * 1.07
+    ):
+        request = {
+            "quantity": inst["sell_quantity"],
+            "price": round(quote["bid"] * 0.985, 2) + 0.01,
+            "reason": "flag7_break_7_after_high_8_5",
+            "action": "flag7_break7_after_high",
+        }
+        _queue_after_cancel(inst, [request], "flag7_break7_cancel", next_flag=FLAG_SELL_DONE, next_reason="flag7_break_7")
+    if (
+        inst["flag"] == FLAG_STRONG
+        and quote["bid"] < inst["pre_close"] * 1.065
+        and seconds is not None
+        and seconds < 9 * 3600 + 31 * 60
+    ):
+        request = {
+            "quantity": inst["sell_quantity"],
+            "price": round(quote["bid"] * 0.99, 2),
+            "reason": "flag7_morning_break_6_5",
+            "action": "flag7_morning_take_profit",
+        }
+        _queue_after_cancel(inst, [request], "flag7_morning_cancel", next_flag=FLAG_SELL_DONE, next_reason="flag7_morning")
+
+
+def _handle_limit_up_open(inst, quote, seconds):
+    if inst["flag"] != FLAG_LIMIT_UP:
+        return
+    if inst["open_flag"] == FLAG_LIMIT_UP and inst["up_sell"] == LIMIT_UP_FIRST_SELL_DONE:
+        return
+    amount = _book_amount(quote["bid"], quote["bid_volume"])
+    previous_amount = inst["pre_up_amount"]
+    opened_or_weakened = (
+        quote["bid"] < inst["limit_up"]
+        or (
+            _price_equal(quote["bid"], inst["limit_up"])
+            and amount < LIMIT_UP_WEAK_AMOUNT
+            and previous_amount - amount > LIMIT_UP_WEAK_REDUCE_AMOUNT
+        )
+        or (
+            _price_equal(quote["bid"], inst["limit_up"])
+            and amount < LIMIT_UP_LARGE_AMOUNT
+            and previous_amount - amount > LIMIT_UP_LARGE_REDUCE_AMOUNT
+        )
+    )
+    if opened_or_weakened:
+        gap = _now() - (inst["limit_up_seen_at"] or _now())
+        if gap < LIMIT_OPEN_GRACE_SECONDS and inst["open_price"] < inst["limit_up"] and seconds < 9 * 3600 + 40 * 60:
+            _log("[LIMIT_OPEN_WAIT] code=%s reason=within_first_minute" % inst["code"])
+        elif inst["up_sell"] != LIMIT_UP_FIRST_SELL_DONE:
+            order = _submit_sell(
+                inst, inst["sell_quantity"], round(quote["bid"] * 0.982, 2),
+                "limit_open_first_sell", "limit_open_first_sell"
+            )
+            if order is not None:
+                inst["up_sell"] = LIMIT_UP_FIRST_SELL_DONE
+                _log("[LIMIT_OPEN_FIRST_SELL] code=%s" % inst["code"])
+    if quote["bid"] < inst["limit_up"]:
+        if inst["open_flag"] != FLAG_LIMIT_UP:
+            inst["limit_open_started_at"] = _now()
+            inst["open_flag"] = FLAG_LIMIT_UP
+        if inst["up_sell"] == LIMIT_UP_FIRST_SELL_DONE:
+            _set_flag(inst, FLAG_SELL_DONE, "limit_open_first_sell")
+
+
+def _handle_limit_open_second_sell(inst, quote, first_sell_done_before_tick):
+    if not (
+        first_sell_done_before_tick
+        and not inst["limit_open_second_sell_done"]
+        and inst["pre_bid"] >= inst["pre_close"] * 1.03
+        and quote["bid"] < inst["pre_close"] * 1.03
+    ):
+        return
+    request = {
+        "quantity": inst["sell_quantity"],
+        "price": round(quote["bid"] * 0.99, 2),
+        "reason": "limit_open_second_sell_break_3",
+        "action": "limit_open_second_sell",
+        "set_second": True,
+    }
+    _queue_after_cancel(
+        inst, [request], "limit_open_second_sell_cancel",
+        next_flag=FLAG_SELL_DONE, next_reason="limit_open_second_sell",
+    )
+
+
+def _recover_after_limit_open_timeout(inst, quote):
+    if inst["open_flag"] == FLAG_LIMIT_UP and quote["bid"] < inst["limit_up"]:
+        if _now() - (inst["limit_open_started_at"] or _now()) > LIMIT_OPEN_RECOVERY_SECONDS:
+            inst["open_flag"] = 0
+            inst["limit_open_started_at"] = _now()
+            _set_flag(inst, FLAG_NORMAL, "limit_open_5_minutes_no_reseal")
+
+
+def _update_price_state(inst, quote):
+    if (
+        quote["bid"] > inst["pre_close"] * 1.07
+        and quote["bid"] < inst["limit_up"]
+        and inst["flag"] >= 0
+        and inst["flag"] != FLAG_LIMIT_UP
+    ):
+        _set_flag(inst, FLAG_STRONG, "bid_above_7_percent")
+    if (
+        quote["bid"] > inst["pre_close"] * 1.04
+        and quote["bid"] < inst["pre_close"] * 1.07
+        and inst["flag"] == FLAG_WEAK
+    ):
+        _set_flag(inst, FLAG_REBOUND, "weak_state_rebound_4_to_7_percent")
+
+
+def _log_flag7_monitor(inst, quote):
+    if inst["flag"] != FLAG_STRONG:
+        inst["flag7_condition_state"] = None
+        return
+    high_reached = inst["day_high"] > inst["pre_close"] * 1.085
+    pulled_back = quote["bid"] < inst["pre_close"] * 1.07
+    state = (high_reached, pulled_back)
+    if state != inst["flag7_condition_state"]:
+        _log("[FLAG7_MONITOR] code=%s bid=%.3f high=%.3f high_8_5=%s back_7=%s pullback_2_5=%.3f" % (
+            inst["code"], quote["bid"], inst["day_high"], high_reached, pulled_back,
+            inst["day_high"] * 0.975
+        ))
+    inst["flag7_condition_state"] = state
+
+
+def _finish_quote(inst, quote):
+    inst["pre_bid"] = quote["bid"]
+    if _price_equal(quote["bid"], inst["limit_up"]):
+        inst["pre_up_amount"] = _book_amount(quote["bid"], quote["bid_volume"])
+
+
+def _process_l2quote(inst, data, event_seconds):
+    quote = _update_market(inst, data, _event_time(_field(data, "stime", "time", "timestamp")))
+    if quote["bid"] <= 0 or inst["pre_close"] <= 0 or inst["limit_up"] <= 0:
+        return
+    first_sell_done_before_tick = inst["up_sell"] == LIMIT_UP_FIRST_SELL_DONE
+    _drain_pending_after_cancel(inst)
+    _handle_auction(inst, quote, event_seconds)
+    if not _in_regular_session(event_seconds):
+        return
+    _handle_early_under_expectation(inst, quote, event_seconds)
+    _confirm_limit_up(inst, quote)
+    _mark_weak_state(inst, quote)
+    _handle_weak_rebound_failure(inst, quote, event_seconds)
+    _handle_limit_down_clear(inst, quote)
+    _handle_flag_five(inst, quote, event_seconds)
+    _handle_flag_seven(inst, quote, event_seconds)
+    _handle_limit_up_open(inst, quote, event_seconds)
+    _handle_limit_open_second_sell(inst, quote, first_sell_done_before_tick)
+    _recover_after_limit_open_timeout(inst, quote)
+    _update_price_state(inst, quote)
+    _log_flag7_monitor(inst, quote)
+    _finish_quote(inst, quote)
+
+
+def _handle_quote(code, period, payload):
+    with _LOCK:
+        inst = _INSTANCES.get(code)
+        if not inst:
+            return
+        data = _owned_payload(code, payload)
+        event_seconds = _event_seconds(_field(data, "stime", "time", "timestamp"))
+        if period == "tick":
+            _update_market(inst, data, _event_time(_field(data, "stime", "time", "timestamp")))
+            return
+        if period == "l2quote":
+            _process_l2quote(inst, data, event_seconds)
+
+
+def _subscribe(C, code, period):
+    global _SUB_SUCCESS, _SUB_FAILED
+    callback = lambda data, c=code, p=period: _handle_quote(c, p, data)
+    try:
+        sub_id = C.subscribe_quote(
+            code, period=period, dividend_type="follow", result_type="dict", callback=callback
+        )
+        if sub_id and sub_id > 0:
+            _SUB_SUCCESS += 1
+            _SUBSCRIPTIONS.append(sub_id)
+            _log("[SUBSCRIBE] code=%s period=%s id=%s" % (code, period, sub_id))
+        else:
+            _SUB_FAILED += 1
+            _log("[SUBSCRIBE_FAILED] code=%s period=%s return=%r" % (code, period, sub_id))
+    except Exception as exc:
+        _SUB_FAILED += 1
+        _log("[SUBSCRIBE_FAILED] code=%s period=%s error=%r" % (code, period, exc))
+
+
+def _script_root():
+    path = globals().get("__file__")
+    return os.path.dirname(os.path.abspath(path)) if path else os.getcwd()
+
+
+def _resolve_csv_path():
+    configured = str(os.environ.get("CYTRADE_JUEJIN_SELL_CSV_PATH", "") or "").strip()
+    candidates = [
+        configured,
+        os.path.join(_script_root(), "data", "sell_10.csv"),
+        CSV_PATH,
+        os.path.join(os.getcwd(), "data", "sell_10.csv"),
+    ]
+    for value in candidates:
+        if value and os.path.isfile(value):
+            return os.path.abspath(value)
+    return os.path.abspath(CSV_PATH)
+
+
+def _to_int(value):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _load_pool(path):
+    if not os.path.isfile(path):
+        raise ValueError("CSV not found: %s" % path)
+    result = []
+    seen = set()
+    with io.open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row_no, row in enumerate(reader, 2):
+            code = _stock_code(row.get("symbol") or row.get("\u80a1\u7968\u4ee3\u7801"))
+            quantity = max(0, _to_int(row.get("sellvol") or row.get("\u5356\u51fa\u6570\u91cf")))
+            if not code or quantity <= 0:
+                raise ValueError("invalid row %s" % row_no)
+            if code in seen:
+                raise ValueError("duplicate symbol row %s: %s" % (row_no, code))
+            seen.add(code)
+            result.append({
+                "row_no": row_no,
+                "code": code,
+                "exp": _to_int(row.get("exp")),
+                "sell_quantity": quantity,
+                "nick": str(row.get("nick") or code),
+            })
+    if not result:
+        raise ValueError("CSV contains no rows")
+    return result
+
+
+def _initial_quote(C, inst):
+    try:
+        detail_getter = getattr(C, "get_instrument_detail", None)
+        if callable(detail_getter):
+            detail = detail_getter(inst["code"])
+            _update_market(inst, detail, "")
+            if inst["pre_close"] <= 0:
+                inst["pre_close"] = _safe_float(_field(
+                    detail, "PreClose", "lastClose", "preClose", "pre_close"
+                ))
+            if inst["limit_up"] <= 0:
+                inst["limit_up"] = _safe_float(_field(
+                    detail, "UpStopPrice", "upStopPrice", "upLimit", "upLimitPrice"
+                ))
+            if inst["limit_down"] <= 0:
+                inst["limit_down"] = _safe_float(_field(
+                    detail, "DownStopPrice", "downStopPrice", "downLimit", "downLimitPrice"
+                ))
+        full_getter = getattr(C, "get_full_tick", None)
+        if not callable(full_getter):
+            return
+        payload = full_getter([inst["code"]])
+        data = _owned_payload(inst["code"], payload)
+        event_seconds = _event_seconds(_field(data, "stime", "time", "timestamp"))
+        quote = _update_market(inst, data, _event_time(_field(data, "stime", "time", "timestamp")))
+        if quote["bid"] > 0 and _price_equal(quote["bid"], inst["limit_up"]):
+            amount = _book_amount(quote["bid"], quote["bid_volume"])
+            if amount > LIMIT_UP_CONFIRM_AMOUNT:
+                inst["limit_up_seen_at"] = _now()
+                _set_flag(inst, FLAG_LIMIT_UP, "startup_observed_limit_up")
+                inst["pre_up_amount"] = amount
+                _log("[STARTUP_LIMIT_UP] code=%s amount=%.0f event=%s" % (
+                    inst["code"], amount, _event_time(_field(data, "stime", "time", "timestamp"))
+                ))
+        inst["pre_bid"] = quote["bid"]
+    except Exception as exc:
+        _log("[INITIAL_QUOTE_FAILED] code=%s error=%r" % (inst["code"], exc))
+
+
+def _summary():
+    states = {}
+    active = 0
+    for inst in _INSTANCES.values():
+        states[inst["flag"]] = states.get(inst["flag"], 0) + 1
+        if _has_active_orders(inst):
+            active += 1
+    _log("[SUMMARY] stocks=%d subscriptions=%d/%d active_orders=%d flags=%s csv=%s" % (
+        len(_INSTANCES), _SUB_SUCCESS, _SUB_SUCCESS + _SUB_FAILED, active,
+        ",".join("%s:%s" % item for item in sorted(states.items())), _CSV_USED
+    ))
+
+
+def _drain_all_pending():
+    for inst in _INSTANCES.values():
+        _drain_pending_after_cancel(inst)
+
+
+def init(C):
+    global _C, _LOG, _LOG_PATH, _CSV_USED, _SUB_SUCCESS, _SUB_FAILED, _LAST_SUMMARY
+    with _LOCK:
+        _C = C
+        if ACCOUNT_ID:
+            setter = getattr(C, "set_account", None)
+            if callable(setter):
+                setter(ACCOUNT_ID, ACCOUNT_TYPE)
+        log_dir = os.path.join(_script_root(), "..", "userdata", "log")
+        if not os.path.isdir(log_dir):
+            log_dir = os.path.join(os.getcwd(), "userdata", "log")
+        try:
+            if not os.path.isdir(log_dir):
+                os.makedirs(log_dir)
+            day = _dt.datetime.now().strftime("%Y%m%d")
+            _LOG_PATH = os.path.abspath(os.path.join(log_dir, "juejin_sell_native_%s.log" % day))
+            _LOG = open(_LOG_PATH, "a")
+        except Exception:
+            _LOG = None
+            _LOG_PATH = ""
+        _SUBSCRIPTIONS[:] = []
+        _SUB_SUCCESS = 0
+        _SUB_FAILED = 0
+        _INSTANCES.clear()
+        try:
+            _CSV_USED = _resolve_csv_path()
+            plans = _load_pool(_CSV_USED)
+        except Exception as exc:
+            _log("[ABORT] csv_load_failed error=%r" % (exc,))
+            return
+        for plan in plans:
+            inst = _new_instance(plan)
+            _INSTANCES[inst["code"]] = inst
+            _log("[JUEJIN_STATUS] code=%s nick=%s status=0 reason=initial" % (inst["code"], inst["nick"]))
+            _initial_quote(C, inst)
+        for inst in _INSTANCES.values():
+            for period in PERIODS:
+                _subscribe(C, inst["code"], period)
+        _LAST_SUMMARY = _now()
+        _log("[INIT] csv=%s stocks=%d live=%s log=%s" % (
+            _CSV_USED, len(_INSTANCES), ENABLE_LIVE_ORDERS, _LOG_PATH or "<console>"
+        ))
+
+
+def handlebar(C):
+    global _LAST_SUMMARY
+    with _LOCK:
+        _drain_all_pending()
+        if _now() - _LAST_SUMMARY >= SUMMARY_INTERVAL_SECONDS:
+            _summary()
+            _LAST_SUMMARY = _now()
+
+
+def order_callback(ContextInfo, orderInfo):
+    with _LOCK:
+        item = _order_fields(orderInfo)
+        for inst in _INSTANCES.values():
+            order = _find_order(inst, item)
+            if order is not None:
+                _apply_order_update(inst, order, item)
+                return
+        _log("[ORDER_CALLBACK_UNMATCHED] id=%s token=%s code=%s" % (
+            item.get("order_id", ""), item.get("token", ""), item.get("code", "")
+        ))
+
+
+def deal_callback(ContextInfo, dealInfo):
+    with _LOCK:
+        item = _order_fields(dealInfo)
+        for inst in _INSTANCES.values():
+            order = _find_order(inst, item)
+            if order is not None:
+                _apply_deal_update(inst, order, item)
+                return
+        pending = [
+            (inst, order)
+            for inst in _INSTANCES.values()
+            if item.get("code") == inst["code"]
+            for order in inst["orders"]
+            if order.get("status") == ORDER_SUBMITTING
+        ]
+        if len(pending) == 1:
+            inst, order = pending[0]
+            order.setdefault("pending_deal_infos", []).append(item)
+            _log("[DEAL_PENDING] code=%s order_id=%s deal_id=%s reason=order_id_not_bound" % (
+                inst["code"], item.get("order_id", ""), item.get("deal_id", "")
+            ))
+            return
+        _log("[DEAL_UNMATCHED] id=%s token=%s code=%s" % (
+            item.get("order_id", ""), item.get("token", ""), item.get("code", "")
+        ))
+
+
+def stop(C):
+    with _LOCK:
+        for sub_id in list(_SUBSCRIPTIONS):
+            try:
+                C.unsubscribe_quote(sub_id)
+            except Exception:
+                pass
+        _SUBSCRIPTIONS[:] = []
+        for inst in _INSTANCES.values():
+            _log("[STOP] code=%s flag=%s active_orders=%s" % (
+                inst["code"], inst["flag"], _has_active_orders(inst)
+            ))
+        if _LOG:
+            try:
+                _LOG.close()
+            except Exception:
+                pass
+
+
+__all__ = ["init", "handlebar", "stop", "order_callback", "deal_callback"]
