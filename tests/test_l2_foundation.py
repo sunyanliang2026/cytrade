@@ -221,6 +221,10 @@ def test_l2_subscription_diagnostics_record_sub_ids(monkeypatch):
     manager = DataSubscriptionManager()
     manager.subscribe_l2_stocks(["000001"], kinds=["l2order", "l2transaction"])
 
+    calls_by_kind = {item[1]: item for item in fake_xtdata.calls}
+    assert calls_by_kind["l2order"][2] == 0
+    assert calls_by_kind["l2transaction"][2] == -1
+
     diagnostics = {
         item["kind"]: item
         for item in manager.get_l2_subscription_diagnostics()

@@ -13,5 +13,6 @@
   "reseal_min_prior_seal_seconds": 10.0,
   "reseal_min_reopen_seconds": 3.0,
   "neighbor_count": 10,
-  "neighbor_window_seconds": 3.0
+  "neighbor_window_seconds": 3.0,
+  "opening_l2order_delay_seconds": 30.0
 }

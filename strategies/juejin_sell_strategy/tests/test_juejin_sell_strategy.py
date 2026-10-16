@@ -282,10 +282,6 @@ def test_juejin_sell_limit_up_open_first_sell_and_five_min_sell():
     assert strategy._open_flag == 10
     assert strategy._flag == -9
 
-    # The remaining assertions below document the old five-minute order path.
-    # The path is intentionally disabled; dedicated tests cover the new behavior.
-    return
-
     strategy.process_tick(
         _tick(
             "09:43:01",
@@ -299,9 +295,7 @@ def test_juejin_sell_limit_up_open_first_sell_and_five_min_sell():
         )
     )
 
-    assert executor.orders[-1].quantity == 200
-    assert executor.orders[-1].price == 10.8
-    assert executor.orders[-1].remark == "涨停开板 5 分钟不回封卖出"
+    assert len(executor.orders) == 1
     assert strategy._open_flag == 0
     assert strategy._flag == 7
 

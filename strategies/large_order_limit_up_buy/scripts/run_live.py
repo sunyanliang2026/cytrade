@@ -30,6 +30,7 @@ from strategies.large_order_limit_up_buy.scripts.run_market_only import (
     log_monitor_summary,
     run_auction_snapshot_loop,
     session_time,
+    sync_opening_l2order_subscription,
 )
 
 SESSION_EVENT_PREFIX = "LARGE_ORDER_LIMIT_UP_BUY_LIVE"
@@ -74,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-total-amount", type=float, default=0.0, help="Required hard limit for total CSV plan_amount.")
     parser.add_argument("--no-market-day-check", dest="market_day_only", action="store_false")
     parser.add_argument("--full-console", action="store_true", help="Print all runtime console logs for troubleshooting.")
+    parser.add_argument("--latency-diagnostics", action="store_true", help="Start the extra L2 reference probe and detailed timing capture.")
     parser.set_defaults(market_day_only=True)
     return parser
 
@@ -154,6 +156,10 @@ def run_live_session(args: argparse.Namespace) -> str:
     runner = ctx["runner"]
     data_sub = ctx["data_sub"]
     stop_at = session_time(datetime.now(), args.stop_time)
+    diagnostic = None
+    if args.latency_diagnostics:
+        from strategies.large_order_limit_up_buy.latency_diagnostics import start_diagnostics
+        diagnostic = start_diagnostics(configs, data_sub, stop_at, Path(args.record_dir))
 
     def stop(sig=None, frame=None) -> None:
         logger.info("%s stopping sig=%s", SESSION_EVENT_PREFIX, sig)
@@ -175,6 +181,7 @@ def run_live_session(args: argparse.Namespace) -> str:
         strategies = []
         for config in configs:
             strategy = LargeOrderLimitUpBuyStrategy(config, ctx["trade_exec"], ctx["pos_mgr"])
+            strategy._latency_diagnostic = diagnostic
             strategies.append(strategy)
             runner.add_strategy(strategy, sync_subscriptions=False)
         runner.sync_subscriptions()
@@ -189,22 +196,31 @@ def run_live_session(args: argparse.Namespace) -> str:
         auction_thread.start()
         _start_runtime_heartbeat(ctx, stop_event, mode="live")
         logger.info(
-            "[LARGE_ORDER] [启动] 实盘=true 已订阅%d只股票，L2已启动",
-            len(data_sub.get_l2_subscription_map()),
-        )
+        "[LARGE_ORDER] [启动] 实盘=true 已订阅%d只股票，L2已启动",
+        len(data_sub.get_l2_subscription_map()),
+    )
+        if not diagnostic:
+            logger.info("[LARGE_ORDER] [启动] 附加延迟探针未启动；保留策略原始行情和订单记录")
         next_summary = time.monotonic() + SUMMARY_INTERVAL_SECONDS
+        opening_l2order_state = {"opened": False}
         while not stop_event.is_set() and datetime.now() < stop_at:
             time.sleep(1)
+            sync_opening_l2order_subscription(runner, strategies, logger, opening_l2order_state)
             if time.monotonic() >= next_summary:
                 log_monitor_summary(logger, strategies, data_sub)
                 next_summary += SUMMARY_INTERVAL_SECONDS
     finally:
         stop_event.set()
-        runner.stop()
-        data_sub.stop()
-        connection = ctx.get("conn_mgr")
-        if connection and hasattr(connection, "disconnect"):
-            connection.disconnect()
+        try:
+            runner.stop()
+            data_sub.stop()
+            connection = ctx.get("conn_mgr")
+            if connection and hasattr(connection, "disconnect"):
+                connection.disconnect()
+        finally:
+            if diagnostic:
+                from strategies.large_order_limit_up_buy.latency_diagnostics import observe
+                observe(diagnostic, "close")
         logger.info(
             "%s stopped live=true system_log=%s trade_log=%s",
             SESSION_EVENT_PREFIX, get_log_file_path("system"), get_log_file_path("trade"),

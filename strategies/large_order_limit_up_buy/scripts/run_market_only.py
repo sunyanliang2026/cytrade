@@ -214,6 +214,21 @@ def session_time(now: datetime, value: str) -> datetime:
     return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
+def sync_opening_l2order_subscription(runner, strategies, logger, state: dict) -> None:
+    """Add l2order only after the opening protection gate opens."""
+    if state.get("opened") or not strategies:
+        return
+    if not any(strategy.is_l2order_window_open() for strategy in strategies):
+        return
+    runner.sync_subscriptions()
+    state["opened"] = True
+    delay = min(
+        float(getattr(strategy, "_opening_l2order_delay_seconds", 30.0) or 0.0)
+        for strategy in strategies
+    )
+    logger.info("[LARGE_ORDER] [启动保护] 开盘保护结束（%.1f秒），开始订阅l2order", delay)
+
+
 def log_monitor_summary(logger, strategies, data_sub) -> None:
     status = data_sub.get_latest_data_status()
     latest = status.get("latest_data_time") or ""
@@ -229,7 +244,7 @@ def log_monitor_summary(logger, strategies, data_sub) -> None:
     groups = {}
     for strategy in strategies:
         groups.setdefault(strategy.console_status(), []).append(strategy)
-    order = ["已成交", "最低涨幅不足已剔除", "验证失败已撤单", "等待首封", "等待开板", "等待回封", "等待首条行情", "当日结束"]
+    order = ["已成交", "已下单，等待成交", "最低涨幅不足已剔除", "验证失败已撤单", "等待首封", "等待开板", "等待回封", "等待首条行情", "当日结束"]
     for status in order:
         items = groups.get(status, [])
         if items:
@@ -267,6 +282,8 @@ def main() -> None:
     data_sub = ctx["data_sub"]
     stop_event = threading.Event()
     stop_at = session_time(datetime.now(), args.stop_time)
+    from strategies.large_order_limit_up_buy.latency_diagnostics import start_diagnostics
+    diagnostic = start_diagnostics(configs, data_sub, stop_at, Path(args.record_dir))
 
     def stop(sig=None, frame=None) -> None:
         logger.info("LargeOrderLimitUpBuy market-only stopping sig=%s", sig)
@@ -284,6 +301,7 @@ def main() -> None:
         strategies = []
         for config in configs:
             strategy = LargeOrderLimitUpBuyStrategy(config, ctx.get("trade_exec"), ctx.get("pos_mgr"))
+            strategy._latency_diagnostic = diagnostic
             strategies.append(strategy)
             runner.add_strategy(strategy, sync_subscriptions=False)
         runner.sync_subscriptions()
@@ -299,15 +317,22 @@ def main() -> None:
         _start_runtime_heartbeat(ctx, stop_event, mode="market-only")
         logger.info("[LARGE_ORDER] monitoring_started live=false l2=%s", data_sub.get_l2_subscription_map())
         next_summary = time.monotonic() + SUMMARY_INTERVAL_SECONDS
+        opening_l2order_state = {"opened": False}
         while not stop_event.is_set() and datetime.now() < stop_at:
             time.sleep(1)
+            sync_opening_l2order_subscription(runner, strategies, logger, opening_l2order_state)
             if time.monotonic() >= next_summary:
                 log_monitor_summary(logger, strategies, data_sub)
                 next_summary += SUMMARY_INTERVAL_SECONDS
     finally:
         stop_event.set()
-        runner.stop()
-        data_sub.stop()
+        try:
+            runner.stop()
+            data_sub.stop()
+        finally:
+            if diagnostic:
+                from strategies.large_order_limit_up_buy.latency_diagnostics import observe
+                observe(diagnostic, "close")
         logger.info(
             "LargeOrderLimitUpBuy stopped dry_run=true real_order_sent=false system_log=%s trade_log=%s",
             get_log_file_path("system"), get_log_file_path("trade"),

@@ -12,7 +12,7 @@ import math
 import threading
 import time
 from collections import deque
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -31,8 +31,19 @@ logger = get_logger("trade")
 def _serialized(method):
     @wraps(method)
     def guarded(self, *args, **kwargs):
+        diagnostic = getattr(self, "_latency_diagnostic", None)
+        if diagnostic:
+            from strategies.large_order_limit_up_buy.latency_diagnostics import observe, stamp
+        began = observe(diagnostic, "strategy_begin", self, method.__name__) if diagnostic else None
         with self._event_lock:
-            return method(self, *args, **kwargs)
+            acquired = stamp() if began else None
+            if began:
+                observe(diagnostic, "strategy_acquired", began, acquired)
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                if began:
+                    observe(diagnostic, "strategy_end", self, method.__name__, args[0] if args else None, began, acquired)
     return guarded
 
 
@@ -112,6 +123,9 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         )
         self._neighbor_count = max(1, int(params.get("neighbor_count", 5) or 5))
         self._neighbor_window_seconds = max(0.0, float(params.get("neighbor_window_seconds", 3.0) or 3.0))
+        self._opening_l2order_delay_seconds = max(
+            0.0, float(params.get("opening_l2order_delay_seconds", 30.0) or 30.0)
+        )
         self._record_dir = Path(str(params.get("record_dir") or self.DEFAULT_RECORD_DIR))
         self._limit_up_price = 0.0
         self._limit_up_price_warning_logged = False
@@ -175,6 +189,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._raw_write_stats = {
             kind: [0, 0.0, 0.0] for kind in ("l2order", "l2transaction", "l2orderqueue")
         }
+        self._ignored_l2order_count = 0
         self._post_order_started_at: datetime | None = None
         self._post_order_big_orders: dict[str, dict[str, Any]] = {}
         self._post_order_sequence = 0
@@ -182,12 +197,24 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
 
     @classmethod
     def required_data_kinds(cls) -> set[str]:
-        return {"tick", "l2quote", "l2order", "l2transaction", "l2orderqueue"}
+        # Keep only feeds used for entry decisions and opening-dip filtering.
+        # Transaction and order-queue callbacks remain available for replay
+        # compatibility, but are intentionally not subscribed in production.
+        return {"tick", "l2quote", "l2order"}
 
     def current_data_kinds(self) -> set[str]:
         if self._excluded_low_gain:
             return set()
-        return self.required_data_kinds()
+        kinds = {"tick", "l2quote"}
+        if self.is_l2order_window_open():
+            kinds.add("l2order")
+        return kinds
+
+    def is_l2order_window_open(self, now: datetime | None = None) -> bool:
+        """Return whether new l2order data may enter the strategy."""
+        now = now or datetime.now()
+        opening = datetime.combine(now.date(), dt_time(9, 30))
+        return now >= opening + timedelta(seconds=self._opening_l2order_delay_seconds)
 
     def _check_low_gain_exclusion(self, low_price: float, pre_close: float) -> bool:
         if self._excluded_low_gain:
@@ -199,20 +226,20 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         low_price = self._exclusion_low_price
         if low_price <= 0 or self._pre_close <= 0:
             return False
-        if low_price >= self._pre_close * 1.015 - 1e-8:
+        if low_price >= self._pre_close - 1e-8:
             return False
         self._excluded_low_gain = True
         self._reseal_validation_active = False
         self._cancel_reseal_validation_timer()
         self._late_reseal_active = False
         self._reseal_ready = False
-        self._set_entry_phase("DONE", "session_low_gain_below_1_5_percent")
+        self._set_entry_phase("DONE", "session_low_gain_below_zero_percent")
         self._finish_post_order_window()
         gain = (low_price / self._pre_close - 1.0) * 100.0
         self._log_event("low_gain_excluded", low_price=low_price, pre_close=self._pre_close,
                         lowest_gain_percent=round(gain, 4), cancel_requested=False)
         logger.info(
-            "[LARGE_ORDER] [停止监控] %s 最低价=%.3f 最低涨幅=%.2f%%，低于1.5%%；取消行情订阅，已有挂单保留",
+            "[LARGE_ORDER] [停止监控] %s 最低价=%.3f 最低涨幅=%.2f%%，低于0%%；取消行情订阅，已有挂单保留",
             self._display_name(), low_price, gain,
         )
         return True
@@ -256,6 +283,7 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                         "reseal_min_reopen_seconds": self._reseal_min_reopen_seconds,
                         "neighbor_count": self._neighbor_count,
                         "neighbor_window_seconds": self._neighbor_window_seconds,
+                        "opening_l2order_delay_seconds": self._opening_l2order_delay_seconds,
                         "record_dir": str(self._record_dir),
                     },
                 ))
@@ -451,10 +479,12 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             return
         if self._excluded_low_gain:
             return
+        order_time = event.event_time or event.recv_time
+        if not self.is_l2order_window_open(order_time) or not self._is_continuous_trading_time(order_time):
+            self._ignored_l2order_count += 1
+            return
         strategy_time = datetime.now()
         self._write_raw("l2order", event.event_time, event.raw_xt_fields)
-        if not self._is_continuous_trading_time(event.event_time):
-            return
         self._maybe_finish_post_order_window(event.event_time)
         self._maybe_finish_late_reseal_window(event.event_time)
         if self._entry_phase == "WAIT_INITIAL_QUOTE" or self._entry_phase == "WAIT_REOPEN":
@@ -584,8 +614,17 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             trigger.get("entrust_no", ""),
         )
         remark = f"L2涨停大单打板 trigger={trigger.get('entrust_no', '')} front={front_volume}股"
-        order = self.add_position(price, quantity, remark)
-        submit_monotonic = time.monotonic()
+        diagnostic = getattr(self, "_latency_diagnostic", None)
+        if diagnostic:
+            from strategies.large_order_limit_up_buy.latency_diagnostics import observe, stamp
+        submit_begin = stamp() if diagnostic else None
+        order = None
+        try:
+            order = self.add_position(price, quantity, remark)
+            submit_monotonic = time.monotonic()
+        finally:
+            if diagnostic:
+                observe(diagnostic, "submit_api", self.stock_code, trigger, submit_begin, order)
         if order is None:
             self._log_event("buy_blocked", reason="order_executor_unavailable", trigger=trigger)
             return
@@ -938,12 +977,15 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
             return "已成交"
         if self._entry_phase == "DONE" and self._reseal_validation_result == "failed":
             return "验证失败已撤单"
+        if self._entry_phase == "DONE":
+            return "当日结束"
+        if self._active_order_uuid:
+            return "已下单，等待成交"
         return {
             "READY": "等待首封",
             "WAIT_REOPEN": "等待开板",
             "WAIT_RESEAL": "等待回封",
             "WAIT_INITIAL_QUOTE": "等待首条行情",
-            "DONE": "当日结束",
         }.get(self._entry_phase, self._entry_phase)
 
     def display_name(self) -> str:
@@ -1001,6 +1043,10 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
                                             "event_time": self._format_time(event_time), "recv_time": datetime.now().isoformat(),
                                             "raw": payload or {}}, ensure_ascii=False, default=str) + "\n")
         self._raw_handle.flush()
+        diagnostic = getattr(self, "_latency_diagnostic", None)
+        if diagnostic:
+            from strategies.large_order_limit_up_buy.latency_diagnostics import observe
+            observe(diagnostic, "raw_write", (time.perf_counter() - started) * 1000)
         if kind in self._raw_write_stats:
             elapsed_ms = (time.perf_counter() - started) * 1000
             stats = self._raw_write_stats[kind]
@@ -1165,6 +1211,10 @@ class LargeOrderLimitUpBuyStrategy(BaseStrategy):
         self._neighbor_handle.flush()
 
     def _log_event(self, event: str, **payload: Any) -> None:
+        diagnostic = getattr(self, "_latency_diagnostic", None)
+        if diagnostic:
+            from strategies.large_order_limit_up_buy.latency_diagnostics import observe
+            observe(diagnostic, "strategy_event", self.stock_code, self._stock_name, event, payload)
         logger.info("%s %s", self.strategy_name, json.dumps({"event": event, "code": self.stock_code,
                                                                "name": self._stock_name, **payload}, ensure_ascii=False, default=str))
 

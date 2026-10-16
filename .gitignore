@@ -31,6 +31,10 @@ strategies/overnight_limit_up_buy/state/
 .tmp_pytest_*/
 strategies/*/data/*.csv
 strategies/*/data/runtime_records/
+strategies/large_order_limit_up_buy/data/latency_probe/
+strategies/large_order_limit_up_buy/data/latency_diagnostics/
+strategies/large_order_limit_up_buy/data/analysis/
+strategies/large_order_limit_up_buy/data/minimal_latency_probe/
 docs/_zip_inspect/
 docs/掘金/
 AGENTS - *.md

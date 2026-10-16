@@ -13,6 +13,40 @@ from strategies.large_order_limit_up_buy.strategy import LargeOrderLimitUpBuyStr
 import strategies.large_order_limit_up_buy.strategy as strategy_module
 
 
+def test_required_data_kinds_exclude_nonessential_l2_streams():
+    assert LargeOrderLimitUpBuyStrategy.required_data_kinds() == {"tick", "l2quote", "l2order"}
+
+
+def test_l2order_window_starts_30_seconds_after_open(tmp_path):
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(stock_code="600001", params={"record_dir": str(tmp_path)}),
+        None,
+        None,
+    )
+    assert not strategy.is_l2order_window_open(datetime(2026, 9, 8, 9, 30, 29))
+    assert strategy.is_l2order_window_open(datetime(2026, 9, 8, 9, 30, 30))
+    assert strategy.current_data_kinds() == {"tick", "l2quote", "l2order"}
+
+
+def test_l2order_before_opening_window_is_ignored_and_not_recorded(tmp_path):
+    strategy = make_strategy(tmp_path)
+    strategy.start()
+
+    strategy.on_l2_order(event(
+        price=8.0,
+        volume=700000,
+        no="protected-window",
+        event_time=datetime(2026, 9, 8, 9, 30, 29),
+    ))
+
+    raw_files = list(tmp_path.rglob("*.l2.jsonl"))
+    assert strategy._ignored_l2order_count == 1
+    assert strategy._trigger_count == 0
+    assert len(raw_files) == 1
+    assert raw_files[0].read_text(encoding="utf-8") == ""
+    strategy.stop()
+
+
 @pytest.fixture(autouse=True)
 def validation_clock(monkeypatch):
     clock = [100.0]
@@ -167,9 +201,9 @@ def test_continuous_session_orders_can_trigger_at_0930(tmp_path):
     mark_open_dip(strategy)
     mark_first_seal_amount(strategy)
 
-    strategy.on_l2_order(event(price=8.0, volume=700000, no="continuous-1", event_time=datetime(2026, 9, 8, 9, 30)))
+    strategy.on_l2_order(event(price=8.0, volume=700000, no="continuous-1", event_time=datetime(2026, 9, 8, 9, 30, 30)))
     assert strategy._trigger_count == 0
-    strategy.on_l2_order(event(price=8.0, volume=700000, no="continuous-2", event_time=datetime(2026, 9, 8, 9, 30, 1)))
+    strategy.on_l2_order(event(price=8.0, volume=700000, no="continuous-2", event_time=datetime(2026, 9, 8, 9, 30, 31)))
 
     assert strategy._trigger_count == 1
 
@@ -396,21 +430,21 @@ def test_post_order_30s_writes_one_row_per_big_order_with_fill_and_cancel(tmp_pa
     mark_open_dip(strategy)
     mark_first_seal_amount(strategy)
     strategy.on_l2_order(event(price=8.0, volume=700000, no="trigger-1",
-                                event_time=datetime(2026, 9, 8, 9, 30)))
+                                event_time=datetime(2026, 9, 8, 9, 30, 30)))
     strategy.on_l2_order(event(price=8.0, volume=700000, no="trigger-2",
-                                event_time=datetime(2026, 9, 8, 9, 30, 1)))
+                                event_time=datetime(2026, 9, 8, 9, 30, 31)))
     strategy.on_l2_order(event(price=8.0, volume=200000, no="big-1",
-                                event_time=datetime(2026, 9, 8, 9, 30, 2)))
+                                event_time=datetime(2026, 9, 8, 9, 30, 32)))
     strategy.on_l2_transaction(L2TransactionEvent(
         stock_code="600001", price=8.0, volume=100000, buy_no="big-1",
-        event_time=datetime(2026, 9, 8, 9, 30, 3),
+        event_time=datetime(2026, 9, 8, 9, 30, 33),
     ))
     strategy.on_l2_transaction(L2TransactionEvent(
         stock_code="600001", price=8.0, volume=100000, buy_no="big-1",
-        trade_flag=3, event_time=datetime(2026, 9, 8, 9, 30, 4),
+        trade_flag=3, event_time=datetime(2026, 9, 8, 9, 30, 34),
     ))
     strategy.on_l2_order(event(price=8.0, volume=100, no="window-end",
-                                event_time=datetime(2026, 9, 8, 9, 30, 31)))
+                                event_time=datetime(2026, 9, 8, 9, 31, 1)))
     strategy.stop()
 
     files = list(tmp_path.rglob("*.post_order_30s_orders.csv"))
@@ -869,7 +903,7 @@ def make_validation_candidate(tmp_path):
     return strategy, executor
 
 
-@pytest.mark.parametrize("low,excluded", [(10.14, True), (10.15, False), (10.16, False), (0.0, False)])
+@pytest.mark.parametrize("low,excluded", [(9.99, True), (10.0, False), (10.01, False), (0.0, False)])
 def test_session_low_gain_exclusion_boundary(tmp_path, low, excluded):
     strategy = make_strategy(tmp_path)
     strategy.on_tick(TickData(stock_code="600001", low=low, pre_close=10.0,
@@ -889,6 +923,7 @@ def test_low_gain_exclusion_ignores_auction_and_waits_for_preclose(tmp_path):
                               data_time=datetime(2026, 9, 8, 9, 30)))
     assert not strategy._excluded_low_gain
     strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", pre_close=10.0, bid1=10.14,
+                                     raw_xt_fields={"low": 9.99},
                                      event_time=datetime(2026, 9, 8, 9, 30)))
     assert strategy._excluded_low_gain
 
@@ -898,7 +933,7 @@ def test_low_gain_exclusion_preserves_order_and_receives_fill(tmp_path, validati
     timer = validation_clock[1][-1]
     order = executor.orders[0]
     strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", pre_close=7.9, bid1=8.0,
-                                     raw_xt_fields={"low": 7.9},
+                                     raw_xt_fields={"low": 7.8},
                                      event_time=datetime(2026, 9, 8, 10, 0)))
     assert strategy._excluded_low_gain
     assert timer.cancelled
@@ -914,6 +949,20 @@ def test_low_gain_exclusion_preserves_order_and_receives_fill(tmp_path, validati
     strategy.on_order_update(order)
     assert strategy._entry_filled
     assert strategy.current_data_kinds() == set()
+
+
+def test_active_order_is_visible_in_console_status(tmp_path):
+    executor = FakeExecutor()
+    strategy = LargeOrderLimitUpBuyStrategy(
+        StrategyConfig(stock_code="600001", params={"plan_amount": 100000, "record_dir": str(tmp_path)}),
+        executor, None,
+    )
+    strategy.on_l2_quote(L2QuoteEvent(stock_code="600001", limit_up_price=8.0, bid1=7.9))
+    mark_open_dip(strategy)
+    mark_first_seal_amount(strategy)
+    strategy.on_l2_order(event(price=8.0, volume=700000, no="first"))
+    strategy.on_l2_order(event(price=8.0, volume=700000, no="second"))
+    assert strategy.console_status() == "已下单，等待成交"
 
 
 def test_validation_waits_one_second_then_timer_cancels_without_new_quotes(tmp_path, validation_clock):

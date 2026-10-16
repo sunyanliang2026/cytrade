@@ -2,7 +2,12 @@ from argparse import Namespace
 import logging
 
 from strategy.models import StrategyConfig
-from strategies.large_order_limit_up_buy.scripts.run_live import StrategyConsoleFilter, validate_live_confirmation
+from strategies.large_order_limit_up_buy.scripts.run_live import StrategyConsoleFilter, build_parser, validate_live_confirmation
+
+
+def test_extra_latency_probe_is_opt_in():
+    assert not build_parser().parse_args([]).latency_diagnostics
+    assert build_parser().parse_args(["--latency-diagnostics"]).latency_diagnostics
 
 
 def args(**overrides):

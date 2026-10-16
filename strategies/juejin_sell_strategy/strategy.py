@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import os
+from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
 from typing import Any, List, Optional
@@ -24,6 +25,23 @@ from trading.models import Order
 logger = get_logger("trade")
 
 
+@dataclass(frozen=True)
+class _TickContext:
+    """Values read from one tick and reused by every rule in that tick."""
+
+    now: datetime
+    pre_close: float
+    limit_up: float
+    limit_down: float
+    bid_price: float
+    ask_price: float
+    bid_volume: int
+    ask_volume: int
+    open_price: float
+    high_price: float
+    low_price: float
+
+
 class JuejinSellStrategy(BaseStrategy):
     """Sell-side port of the Juejin ``sell_10.csv`` tick strategy."""
 
@@ -31,6 +49,27 @@ class JuejinSellStrategy(BaseStrategy):
     max_positions = 200
     max_total_amount = 0.0
     state_version = 1
+
+    # Persisted flag values are kept numeric for compatibility with existing
+    # strategy state files. These names make the state machine readable.
+    FLAG_NORMAL = 0
+    FLAG_AUCTION_UNDER_EXPECTATION = 1
+    FLAG_WEAK = -3
+    FLAG_REBOUND = 5
+    FLAG_STRONG = 7
+    FLAG_LIMIT_UP = 10
+    FLAG_LIMIT_DOWN_CLEAR = 99
+    FLAG_SELL_DONE = -9
+    LIMIT_UP_FIRST_SELL_DONE = 99
+
+    LIMIT_UP_CONFIRM_AMOUNT = 120_000_000
+    LIMIT_UP_WEAK_AMOUNT = 100_000_000
+    LIMIT_UP_WEAK_REDUCE_AMOUNT = 25_000_000
+    LIMIT_UP_LARGE_AMOUNT = 160_000_000
+    LIMIT_UP_LARGE_REDUCE_AMOUNT = 80_000_000
+    LIMIT_DOWN_CLEAR_AMOUNT = 50_000_000
+    LIMIT_OPEN_GRACE_SECONDS = 60
+    LIMIT_OPEN_RECOVERY_SECONDS = 300
 
     def __init__(
         self,
@@ -163,6 +202,40 @@ class JuejinSellStrategy(BaseStrategy):
         super().on_order_update(order)
 
     def on_tick(self, tick: TickData) -> Optional[dict]:
+        context = self._build_tick_context(tick)
+        if context is None:
+            return None
+
+        position = self._get_position()
+        # This must be captured before the current tick can submit the first
+        # limit-up-open order. It prevents the first sell from also becoming
+        # the second sell on the same tick.
+        first_sell_done_before_tick = self._up_sell == self.LIMIT_UP_FIRST_SELL_DONE
+
+        self._handle_auction_under_expectation(context, position)
+        if not self._is_regular_trading_time(context.now):
+            return None
+
+        self._handle_pending_limit_open_second_sell(context, position)
+        self._handle_early_under_expectation(context, position)
+        self._confirm_limit_up(context)
+        self._mark_weak_state(context)
+        self._handle_weak_rebound_failure(context, position)
+        self._handle_limit_down_clear(context, position)
+        self._handle_flag_five(context, position)
+        self._handle_flag_seven(context, position)
+        self._handle_limit_up_open(context, position)
+        self._handle_limit_open_second_sell(context, position, first_sell_done_before_tick)
+        self._recover_after_limit_open_timeout(context)
+        self._update_price_state(context)
+        self._log_flag7_monitor(context)
+        self._finish_tick(context)
+        return None
+
+    # ------------------------------------------------------------------ Tick rules
+
+    def _build_tick_context(self, tick: TickData) -> Optional[_TickContext]:
+        """Normalize one tick before any strategy rule reads it."""
         now = self._tick_time(tick)
         if now.time() < time(9, 15):
             return None
@@ -172,285 +245,370 @@ class JuejinSellStrategy(BaseStrategy):
             return None
         limit_up, limit_down = self._resolve_limit_prices(pre_close)
 
-        bid_p = float(tick.bid1 or tick.last_price or 0.0)
-        ask_p = float(tick.ask1 or tick.last_price or 0.0)
-        bid_v = int(tick.bid_volumes[0] if tick.bid_volumes else 0)
-        ask_v = int(tick.ask_volumes[0] if tick.ask_volumes else 0)
-        if bid_p <= 0 and ask_p <= 0:
+        bid_price = float(tick.bid1 or tick.last_price or 0.0)
+        ask_price = float(tick.ask1 or tick.last_price or 0.0)
+        if bid_price <= 0 and ask_price <= 0:
             return None
 
-        open_price = float(tick.open or tick.last_price or 0.0)
-        high_price = float(tick.high or tick.last_price or 0.0)
-        low_price = float(tick.low or tick.last_price or 0.0)
-        position = self._get_position()
-        first_sell_done_before_tick = self._up_sell == 99
+        return _TickContext(
+            now=now,
+            pre_close=pre_close,
+            limit_up=limit_up,
+            limit_down=limit_down,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            bid_volume=int(tick.bid_volumes[0] if tick.bid_volumes else 0),
+            ask_volume=int(tick.ask_volumes[0] if tick.ask_volumes else 0),
+            open_price=float(tick.open or tick.last_price or 0.0),
+            high_price=float(tick.high or tick.last_price or 0.0),
+            low_price=float(tick.low or tick.last_price or 0.0),
+        )
 
-        if (
-            now.hour == 9
-            and now.minute == 24
-            and now.second >= 56
-            and bid_p > pre_close * 0.94
-            and bid_p < pre_close * 0.995
+    @staticmethod
+    def _is_regular_trading_time(now: datetime) -> bool:
+        return time(9, 26) <= now.time() <= time(14, 57)
+
+    def _handle_auction_under_expectation(
+        self, context: _TickContext, position: Optional[PositionInfo]
+    ) -> None:
+        if not (
+            context.now.hour == 9
+            and context.now.minute == 24
+            and context.now.second >= 56
+            and context.bid_price > context.pre_close * 0.94
+            and context.bid_price < context.pre_close * 0.995
             and self._exp == 1
             and position is not None
-            and self._flag == 0
+            and self._flag == self.FLAG_NORMAL
         ):
-            first_qty = min(self._target_sell_quantity(position), self._position_available(position))
-            first_order = self._submit_sell(
-                first_qty,
-                limit_down,
-                "竞价严重不及预期: 第一笔跌停价卖出",
-                action_key="auction_under_expectation_primary",
-            )
-            remaining_qty = max(0, self._position_available(position) - first_qty)
-            self._submit_sell(
-                remaining_qty,
-                round(pre_close * 1.05, 2),
-                "竞价严重不及预期: 剩余挂 5% 反弹价",
-                action_key="auction_under_expectation_rebound",
-            )
-            if self._order_submission_accepted(first_order) or remaining_qty > 0:
-                self._flag = 1
-                self._log_status("竞价严重不及预期")
+            return
 
-        if now.time() < time(9, 26) or now.time() > time(14, 57):
-            return None
+        first_qty = min(self._target_sell_quantity(position), self._position_available(position))
+        first_order = self._submit_sell(
+            first_qty,
+            context.limit_down,
+            "竞价严重不及预期: 第一笔跌停价卖出",
+            action_key="auction_under_expectation_primary",
+        )
+        remaining_qty = max(0, self._position_available(position) - first_qty)
+        self._submit_sell(
+            remaining_qty,
+            round(context.pre_close * 1.05, 2),
+            "竞价严重不及预期: 剩余挂 5% 反弹价",
+            action_key="auction_under_expectation_rebound",
+        )
+        if self._order_submission_accepted(first_order) or remaining_qty > 0:
+            self._flag = self.FLAG_AUCTION_UNDER_EXPECTATION
+            self._log_status("竞价严重不及预期")
 
+    def _handle_pending_limit_open_second_sell(
+        self, context: _TickContext, position: Optional[PositionInfo]
+    ) -> None:
         if self._pending_limit_open_second_sell and not self._has_active_sell_orders():
             self._pending_limit_open_second_sell = False
-            self._submit_limit_open_second_sell(bid_p, position)
+            self._submit_limit_open_second_sell(context.bid_price, position)
 
-        if (
+    def _handle_early_under_expectation(
+        self, context: _TickContext, position: Optional[PositionInfo]
+    ) -> None:
+        if not (
             position is not None
             and self._exp == 1
-            and bid_p > pre_close * 0.94
-            and bid_p < pre_close * 0.98
-            and now.time() < time(9, 31)
+            and context.bid_price > context.pre_close * 0.94
+            and context.bid_price < context.pre_close * 0.98
+            and context.now.time() < time(9, 31)
         ):
-            self._cancel_active_orders("严重不及预期前撤单")
-            order = self._submit_sell(
-                self._target_sell_quantity(position),
-                round(bid_p * 0.99, 2),
-                "严重不及预期卖出",
-                action_key="early_under_expectation",
-            )
-            if self._order_submission_accepted(order):
-                self._exp = -1
-                self._log_status("严重不及预期卖出")
+            return
 
-        if self._price_equal(bid_p, limit_up) and self._flag != 10:
-            self._timestamp_2 = now
-        if self._price_equal(bid_p, limit_up) and self._book_amount(bid_p, bid_v) > 120_000_000 and self._flag != 99:
-            self._flag = 10
+        self._cancel_active_orders("严重不及预期前撤单")
+        order = self._submit_sell(
+            self._target_sell_quantity(position),
+            round(context.bid_price * 0.99, 2),
+            "严重不及预期卖出",
+            action_key="early_under_expectation",
+        )
+        if self._order_submission_accepted(order):
+            self._exp = -1
+            self._log_status("严重不及预期卖出")
+
+    def _confirm_limit_up(self, context: _TickContext) -> None:
+        at_limit_up = self._price_equal(context.bid_price, context.limit_up)
+        if at_limit_up and self._flag != self.FLAG_LIMIT_UP:
+            self._timestamp_2 = context.now
+
+        bid_amount = self._book_amount(context.bid_price, context.bid_volume)
+        if at_limit_up and bid_amount > self.LIMIT_UP_CONFIRM_AMOUNT and self._flag != self.FLAG_LIMIT_DOWN_CLEAR:
+            self._flag = self.FLAG_LIMIT_UP
             self._open_flag = 0
             logger.info(
-                "JuejinSellStrategy[%s] %s 涨停封单确认 bid=%.2f bid_vol=%d手 amount=%.0f threshold=120000000 flag=10",
-                self.strategy_id[:8], self._nick, bid_p, bid_v, self._book_amount(bid_p, bid_v),
+                "JuejinSellStrategy[%s] %s 涨停封单确认 bid=%.2f bid_vol=%d手 amount=%.0f threshold=%.0f flag=10",
+                self.strategy_id[:8], self._nick, context.bid_price, context.bid_volume,
+                bid_amount, self.LIMIT_UP_CONFIRM_AMOUNT,
             )
-        if bid_p < pre_close * 0.975 and self._flag not in (99, -3, 66):
-            self._flag = -3
 
-        if (
-            self._flag == -3
-            and self._pre_bid >= pre_close * 1.02
-            and bid_p < pre_close * 1.02
-            and low_price < pre_close * 0.97
-            and now.time() > time(9, 33)
+    def _mark_weak_state(self, context: _TickContext) -> None:
+        if context.bid_price < context.pre_close * 0.975 and self._flag not in (
+            self.FLAG_LIMIT_DOWN_CLEAR,
+            self.FLAG_WEAK,
+            66,
+        ):
+            self._flag = self.FLAG_WEAK
+
+    def _handle_weak_rebound_failure(
+        self, context: _TickContext, position: Optional[PositionInfo]
+    ) -> None:
+        if not (
+            self._flag == self.FLAG_WEAK
+            and self._pre_bid >= context.pre_close * 1.02
+            and context.bid_price < context.pre_close * 1.02
+            and context.low_price < context.pre_close * 0.97
+            and context.now.time() > time(9, 33)
             and position is not None
         ):
-            self._cancel_active_orders("-3 反弹失败前撤单")
-            first_qty = self._target_sell_quantity(position)
-            first_order = self._submit_sell(
-                first_qty,
-                round(bid_p * 0.99, 2),
-                "-3 反弹失败试错离场",
-                action_key="weak_rebound_primary",
-            )
-            remaining_qty = max(0, self._position_available(position) - min(first_qty, self._position_available(position)))
-            self._submit_sell(
-                remaining_qty,
-                round(pre_close * 1.04, 2),
-                "-3 反弹失败剩余挂 4%",
-                action_key="weak_rebound_remainder",
-            )
-            if self._order_submission_accepted(first_order):
-                self._flag = 0
-                self._log_status("-3 反弹失败")
+            return
 
-        if (
-            self._price_equal(ask_p, limit_down)
-            and open_price > pre_close * 0.91
-            and self._flag != 99
+        self._cancel_active_orders("-3 反弹失败前撤单")
+        first_qty = self._target_sell_quantity(position)
+        first_order = self._submit_sell(
+            first_qty,
+            round(context.bid_price * 0.99, 2),
+            "-3 反弹失败试错离场",
+            action_key="weak_rebound_primary",
+        )
+        available = self._position_available(position)
+        remaining_qty = max(0, available - min(first_qty, available))
+        self._submit_sell(
+            remaining_qty,
+            round(context.pre_close * 1.04, 2),
+            "-3 反弹失败剩余挂 4%",
+            action_key="weak_rebound_remainder",
+        )
+        if self._order_submission_accepted(first_order):
+            self._flag = self.FLAG_NORMAL
+            self._log_status("-3 反弹失败")
+
+    def _handle_limit_down_clear(
+        self, context: _TickContext, position: Optional[PositionInfo]
+    ) -> None:
+        if not (
+            self._price_equal(context.ask_price, context.limit_down)
+            and context.open_price > context.pre_close * 0.91
+            and self._flag != self.FLAG_LIMIT_DOWN_CLEAR
             and position is not None
-            and self._book_amount(ask_p, ask_v) > 50_000_000
+            and self._book_amount(context.ask_price, context.ask_volume) > self.LIMIT_DOWN_CLEAR_AMOUNT
         ):
-            self._cancel_active_orders("跌停止损清仓前撤单")
+            return
+
+        self._cancel_active_orders("跌停止损清仓前撤单")
+        order = self._submit_sell(
+            None,
+            context.limit_down,
+            "非跌停开后跌停止损清仓",
+            action_key="limit_down_clear",
+        )
+        if self._order_submission_accepted(order):
+            self._flag = self.FLAG_LIMIT_DOWN_CLEAR
+            self._log_status("跌停止损清仓")
+
+    def _handle_flag_five(self, context: _TickContext, position: Optional[PositionInfo]) -> None:
+        if self._flag != self.FLAG_REBOUND or context.bid_price >= context.pre_close * 1.05:
+            return
+
+        if context.now.time() < time(9, 31) and context.open_price < context.pre_close * 1.05:
+            logger.info("JuejinSellStrategy[%s] %s 第一分钟跌破 5%%，暂不卖", self.strategy_id[:8], self._nick)
+        elif position is not None and context.high_price > context.pre_close * 1.065:
+            self._cancel_active_orders("高点超过 6.5% 后跌破 5%")
             order = self._submit_sell(
-                None,
-                limit_down,
-                "非跌停开后跌停止损清仓",
-                action_key="limit_down_clear",
+                self._target_sell_quantity(position),
+                round(context.bid_price * 0.99, 2),
+                "高点超过 6.5% 后跌破 5%",
+                action_key="flag5_high_pullback",
             )
             if self._order_submission_accepted(order):
-                self._flag = 99
-                self._log_status("跌停止损清仓")
+                self._flag = self.FLAG_SELL_DONE
+                self._log_status("flag 5 跌破 5%")
+        elif position is not None and context.bid_price < context.pre_close * 1.03:
+            self._cancel_active_orders("flag 5 跌破 3%")
+            order = self._submit_sell(
+                self._target_sell_quantity(position),
+                round(context.bid_price * 0.99, 2),
+                "flag 5 跌破 3%",
+                action_key="flag5_break3",
+            )
+            if self._order_submission_accepted(order):
+                self._flag = self.FLAG_SELL_DONE
+                self._log_status("flag 5 跌破 3%")
 
-        if self._flag == 5 and bid_p < pre_close * 1.05:
-            if now.time() < time(9, 31) and open_price < pre_close * 1.05:
-                logger.info("JuejinSellStrategy[%s] %s 第一分钟跌破 5%%，暂不卖", self.strategy_id[:8], self._nick)
-            elif position is not None and high_price > pre_close * 1.065:
-                self._cancel_active_orders("高点超过 6.5% 后跌破 5%")
-                order = self._submit_sell(
-                    self._target_sell_quantity(position),
-                    round(bid_p * 0.99, 2),
-                    "高点超过 6.5% 后跌破 5%",
-                    action_key="flag5_high_pullback",
-                )
-                if self._order_submission_accepted(order):
-                    self._flag = -9
-                    self._log_status("flag 5 跌破 5%")
-            elif position is not None and bid_p < pre_close * 1.03:
-                self._cancel_active_orders("flag 5 跌破 3%")
-                order = self._submit_sell(
-                    self._target_sell_quantity(position),
-                    round(bid_p * 0.99, 2),
-                    "flag 5 跌破 3%",
-                    action_key="flag5_break3",
-                )
-                if self._order_submission_accepted(order):
-                    self._flag = -9
-                    self._log_status("flag 5 跌破 3%")
+    def _handle_flag_seven(self, context: _TickContext, position: Optional[PositionInfo]) -> None:
+        if self._flag != self.FLAG_STRONG or position is None:
+            return
 
-        if (
-            self._flag == 7
-            and position is not None
-            and high_price > 0
-            and bid_p < high_price * 0.975
-        ):
+        if context.high_price > 0 and context.bid_price < context.high_price * 0.975:
             self._cancel_active_orders("flag 7 高点回落 2.5% 前撤单")
             order = self._submit_sell(
                 self._target_sell_quantity(position),
-                round(bid_p * 0.99, 2),
+                round(context.bid_price * 0.99, 2),
                 "flag 7 高点回落 2.5% 卖出一笔",
                 action_key="flag7_high_pullback_25",
             )
             if self._order_submission_accepted(order):
-                self._flag = -9
+                self._flag = self.FLAG_SELL_DONE
                 self._log_status("flag 7 高点回落 2.5%")
 
-        if high_price > pre_close * 1.085 and bid_p < pre_close * 1.07 and self._flag == 7 and position is not None:
+        if (
+            context.high_price > context.pre_close * 1.085
+            and context.bid_price < context.pre_close * 1.07
+            and self._flag == self.FLAG_STRONG
+        ):
             self._cancel_active_orders("冲高 8.5% 未封板跌破 7%")
             order = self._submit_sell(
                 self._target_sell_quantity(position),
-                round(bid_p * 0.985, 2) + 0.01,
+                round(context.bid_price * 0.985, 2) + 0.01,
                 "冲高 8.5% 未封板跌破 7%",
                 action_key="flag7_break7_after_high",
             )
             if self._order_submission_accepted(order):
-                self._flag = -9
+                self._flag = self.FLAG_SELL_DONE
                 self._log_status("flag 7 跌破 7%")
 
-        if bid_p < pre_close * 1.065 and self._flag == 7 and now.time() < time(9, 31) and position is not None:
+        if (
+            context.bid_price < context.pre_close * 1.065
+            and self._flag == self.FLAG_STRONG
+            and context.now.time() < time(9, 31)
+        ):
             self._cancel_active_orders("早盘到 7% 后跌破 6.5%")
             order = self._submit_sell(
                 self._target_sell_quantity(position),
-                round(bid_p * 0.99, 2),
+                round(context.bid_price * 0.99, 2),
                 "早盘到 7% 后跌破 6.5%",
                 action_key="flag7_morning_take_profit",
             )
             if self._order_submission_accepted(order):
-                self._flag = -9
+                self._flag = self.FLAG_SELL_DONE
                 self._log_status("flag 7 早盘回落")
 
-        if self._flag == 10 and self._open_flag != 10:
-            gap_seconds = self._seconds_since(self._timestamp_2, now)
-            bid_amount = self._book_amount(bid_p, bid_v)
-            opened_or_weakened = (
-                bid_p < limit_up
-                or (
-                    self._price_equal(bid_p, limit_up)
-                    and bid_amount < 100_000_000
-                    and self._pre_up_amount - bid_amount > 25_000_000
-                )
-                or (
-                    self._price_equal(bid_p, limit_up)
-                    and bid_amount < 160_000_000
-                    and self._pre_up_amount - bid_amount > 80_000_000
-                )
-            )
-            if opened_or_weakened:
-                if gap_seconds < 60 and open_price < limit_up and now.time() < time(9, 40):
-                    logger.info("JuejinSellStrategy[%s] %s 封板 1 分钟内开板，暂不卖", self.strategy_id[:8], self._nick)
-                elif self._up_sell != 99 and position is not None:
-                    order = self._submit_sell(
-                        self._target_sell_quantity(position),
-                        round(bid_p * 0.982, 2),
-                        "涨停开板先卖一笔",
-                        action_key="limit_open_first_sell",
-                    )
-                    if self._order_submission_accepted(order):
-                        self._up_sell = 99
-                        self._log_status("涨停开板先卖一笔")
-            if bid_p < limit_up:
-                self._timestamp_10 = now
-                self._open_flag = 10
-                if self._up_sell == 99:
-                    self._flag = -9
+    def _handle_limit_up_open(
+        self, context: _TickContext, position: Optional[PositionInfo]
+    ) -> None:
+        if self._flag != self.FLAG_LIMIT_UP or self._open_flag == self.FLAG_LIMIT_UP:
+            return
 
-        if (
+        gap_seconds = self._seconds_since(self._timestamp_2, context.now)
+        bid_amount = self._book_amount(context.bid_price, context.bid_volume)
+        opened_or_weakened = (
+            context.bid_price < context.limit_up
+            or (
+                self._price_equal(context.bid_price, context.limit_up)
+                and bid_amount < self.LIMIT_UP_WEAK_AMOUNT
+                and self._pre_up_amount - bid_amount > self.LIMIT_UP_WEAK_REDUCE_AMOUNT
+            )
+            or (
+                self._price_equal(context.bid_price, context.limit_up)
+                and bid_amount < self.LIMIT_UP_LARGE_AMOUNT
+                and self._pre_up_amount - bid_amount > self.LIMIT_UP_LARGE_REDUCE_AMOUNT
+            )
+        )
+        if opened_or_weakened:
+            if (
+                gap_seconds < self.LIMIT_OPEN_GRACE_SECONDS
+                and context.open_price < context.limit_up
+                and context.now.time() < time(9, 40)
+            ):
+                logger.info("JuejinSellStrategy[%s] %s 封板 1 分钟内开板，暂不卖", self.strategy_id[:8], self._nick)
+            elif self._up_sell != self.LIMIT_UP_FIRST_SELL_DONE and position is not None:
+                order = self._submit_sell(
+                    self._target_sell_quantity(position),
+                    round(context.bid_price * 0.982, 2),
+                    "涨停开板先卖一笔",
+                    action_key="limit_open_first_sell",
+                )
+                if self._order_submission_accepted(order):
+                    self._up_sell = self.LIMIT_UP_FIRST_SELL_DONE
+                    self._log_status("涨停开板先卖一笔")
+
+        if context.bid_price < context.limit_up:
+            self._timestamp_10 = context.now
+            self._open_flag = self.FLAG_LIMIT_UP
+            if self._up_sell == self.LIMIT_UP_FIRST_SELL_DONE:
+                self._flag = self.FLAG_SELL_DONE
+
+    def _handle_limit_open_second_sell(
+        self,
+        context: _TickContext,
+        position: Optional[PositionInfo],
+        first_sell_done_before_tick: bool,
+    ) -> None:
+        if not (
             first_sell_done_before_tick
             and not self._limit_open_second_sell_done
-            and self._pre_bid >= pre_close * 1.03
-            and bid_p < pre_close * 1.03
+            and self._pre_bid >= context.pre_close * 1.03
+            and context.bid_price < context.pre_close * 1.03
             and position is not None
         ):
-            self._cancel_active_orders("开板首卖后跌破 3% 前撤单")
-            if self._has_active_sell_orders():
-                self._pending_limit_open_second_sell = True
-                self.request_state_persist(reason=f"juejin_sell_wait_cancel:{self.strategy_id}", min_interval_sec=0.0)
-            else:
-                self._submit_limit_open_second_sell(bid_p, position)
+            return
 
-        if self._open_flag == 10 and bid_p < limit_up:
-            gap_seconds = self._seconds_since(self._timestamp_10, now)
-            if gap_seconds > 300:
-                self._flag = 0
+        self._cancel_active_orders("开板首卖后跌破 3% 前撤单")
+        if self._has_active_sell_orders():
+            self._pending_limit_open_second_sell = True
+            self.request_state_persist(reason=f"juejin_sell_wait_cancel:{self.strategy_id}", min_interval_sec=0.0)
+        else:
+            self._submit_limit_open_second_sell(context.bid_price, position)
+
+    def _recover_after_limit_open_timeout(self, context: _TickContext) -> None:
+        if self._open_flag == self.FLAG_LIMIT_UP and context.bid_price < context.limit_up:
+            gap_seconds = self._seconds_since(self._timestamp_10, context.now)
+            if gap_seconds > self.LIMIT_OPEN_RECOVERY_SECONDS:
+                self._flag = self.FLAG_NORMAL
                 self._open_flag = 0
-                self._timestamp_10 = now
+                self._timestamp_10 = context.now
                 self._log_status("涨停开板 5 分钟不回封，转普通价格逻辑")
 
-        if bid_p > pre_close * 1.07 and bid_p < limit_up and self._flag >= 0 and self._flag != 10:
-            self._flag = 7
-        if bid_p > pre_close * 1.04 and bid_p < pre_close * 1.07 and self._flag == -3:
-            self._flag = 5
+    def _update_price_state(self, context: _TickContext) -> None:
+        if (
+            context.bid_price > context.pre_close * 1.07
+            and context.bid_price < context.limit_up
+            and self._flag >= 0
+            and self._flag != self.FLAG_LIMIT_UP
+        ):
+            self._flag = self.FLAG_STRONG
+        if (
+            context.bid_price > context.pre_close * 1.04
+            and context.bid_price < context.pre_close * 1.07
+            and self._flag == self.FLAG_WEAK
+        ):
+            self._flag = self.FLAG_REBOUND
 
-        if self._flag == 7:
-            high_reached = high_price > pre_close * 1.085
-            pulled_back = bid_p < pre_close * 1.07
-            condition_state = (high_reached, pulled_back)
-            if condition_state != self._flag7_sell_condition_state:
-                if high_reached and pulled_back:
-                    reason = "卖出条件满足"
-                elif not high_reached and not pulled_back:
-                    reason = "等待最高价达到8.5%且买一回落到7%以下"
-                elif not high_reached:
-                    reason = "未卖出：当日最高价未达到8.5%"
-                else:
-                    reason = "等待买一回落到7%以下"
-                logger.info(
-                    "JuejinSellStrategy[%s] %s flag=7监控 bid=%.2f 涨幅=%.2f%% high=%.2f "
-                    "高点阈值=%.2f 回落阈值=%.2f %s",
-                    self.strategy_id[:8], self._nick, bid_p,
-                    (bid_p / pre_close - 1) * 100,
-                    high_price, pre_close * 1.085, pre_close * 1.07, reason,
-                )
-            self._flag7_sell_condition_state = condition_state
-        else:
+    def _log_flag7_monitor(self, context: _TickContext) -> None:
+        if self._flag != self.FLAG_STRONG:
             self._flag7_sell_condition_state = None
+            return
 
-        self._pre_bid = bid_p
-        if self._price_equal(bid_p, limit_up):
-            self._pre_up_amount = self._book_amount(bid_p, bid_v)
+        high_reached = context.high_price > context.pre_close * 1.085
+        pulled_back = context.bid_price < context.pre_close * 1.07
+        condition_state = (high_reached, pulled_back)
+        if condition_state != self._flag7_sell_condition_state:
+            if high_reached and pulled_back:
+                reason = "卖出条件满足"
+            elif not high_reached and not pulled_back:
+                reason = "等待最高价达到8.5%且买一回落到7%以下"
+            elif not high_reached:
+                reason = "未卖出：当日最高价未达到8.5%"
+            else:
+                reason = "等待买一回落到7%以下"
+            logger.info(
+                "JuejinSellStrategy[%s] %s flag=7监控 bid=%.2f 涨幅=%.2f%% high=%.2f "
+                "高点阈值=%.2f 回落阈值=%.2f %s",
+                self.strategy_id[:8], self._nick, context.bid_price,
+                (context.bid_price / context.pre_close - 1) * 100,
+                context.high_price, context.pre_close * 1.085, context.pre_close * 1.07, reason,
+            )
+        self._flag7_sell_condition_state = condition_state
+
+    def _finish_tick(self, context: _TickContext) -> None:
+        """Update cross-tick values and persist only after all rules ran."""
+        self._pre_bid = context.bid_price
+        if self._price_equal(context.bid_price, context.limit_up):
+            self._pre_up_amount = self._book_amount(context.bid_price, context.bid_volume)
         if self._flag != self._pre_flag:
             logger.info(
                 "[JUEJIN_STATUS] JuejinSellStrategy[%s] %s stock=%s status %s -> %s",
@@ -462,7 +620,6 @@ class JuejinSellStrategy(BaseStrategy):
             )
             self._pre_flag = self._flag
             self.request_state_persist(reason=f"juejin_sell_flag:{self.strategy_id}", min_interval_sec=1.0)
-        return None
 
     # ------------------------------------------------------------------ CSV declared position
 

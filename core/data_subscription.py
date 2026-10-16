@@ -70,6 +70,7 @@ class DataSubscriptionManager:
         self._latest_latency_ms: float = 0.0
         self._xtdata_connected = False
         self._print_latest_status = bool(print_latest_status)
+        self._l2_diagnostics = None
 
     # ------------------------------------------------------------------ Public
 
@@ -189,7 +190,7 @@ class DataSubscriptionManager:
                         subscribe_key=(code, kind),
                         xt_code=xt_code,
                         period=kind,
-                        callback=self._profile_l2_callback(kind, self._get_l2_callback(kind)),
+                        callback=self._get_l2_callback(kind),
                         subscription_ids=self._l2_subscription_ids,
                     )
                     end = datetime.now()
@@ -422,6 +423,7 @@ class DataSubscriptionManager:
                 code = xt_code.split(".")[0] if "." in xt_code else xt_code
                 event = self._parse_l2_quote(code, data, recv_time)
                 events[code] = event
+            self._mark_l2_parsed()
             if events:
                 latest = max((event.event_time or recv_time) for event in events.values())
                 self._update_latest_data_status_from_times(latest, recv_time)
@@ -440,6 +442,7 @@ class DataSubscriptionManager:
                 events = [self._parse_l2_transaction_record(code, record, recv_time) for record in records]
                 if events:
                     events_by_code[code] = events
+            self._mark_l2_parsed()
             if events_by_code:
                 latest = max((event.event_time or recv_time) for events in events_by_code.values() for event in events)
                 self._update_latest_data_status_from_times(latest, recv_time)
@@ -458,6 +461,7 @@ class DataSubscriptionManager:
                 events = [self._parse_l2_order_record(code, record, recv_time) for record in records]
                 if events:
                     events_by_code[code] = events
+            self._mark_l2_parsed()
             if events_by_code:
                 latest = max((event.event_time or recv_time) for events in events_by_code.values() for event in events)
                 self._update_latest_data_status_from_times(latest, recv_time)
@@ -474,6 +478,7 @@ class DataSubscriptionManager:
                 code = xt_code.split(".")[0] if "." in xt_code else xt_code
                 event = self._parse_l2_orderqueue(code, data, recv_time)
                 events[code] = event
+            self._mark_l2_parsed()
             if events:
                 latest = max((event.event_time or recv_time) for event in events.values())
                 self._update_latest_data_status_from_times(latest, recv_time)
@@ -619,6 +624,11 @@ class DataSubscriptionManager:
         subscription_ids: dict,
     ) -> int:
         old_sub_id = subscription_ids.get(subscribe_key)
+        if self._l2_diagnostics:
+            try:
+                self._l2_diagnostics.subscription(xt_code, period, "begin", old_sub_id)
+            except Exception:
+                pass
         if old_sub_id is not None:
             try:
                 xtdata.unsubscribe_quote(old_sub_id)
@@ -627,11 +637,18 @@ class DataSubscriptionManager:
         sub_id = xtdata.subscribe_quote(
             xt_code,
             period=period,
-            count=-1,
+            # l2order starts after the opening protection window; avoid its
+            # historical backlog when the stream is enabled.
+            count=0 if period == "l2order" else -1,
             callback=callback,
         )
         normalized_sub_id = int(sub_id) if sub_id is not None else -1
         subscription_ids[subscribe_key] = normalized_sub_id
+        if self._l2_diagnostics:
+            try:
+                self._l2_diagnostics.subscription(xt_code, period, "end", normalized_sub_id)
+            except Exception:
+                pass
         return normalized_sub_id
 
     def _get_l2_callback(self, kind: str):
@@ -641,7 +658,24 @@ class DataSubscriptionManager:
             "l2order": self._on_l2_order_data,
             "l2orderqueue": self._on_l2_orderqueue_data,
         }
-        return callback_map[kind]
+        callback = self._profile_l2_callback(kind, callback_map[kind])
+        if self._l2_diagnostics:
+            try:
+                return self._l2_diagnostics.wrap_callback(kind, callback)
+            except Exception as exc:
+                logger.warning("DataSubscription: diagnostic wrapper unavailable: %s", exc)
+        return callback
+
+    def set_l2_diagnostics(self, diagnostics) -> None:
+        """Opt-in passive instrumentation; subscription and dispatch semantics stay intact."""
+        self._l2_diagnostics = diagnostics
+
+    def _mark_l2_parsed(self) -> None:
+        if self._l2_diagnostics:
+            try:
+                self._l2_diagnostics.mark_parsed()
+            except Exception:
+                pass
 
     def _profile_l2_callback(self, kind: str, callback):
         def measured(raw_data):
