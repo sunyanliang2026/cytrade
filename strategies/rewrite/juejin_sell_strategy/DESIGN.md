@@ -33,9 +33,9 @@
 
 ## 订单处理
 
-实盘下单前通过 `get_trade_detail_data(account, account_type, "POSITION")` 查询当前股票可卖数量，读取原生 `XtPosition.stock_code` 和 `XtPosition.can_use_volume`。查询失败时安全拒绝下单。订单使用唯一 token，优先按 token 或订单号关联回调，只有无法取得标识且候选唯一时才按代码、价格和数量关联。
+实盘在 `init`、最新 K 线的 `handlebar` 及每 2 秒一次的原生定时回调中调用 `get_trade_detail_data(account, account_type, "POSITION")`，将原生 `XtPosition.stock_code` 和 `XtPosition.can_use_volume` 写入全局缓存。日线 `handlebar` 可能长时间不再触发，因此定时刷新维持缓存时效。订阅回调只读取 6 秒内的缓存；缓存失效时将信号暂存最多 5 秒，刷新后用最新 L2 报价重新核对条件及价格。定时回调中的持仓查询上下文仍需在 QMT 实机验证；查询失败或真实可卖量为零时不下单，日志分别记录原因。委托数量还受本模型已成交量与 `sellvol` 的差额约束。
 
-下单使用 11 参数形式：`passorder(24, 1101, account, code, 11, price, quantity, strategy, quick_trade, user_order_id, ContextInfo)`。其中本机大 QMT `xtconstant.py` 对应 `STOCK_SELL=24`、限价委托类型 `1101`、`FIX_PRICE=11`。委托回报解析 `XtOrder.order_id`、`order_volume`、`traded_volume`、`order_status` 和 `order_remark`；成交回报解析 `XtTrade.order_id`、`traded_id`、`traded_volume` 和 `traded_price`。订单回报按 QMT 状态码区分撤单处理中、撤单完成、成交和废单；成交回报按交易 ID 去重，订单号异步绑定期间暂存的成交在绑定后回放。
+下单使用 11 参数形式：`passorder(24, 1101, account, code, 11, price, quantity, strategy, 2, user_order_id, ContextInfo)`。其中本机大 QMT `xtconstant.py` 对应 `STOCK_SELL=24`、限价委托类型 `1101`、`FIX_PRICE=11`。委托回报解析 `XtOrder.order_id`、`order_volume`、`traded_volume`、`order_status` 和 `order_remark`；成交回报解析 `XtTrade.order_id`、`traded_id`、`traded_volume` 和 `traded_price`。订单回报按 QMT 状态码区分撤单处理中、撤单完成、成交和废单；成交回报按交易 ID 去重，订单号异步绑定期间暂存的成交在绑定后回放。没有委托号的订单保持待确认并阻止同股重复发单，不盲绑账户最近委托号。
 
 卖出动作使用 action key 去重。一次实盘下单已经发起但返回未知时，本次运行不自动重试相同 action，避免 QMT 返回异常时重复卖出。撤单请求没有得到确认前，不提交依赖撤单完成的下一笔卖单。
 

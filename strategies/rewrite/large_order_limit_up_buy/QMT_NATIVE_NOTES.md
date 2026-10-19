@@ -19,7 +19,7 @@ QMT 回调传入的数据对象可能是复用对象，并具有深拷贝和回�
 
 - 封板开始时间、封单峰值和大单去重集合。
 - 验证笔数、验证定时器、撤单状态和跟随下单标记。
-- 订单号查询重试次数、原始数据缓冲区和统计计数器。
+- 委托待报状态、原始数据缓冲区和统计计数器。
 
 ## 订阅和定时器
 
@@ -41,18 +41,20 @@ C.cancel_schedule_run(task_id_or_name)
 ```python
 passorder(23, ORDER_TYPE_BUY, ACCOUNT_ID, code,
           PRICE_TYPE_LIMIT, price, quantity,
-          STRATEGY_NAME, 1, user_order_id, C)
+          STRATEGY_NAME, 2, user_order_id, C)
 ```
 
 `user_order_id` is the investment remark (`userOrderId`) used to associate order or deal callbacks; pass `ContextInfo` immediately after it.
 
-回报回调签名为 `order_callback(ContextInfo, orderInfo)` 和 `deal_callback(ContextInfo, dealInfo)`。订单号异步查询使用 `get_last_order_id(accountID, strAccountType, strDatatype, strategyName)`；撤单使用 `cancel(orderId, accountId, accountType, ContextInfo)`。这些接口的字段名可能随 QMT 版本不同，脚本对常见字典键和对象属性做了兼容读取，但仍需以当前券商版本的实际回调为准。
+大单路径使用 `l2order.volume` 的股数单位；9000 手按 100 股/手换算为 900000 股，触发条件为严格大于 900000 股且委托金额严格大于 500 万元。委托金额优先取 `amount`，缺失时按 `price * volume` 计算。`l2quote.bid1_volume` 才是手数，封单金额按 `bid1 * bid1_volume * 100` 计算。该单位映射与已实盘验证的原 Python 策略一致。
+
+订阅回调中的即时委托使用 `quickTrade=2`。回报回调签名为 `order_callback(ContextInfo, orderInfo)` 和 `deal_callback(ContextInfo, dealInfo)`；撤单使用 `cancel(orderId, accountId, accountType, ContextInfo)`。`passorder` 没有返回委托号时保持待报，等待唯一备注或股票、价格、数量可关联的回报，不将账户最近委托号直接绑定到某只股票。超时仅记录待确认状态，不自动重发。这些接口的字段名可能随 QMT 版本不同，仍需以当前券商版本的实际回报为准。
 
 订单和成交回调需要分别确认 `m_nOrderID`、证券代码及市场、订单累计成交量和成交回报单笔数量。回调可能先于订单号查询到达；订单号未知时，只能用唯一的待提交订单及代码、价格、数量进行关联。成交回报用 `m_nVolume` 等单笔成交量累计，并用 `m_nVolumeTraded` 作为订单侧累计量交叉核验。
 
 ## 编码、路径和日志
 
-`QMT_LARGE_ORDER_LIMIT_UP_BUY.py` 保持 `# coding: gbk`，以兼容现有 QMT 原生 Python 编辑器。股票池用 UTF-8-SIG CSV 读取；日志和原始 JSONL 使用脚本运行目录、当前工作目录及 QMT 根目录逐级查找可用路径。实盘验证时应记录实际生成的文件路径，不要凭默认路径推断“没有回调”。
+`QMT_LARGE_ORDER_LIMIT_UP_BUY.py` 保持 `# coding: gbk`，以兼容现有 QMT 原生 Python 编辑器。股票池用 UTF-8-SIG CSV 读取；日志和原始 JSONL 使用脚本运行目录、当前工作目录及 QMT 根目录逐级查找可用路径。实盘验证时应记录实际生成的文件路径，不要凭默认路径推断“没有回调”。原累计首封、单笔大单首封和两种回封入口均启动订单验证；撤单后补充追随不再启动第二轮验证。
 
 ## 验证重点
 

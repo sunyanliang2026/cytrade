@@ -3,9 +3,8 @@
 
 The model deliberately keeps the signal rules separate from QMT callbacks.
 It uses l2quote as the canonical signal stream and ordinary tick data to keep
-the session high/low/open values current.  Live orders are disabled by
-default; the operator must verify the sell order type and account fields in
-the installed QMT version before enabling them.
+the session high/low/open values current. Live orders use the configured
+QMT account by default.
 """
 
 import copy
@@ -18,14 +17,17 @@ import uuid
 
 
 # ------------------------- operator configuration -------------------------
-ENABLE_LIVE_ORDERS = False
-ACCOUNT_ID = ""
+ENABLE_LIVE_ORDERS = True
+ACCOUNT_ID = "32011276"
 ACCOUNT_TYPE = "stock"
 STRATEGY_NAME = "juejin_sell_native"
 OP_TYPE_SELL = 24
 ORDER_TYPE_LIMIT = 1101
 PRICE_TYPE_LIMIT = 11
-QUICK_TRADE = 1
+QUICK_TRADE = 2
+POSITION_CACHE_MAX_AGE_SECONDS = 6.0
+POSITION_REFRESH_INTERVAL_SECONDS = 2.0
+PENDING_SIGNAL_MAX_AGE_SECONDS = 5.0
 
 QMT_HOME = u"C:/\u5149\u5927\u8bc1\u5238\u91d1\u9633\u5149QMT\u5b9e\u76d8"
 CSV_PATH = os.path.join(QMT_HOME, "python", "sell_10.csv")
@@ -83,6 +85,8 @@ _LOG = None
 _LOG_PATH = ""
 _CSV_USED = ""
 _LAST_SUMMARY = 0.0
+_POSITION_CACHE = {"updated_at": 0.0, "available": {}}
+_POSITION_REFRESH_TIMER = None
 
 
 def _now():
@@ -290,6 +294,9 @@ def _new_instance(plan):
         "day_low": 0.0,
         "last_event_time": "",
         "last_quote": {},
+        "last_l2_quote": {},
+        "last_l2_event_time": "",
+        "last_l2_at": 0.0,
         "submitted_actions": set(),
         "orders": [],
         "pending_after_cancel": None,
@@ -342,7 +349,8 @@ def _book_amount(price, volume):
 
 def _is_order_active(order):
     return order.get("status") in (
-        ORDER_SUBMITTING, ORDER_ACTIVE, ORDER_PARTIAL, ORDER_CANCEL_REQUESTED
+        ORDER_SUBMITTING, ORDER_ACTIVE, ORDER_PARTIAL, ORDER_CANCEL_REQUESTED,
+        ORDER_UNKNOWN,
     )
 
 
@@ -367,7 +375,8 @@ def _position_records():
         _log("[POSITION_QUERY_FAILED] error=%r" % (exc,))
         return None
     if records is None:
-        return []
+        _log("[POSITION_QUERY_FAILED] error=empty_result")
+        return None
     if isinstance(records, dict):
         return list(records.values())
     if isinstance(records, (list, tuple)):
@@ -375,26 +384,52 @@ def _position_records():
     return [records]
 
 
-def _available_for_sell(inst):
+def _refresh_positions():
     if not ENABLE_LIVE_ORDERS:
-        return inst["sell_quantity"]
+        return True
     records = _position_records()
     if records is None:
-        _log("[SELL_SKIP] code=%s reason=position_query_unavailable" % inst["code"])
-        return 0
+        _POSITION_CACHE["updated_at"] = 0.0
+        return False
+    available_by_code = {}
     for record in records:
         code = _stock_code(_field(
             record, "m_strInstrumentID", "m_strOrderCode", "stockCode", "stock_code", "code"
         ))
-        if code != inst["code"]:
+        if code not in _INSTANCES:
             continue
         available = _field(
             record,
             "m_nCanUseVolume", "can_use_volume", "canUseVolume",
             "available_quantity", "m_nVolumeAvailable", "m_nAvailable",
         )
-        return max(0, int(_safe_float(available)))
-    return 0
+        if available is None:
+            _log("[POSITION_QUERY_FAILED] code=%s reason=available_volume_missing" % code)
+            _POSITION_CACHE["updated_at"] = 0.0
+            return False
+        available_by_code[code] = max(0, int(_safe_float(available)))
+    if available_by_code != _POSITION_CACHE["available"]:
+        _log("[POSITION_CACHE] available=%s" % available_by_code)
+    _POSITION_CACHE["available"] = available_by_code
+    _POSITION_CACHE["updated_at"] = _now()
+    return True
+
+
+def _available_for_sell(inst):
+    if not ENABLE_LIVE_ORDERS:
+        return inst["sell_quantity"]
+    if not _position_cache_valid():
+        _log("[SELL_SKIP] code=%s reason=position_cache_unavailable" % inst["code"])
+        return None
+    already_sold = sum(order["traded_quantity"] for order in inst["orders"])
+    remaining_target = max(0, inst["sell_quantity"] - already_sold)
+    return min(_POSITION_CACHE["available"].get(inst["code"], 0), remaining_target)
+
+
+def _position_cache_valid():
+    return bool(_POSITION_CACHE["updated_at"]) and (
+        _now() - _POSITION_CACHE["updated_at"] <= POSITION_CACHE_MAX_AGE_SECONDS
+    )
 
 
 def _order_record(inst, action, price, quantity, token):
@@ -416,11 +451,13 @@ def _order_record(inst, action, price, quantity, token):
 
 
 def _order_matches(record, item):
-    if item.get("order_id") and item["order_id"] == record.get("order_id"):
-        return True
-    if item.get("token") and item["token"] == record.get("token"):
-        return True
-    if record.get("status") not in (ORDER_SUBMITTING, ORDER_ACTIVE, ORDER_PARTIAL, ORDER_CANCEL_REQUESTED):
+    if item.get("code") and item["code"] != record.get("code"):
+        return False
+    if item.get("order_id") and record.get("order_id"):
+        return item["order_id"] == record["order_id"]
+    if item.get("token") and record.get("token"):
+        return item["token"] == record["token"]
+    if record.get("status") not in (ORDER_SUBMITTING, ORDER_ACTIVE, ORDER_PARTIAL, ORDER_CANCEL_REQUESTED, ORDER_UNKNOWN):
         return False
     if item.get("code") != record.get("code", item.get("code")):
         return False
@@ -605,7 +642,7 @@ def _schedule_order_lookup(inst, order):
     try:
         order["lookup_timer"] = scheduler(
             lambda ContextInfo, c=code, t=token: _resolve_order_id(c, t),
-            _dt.datetime.now() + _dt.timedelta(milliseconds=200),
+            _dt.datetime.now() + _dt.timedelta(seconds=8),
             repeat_times=0,
             name="juejin_sell_order_lookup_%s" % code,
         )
@@ -621,32 +658,22 @@ def _resolve_order_id(code, token):
         order = next((item for item in inst["orders"] if item.get("token") == token), None)
         if not order or order.get("status") != ORDER_SUBMITTING:
             return
-        order["lookup_attempts"] = order.get("lookup_attempts", 0) + 1
-        getter = globals().get("get_last_order_id")
-        order_id = ""
-        if callable(getter):
-            try:
-                order_id = getter(ACCOUNT_ID, ACCOUNT_TYPE, "order", STRATEGY_NAME)
-            except TypeError:
-                try:
-                    order_id = getter(ACCOUNT_ID, ACCOUNT_TYPE, "order")
-                except Exception:
-                    order_id = ""
-            except Exception:
-                order_id = ""
-        if _bind_order_id(inst, order, order_id):
-            return
-        if order["lookup_attempts"] < 10:
-            _schedule_order_lookup(inst, order)
-        else:
-            order["status"] = ORDER_UNKNOWN
-            _log("[ORDER_UNKNOWN] code=%s action=%s reason=order_id_not_found" % (code, order["action"]))
+        order["lookup_timer"] = None
+        order["status"] = ORDER_UNKNOWN
+        _log("[ORDER_UNKNOWN] code=%s action=%s token=%s reason=callback_not_received" % (
+            code, order["action"], token
+        ))
 
 
 def _submit_sell(inst, quantity, price, reason, action):
     if _action_known(inst, action):
         return None
+    if ENABLE_LIVE_ORDERS and _has_active_orders(inst):
+        _log("[SELL_SKIP] code=%s action=%s reason=existing_order_unresolved" % (inst["code"], action))
+        return None
     available = _available_for_sell(inst)
+    if available is None:
+        return None
     requested = available if quantity is None else max(0, int(quantity))
     sell_quantity = min(requested, available)
     if sell_quantity <= 0 or price <= 0:
@@ -736,10 +763,13 @@ def _queue_after_cancel(inst, requests, reason, next_flag=None, next_reason="", 
         return
     if any(_action_known(inst, item["action"]) for item in requests):
         return
+    had_active_orders = _has_active_orders(inst)
     inst["pending_after_cancel"] = {
         "requests": list(requests),
         "reason": reason,
-        "deadline": _now() + CANCEL_WAIT_SECONDS,
+        "created_at": _now(),
+        "expires_at": _now() + PENDING_SIGNAL_MAX_AGE_SECONDS,
+        "deadline": _now() + CANCEL_WAIT_SECONDS if had_active_orders else None,
         "next_flag": next_flag,
         "next_reason": next_reason,
         "set_exp": set_exp,
@@ -748,12 +778,81 @@ def _queue_after_cancel(inst, requests, reason, next_flag=None, next_reason="", 
     _drain_pending_after_cancel(inst)
 
 
+def _pending_request_valid(inst, request):
+    quote = inst["last_l2_quote"]
+    bid = quote.get("bid", 0)
+    if bid <= 0 or _now() - inst["last_l2_at"] > PENDING_SIGNAL_MAX_AGE_SECONDS:
+        return False
+    pre_close = inst["pre_close"]
+    action = request["action"]
+    seconds = _event_seconds(inst["last_l2_event_time"])
+    if action == "auction_under_expectation_primary":
+        return (seconds is not None and 9 * 3600 + 24 * 60 + 56 <= seconds < 9 * 3600 + 25 * 60
+                and inst["exp"] == 1 and pre_close * 0.94 < bid < pre_close * 0.995)
+    if seconds is None or not _in_regular_session(seconds):
+        return False
+    if action == "early_under_expectation":
+        return (inst["exp"] == 1 and seconds is not None and seconds < 9 * 3600 + 31 * 60
+                and pre_close * 0.94 < bid < pre_close * 0.98)
+    if action == "weak_rebound_primary":
+        return inst["flag"] == FLAG_WEAK and bid < pre_close * 1.02 and inst["day_low"] < pre_close * 0.97
+    if action == "limit_down_clear":
+        return (_price_equal(quote.get("ask", 0), inst["limit_down"])
+                and _book_amount(quote.get("ask", 0), quote.get("ask_volume", 0)) > LIMIT_DOWN_CLEAR_AMOUNT)
+    if action == "flag5_high_pullback":
+        return inst["flag"] == FLAG_REBOUND and bid < pre_close * 1.05 and inst["day_high"] > pre_close * 1.065
+    if action == "flag5_break3":
+        return inst["flag"] == FLAG_REBOUND and bid < pre_close * 1.03
+    if action == "flag7_high_pullback_25":
+        return inst["flag"] == FLAG_STRONG and bid < inst["day_high"] * 0.975
+    if action == "flag7_break7_after_high":
+        return inst["flag"] == FLAG_STRONG and inst["day_high"] > pre_close * 1.085 and bid < pre_close * 1.07
+    if action == "flag7_morning_take_profit":
+        return inst["flag"] == FLAG_STRONG and bid < pre_close * 1.065 and seconds is not None and seconds < 9 * 3600 + 31 * 60
+    if action == "limit_open_first_sell":
+        amount = _book_amount(bid, quote.get("bid_volume", 0))
+        previous_amount = inst["pre_up_amount"]
+        return (inst["flag"] == FLAG_LIMIT_UP and
+                (bid < inst["limit_up"] or
+                 (_price_equal(bid, inst["limit_up"]) and
+                  ((amount < LIMIT_UP_WEAK_AMOUNT and previous_amount - amount > LIMIT_UP_WEAK_REDUCE_AMOUNT) or
+                   (amount < LIMIT_UP_LARGE_AMOUNT and previous_amount - amount > LIMIT_UP_LARGE_REDUCE_AMOUNT)))))
+    if action == "limit_open_second_sell":
+        return inst["up_sell"] == LIMIT_UP_FIRST_SELL_DONE and bid < pre_close * 1.03
+    return False
+
+
+def _pending_price(inst, request):
+    bid = inst["last_l2_quote"].get("bid", 0)
+    action = request["action"]
+    if action in ("auction_under_expectation_primary", "limit_down_clear"):
+        return inst["limit_down"]
+    if action == "flag7_break7_after_high":
+        return round(bid * 0.985, 2) + 0.01
+    if action == "limit_open_first_sell":
+        return round(bid * 0.982, 2)
+    return round(bid * 0.99, 2)
+
+
 def _drain_pending_after_cancel(inst):
     pending = inst.get("pending_after_cancel")
-    if not pending or _has_active_orders(inst):
+    if not pending:
         return
-    if pending.get("deadline", 0) < _now():
+    if _now() > pending["expires_at"]:
+        _log("[PENDING_SELL_ABORTED] code=%s reason=signal_expired" % inst["code"])
+        inst["pending_after_cancel"] = None
+        return
+    if _has_active_orders(inst):
+        return
+    if pending.get("deadline") and pending["deadline"] < _now():
         _log("[PENDING_SELL_ABORTED] code=%s reason=cancel_timeout" % inst["code"])
+        inst["pending_after_cancel"] = None
+        return
+    if ENABLE_LIVE_ORDERS and not _position_cache_valid():
+        return
+    delayed = _now() - pending["created_at"] > 0.1
+    if delayed and not all(_pending_request_valid(inst, request) for request in pending["requests"]):
+        _log("[PENDING_SELL_ABORTED] code=%s reason=signal_no_longer_valid" % inst["code"])
         inst["pending_after_cancel"] = None
         return
     inst["pending_after_cancel"] = None
@@ -762,7 +861,7 @@ def _drain_pending_after_cancel(inst):
         order = _submit_sell(
             inst,
             request.get("quantity"),
-            request["price"],
+            _pending_price(inst, request) if delayed else request["price"],
             request["reason"],
             request["action"],
         )
@@ -770,6 +869,9 @@ def _drain_pending_after_cancel(inst):
             accepted = True
             if request.get("set_second"):
                 inst["limit_open_second_sell_done"] = True
+            if request.get("set_up_sell"):
+                inst["up_sell"] = LIMIT_UP_FIRST_SELL_DONE
+                _log("[LIMIT_OPEN_FIRST_SELL] code=%s" % inst["code"])
     if accepted and pending.get("set_exp") is not None:
         inst["exp"] = pending["set_exp"]
     if accepted and pending.get("next_flag") is not None:
@@ -786,18 +888,12 @@ def _handle_auction(inst, quote, seconds):
         and inst["flag"] == FLAG_NORMAL
     ):
         return
-    first_quantity = inst["sell_quantity"]
-    first = _submit_sell(
-        inst, first_quantity, inst["limit_down"],
-        "auction_under_expectation_primary", "auction_under_expectation_primary"
-    )
-    remaining = max(0, inst["sell_quantity"] - first_quantity)
-    _submit_sell(
-        inst, remaining, round(inst["pre_close"] * 1.05, 2),
-        "auction_under_expectation_rebound", "auction_under_expectation_rebound"
-    )
-    if first is not None or remaining > 0:
-        _set_flag(inst, FLAG_AUCTION_UNDER_EXPECTATION, "auction_under_expectation")
+    request = {
+        "quantity": inst["sell_quantity"], "price": inst["limit_down"],
+        "reason": "auction_under_expectation_primary", "action": "auction_under_expectation_primary",
+    }
+    _queue_after_cancel(inst, [request], "auction_under_expectation_cancel",
+                        next_flag=FLAG_AUCTION_UNDER_EXPECTATION, next_reason="auction_under_expectation")
 
 
 def _handle_early_under_expectation(inst, quote, seconds):
@@ -920,17 +1016,8 @@ def _handle_flag_five(inst, quote, seconds):
 def _handle_flag_seven(inst, quote, seconds):
     if inst["flag"] != FLAG_STRONG:
         return
-    if inst["day_high"] > 0 and quote["bid"] < inst["day_high"] * 0.975:
-        request = {
-            "quantity": inst["sell_quantity"],
-            "price": round(quote["bid"] * 0.99, 2),
-            "reason": "flag7_high_pullback_2_5",
-            "action": "flag7_high_pullback_25",
-        }
-        _queue_after_cancel(inst, [request], "flag7_high_pullback_cancel", next_flag=FLAG_SELL_DONE, next_reason="flag7_high_pullback_2_5")
     if (
-        inst["flag"] == FLAG_STRONG
-        and inst["day_high"] > inst["pre_close"] * 1.085
+        inst["day_high"] > inst["pre_close"] * 1.085
         and quote["bid"] < inst["pre_close"] * 1.07
     ):
         request = {
@@ -940,6 +1027,16 @@ def _handle_flag_seven(inst, quote, seconds):
             "action": "flag7_break7_after_high",
         }
         _queue_after_cancel(inst, [request], "flag7_break7_cancel", next_flag=FLAG_SELL_DONE, next_reason="flag7_break_7")
+        return
+    if inst["day_high"] > 0 and quote["bid"] < inst["day_high"] * 0.975:
+        request = {
+            "quantity": inst["sell_quantity"],
+            "price": round(quote["bid"] * 0.99, 2),
+            "reason": "flag7_high_pullback_2_5",
+            "action": "flag7_high_pullback_25",
+        }
+        _queue_after_cancel(inst, [request], "flag7_high_pullback_cancel", next_flag=FLAG_SELL_DONE, next_reason="flag7_high_pullback_2_5")
+        return
     if (
         inst["flag"] == FLAG_STRONG
         and quote["bid"] < inst["pre_close"] * 1.065
@@ -980,13 +1077,15 @@ def _handle_limit_up_open(inst, quote, seconds):
         if gap < LIMIT_OPEN_GRACE_SECONDS and inst["open_price"] < inst["limit_up"] and seconds < 9 * 3600 + 40 * 60:
             _log("[LIMIT_OPEN_WAIT] code=%s reason=within_first_minute" % inst["code"])
         elif inst["up_sell"] != LIMIT_UP_FIRST_SELL_DONE:
-            order = _submit_sell(
-                inst, inst["sell_quantity"], round(quote["bid"] * 0.982, 2),
-                "limit_open_first_sell", "limit_open_first_sell"
-            )
-            if order is not None:
-                inst["up_sell"] = LIMIT_UP_FIRST_SELL_DONE
-                _log("[LIMIT_OPEN_FIRST_SELL] code=%s" % inst["code"])
+            request = {
+                "quantity": inst["sell_quantity"],
+                "price": round(quote["bid"] * 0.982, 2),
+                "reason": "limit_open_first_sell",
+                "action": "limit_open_first_sell",
+                "set_up_sell": True,
+            }
+            _queue_after_cancel(inst, [request], "limit_open_first_sell_cancel",
+                                next_flag=FLAG_SELL_DONE, next_reason="limit_open_first_sell")
     if quote["bid"] < inst["limit_up"]:
         if inst["open_flag"] != FLAG_LIMIT_UP:
             inst["limit_open_started_at"] = _now()
@@ -1062,7 +1161,11 @@ def _finish_quote(inst, quote):
 
 
 def _process_l2quote(inst, data, event_seconds):
-    quote = _update_market(inst, data, _event_time(_field(data, "stime", "time", "timestamp")))
+    event_time = _event_time(_field(data, "stime", "time", "timestamp"))
+    quote = _update_market(inst, data, event_time)
+    inst["last_l2_quote"] = quote
+    inst["last_l2_event_time"] = event_time
+    inst["last_l2_at"] = _now()
     if quote["bid"] <= 0 or inst["pre_close"] <= 0 or inst["limit_up"] <= 0:
         return
     first_sell_done_before_tick = inst["up_sell"] == LIMIT_UP_FIRST_SELL_DONE
@@ -1228,6 +1331,35 @@ def _drain_all_pending():
         _drain_pending_after_cancel(inst)
 
 
+def _position_refresh_timer(ContextInfo):
+    with _LOCK:
+        _refresh_positions()
+        _drain_all_pending()
+
+
+def _schedule_position_refresh(C):
+    global _POSITION_REFRESH_TIMER
+    if not ENABLE_LIVE_ORDERS:
+        return
+    scheduler = getattr(C, "schedule_run", None)
+    if not callable(scheduler):
+        _log("[POSITION_REFRESH_FAILED] reason=schedule_run_unavailable")
+        return
+    try:
+        _POSITION_REFRESH_TIMER = scheduler(
+            _position_refresh_timer,
+            _dt.datetime.now() + _dt.timedelta(seconds=POSITION_REFRESH_INTERVAL_SECONDS),
+            repeat_times=-1,
+            interval=_dt.timedelta(seconds=POSITION_REFRESH_INTERVAL_SECONDS),
+            name="juejin_sell_position_refresh",
+        )
+        _log("[POSITION_REFRESH_SCHEDULED] interval=%.1fs id=%s" % (
+            POSITION_REFRESH_INTERVAL_SECONDS, _POSITION_REFRESH_TIMER
+        ))
+    except Exception as exc:
+        _log("[POSITION_REFRESH_FAILED] error=%r" % (exc,))
+
+
 def init(C):
     global _C, _LOG, _LOG_PATH, _CSV_USED, _SUB_SUCCESS, _SUB_FAILED, _LAST_SUMMARY
     with _LOCK:
@@ -1263,9 +1395,13 @@ def init(C):
             _INSTANCES[inst["code"]] = inst
             _log("[JUEJIN_STATUS] code=%s nick=%s status=0 reason=initial" % (inst["code"], inst["nick"]))
             _initial_quote(C, inst)
+        _POSITION_CACHE["updated_at"] = 0.0
+        _POSITION_CACHE["available"] = {}
+        _refresh_positions()
         for inst in _INSTANCES.values():
             for period in PERIODS:
                 _subscribe(C, inst["code"], period)
+        _schedule_position_refresh(C)
         _LAST_SUMMARY = _now()
         _log("[INIT] csv=%s stocks=%d live=%s log=%s" % (
             _CSV_USED, len(_INSTANCES), ENABLE_LIVE_ORDERS, _LOG_PATH or "<console>"
@@ -1274,7 +1410,11 @@ def init(C):
 
 def handlebar(C):
     global _LAST_SUMMARY
+    is_last_bar = getattr(C, "is_last_bar", None)
+    if callable(is_last_bar) and not is_last_bar():
+        return
     with _LOCK:
+        _refresh_positions()
         _drain_all_pending()
         if _now() - _LAST_SUMMARY >= SUMMARY_INTERVAL_SECONDS:
             _summary()
@@ -1322,7 +1462,14 @@ def deal_callback(ContextInfo, dealInfo):
 
 
 def stop(C):
+    global _POSITION_REFRESH_TIMER
     with _LOCK:
+        if _POSITION_REFRESH_TIMER is not None:
+            try:
+                C.cancel_schedule_run(_POSITION_REFRESH_TIMER)
+            except Exception:
+                pass
+            _POSITION_REFRESH_TIMER = None
         for sub_id in list(_SUBSCRIPTIONS):
             try:
                 C.unsubscribe_quote(sub_id)

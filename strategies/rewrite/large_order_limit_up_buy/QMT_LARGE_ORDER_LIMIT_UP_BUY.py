@@ -2,7 +2,7 @@
 """大QMT内置 Python 大单打板模型。
 
 只使用 QMT 模型上下文、subscribe_quote、行情函数和内置交易函数。
-ENABLE_LIVE_ORDERS 默认为 False，先用于盘中数据与状态验证。
+ENABLE_LIVE_ORDERS 默认为 True，使用配置的 QMT 资金账号运行。
 """
 
 import csv
@@ -14,8 +14,8 @@ import time
 
 
 # ------------------------- operator configuration -------------------------
-ENABLE_LIVE_ORDERS = False
-ACCOUNT_ID = ""
+ENABLE_LIVE_ORDERS = True
+ACCOUNT_ID = "32011276"
 ACCOUNT_TYPE = "stock"
 STRATEGY_NAME = "large_order_limit_up_buy"
 ORDER_TYPE_BUY = 1101
@@ -24,6 +24,8 @@ PRICE_TYPE_LIMIT = 11
 FIRST_SEAL_MIN_AMOUNT = 60000000.0
 FIRST_LARGE_ORDER_MIN_AMOUNT = 2000000.0
 FIRST_LARGE_ORDER_TOTAL_AMOUNT = 10000000.0
+LARGE_ORDER_MIN_VOLUME_SHARES = 900000
+LARGE_ORDER_MIN_AMOUNT = 5000000.0
 RESEAL_MIN_SEAL_SECONDS = 10.0
 RESEAL_MIN_PEAK_AMOUNT = 100000000.0
 RESEAL_BREAK_SECONDS = 3.0
@@ -31,20 +33,22 @@ RESEAL_VERIFY_ORDER_COUNT = 150
 RESEAL_VERIFY_LARGE_AMOUNT = 1500000.0
 RESEAL_VERIFY_LARGE_COUNT = 2
 RESEAL_VALIDATION_MIN_SECONDS = 1.0
-RESEAL_VALIDATION_CONTINUE_ON_FAILURE = True
+RESEAL_VALIDATION_CONTINUE_ON_FAILURE = False
 RESEAL_LATE_WINDOW_SECONDS = 5.0
 
 PERIODS = ("tick", "l2quote", "l2order")
 DEBUG_SUMMARY_INTERVAL_SECONDS = 60
 DEBUG_LATENCY_WARN_THRESHOLD_MS = 1000.0
 DEBUG_LATENCY_WARN_INTERVAL_SECONDS = 10.0
+MAX_SIGNAL_QUOTE_DELAY_MS = 1000.0
 L2_PERIODS = set(PERIODS[1:])
+VALIDATED_SUBMIT_REASONS = frozenset(("首封", "首封大单", "回封", "回封大单"))
 STATE_WAIT_INITIAL = "WAIT_INITIAL_QUOTE"
 STATE_READY = "READY"
 STATE_WAIT_REOPEN = "WAIT_REOPEN"
 STATE_WAIT_RESEAL = "WAIT_RESEAL"
 STATE_DONE = "DONE"
-STATE_SKIPPED = "SKIPPED_OPENING_GAIN"
+STATE_SKIPPED = "SKIPPED_NEGATIVE_RETURN"
 
 class _NoopLock(object):
     """QMT native model callbacks are serialized; never wait in the model thread."""
@@ -462,7 +466,9 @@ def _new_instance(code, amount):
         "submission_pending": False, "submit_token": None, "submit_reason": None,
         "order_lookup_timer": None, "order_lookup_attempts": 0,
         "pending_order_info": None,
-        "sub_ids": [], "last_latency_ms": None, "last_log_reason": "",
+        "sub_ids": [], "sub_periods": {}, "subscriptions_stopped": False,
+        "stale_negative_warned": False,
+        "last_latency_ms": None, "last_log_reason": "",
     }
 
 
@@ -517,6 +523,21 @@ def _amount(price, volume):
     return (price * volume * 100.0) if price and volume else 0.0
 
 
+def _order_amount(price, volume, reported_amount=None):
+    reported_amount = _safe_float(reported_amount)
+    if reported_amount:
+        return reported_amount
+    price = _safe_float(price)
+    volume = _safe_float(volume)
+    return price * volume if price and volume else 0.0
+
+
+def _is_large_order_trigger(volume, amount):
+    volume = _safe_float(volume) or 0.0
+    amount = _safe_float(amount) or 0.0
+    return volume > LARGE_ORDER_MIN_VOLUME_SHARES and amount > LARGE_ORDER_MIN_AMOUNT
+
+
 def _limit_price(inst, quote=None):
     if inst["limit_up"]:
         return inst["limit_up"]
@@ -533,15 +554,68 @@ def _set_state(inst, state, reason=""):
         _log("[状态] %s %s -> %s %s" % (inst["code"], inst.get("name", "未命名"), state, reason))
 
 
-def _skip_low_gain(inst):
-    if inst["state"] in (STATE_DONE, STATE_SKIPPED) or not inst["last_close"]:
+def _unsubscribe_instance(inst):
+    if inst.get("subscriptions_stopped"):
+        return 0, 0
+    inst["subscriptions_stopped"] = True
+    unsubscribed = 0
+    failed = 0
+    remaining = []
+    for sub_id in list(inst.get("sub_ids", [])):
+        period = inst.get("sub_periods", {}).get(sub_id, "unknown")
+        if _C is None:
+            failed += 1
+            remaining.append(sub_id)
+            _log("[UNSUBSCRIBE_FAIL] code=%s period=%s sub_id=%s reason=context_unavailable" %
+                 (inst["code"], period, sub_id))
+            continue
+        try:
+            result = _C.unsubscribe_quote(sub_id)
+        except Exception as exc:
+            failed += 1
+            remaining.append(sub_id)
+            _log("[UNSUBSCRIBE_FAIL] code=%s period=%s sub_id=%s error=%r" %
+                 (inst["code"], period, sub_id, exc))
+            continue
+        unsubscribed += 1
+        _SUBSCRIPTIONS[:] = [active_id for active_id in _SUBSCRIPTIONS
+                             if active_id != sub_id]
+        inst.get("sub_periods", {}).pop(sub_id, None)
+        _log("[UNSUBSCRIBE] code=%s period=%s sub_id=%s result=%r" %
+             (inst["code"], period, sub_id, result))
+    inst["sub_ids"][:] = remaining
+    return unsubscribed, failed
+
+
+def _skip_negative_latest(inst, last, source, event_time=None, received_at=None):
+    last = _safe_float(last)
+    previous_close = _safe_float(inst.get("last_close"))
+    if (inst["state"] in (STATE_DONE, STATE_SKIPPED) or
+            inst.get("subscriptions_stopped") or not last or not previous_close or
+            last >= previous_close):
         return False
-    if inst["day_low"] is not None and inst["day_low"] < inst["last_close"]:
-        _cancel_timer(inst)
-        inst["cancel_started"] = None
-        _set_state(inst, STATE_SKIPPED, "当日最低价低于昨收")
-        return True
-    return False
+    latency_ms = (_latency_ms(event_time, received_at)
+                  if event_time is not None and received_at is not None else None)
+    if latency_ms is not None and latency_ms > MAX_SIGNAL_QUOTE_DELAY_MS:
+        if not inst.get("stale_negative_warned"):
+            inst["stale_negative_warned"] = True
+            _log("[NEGATIVE_RETURN_IGNORED_STALE] code=%s source=%s last=%.4f "
+                 "prev_close=%.4f latency_ms=%.0f threshold_ms=%.0f" %
+                 (inst["code"], source, last, previous_close, latency_ms,
+                  MAX_SIGNAL_QUOTE_DELAY_MS))
+        return False
+    change_pct = (last / previous_close - 1.0) * 100.0
+    _cancel_timer(inst)
+    _cancel_order_lookup(inst)
+    _set_state(inst, STATE_SKIPPED, "latest tick return < 0")
+    unsubscribed, failed = _unsubscribe_instance(inst)
+    _log("[NEGATIVE_RETURN_EXIT] code=%s source=%s last=%.4f prev_close=%.4f "
+         "change_pct=%.4f unsubscribed=%d failed=%d active_subscriptions=%d "
+         "existing_order_left_untouched=%s" %
+         (inst["code"], source, last, previous_close, change_pct,
+          unsubscribed, failed, len(_SUBSCRIPTIONS),
+          inst.get("our_order_id") or ("pending" if inst.get("submission_pending") else "none")))
+    return True
 
 
 def _cancel_timer(inst):
@@ -573,7 +647,7 @@ def _schedule_validation(inst):
         order_id = inst["validation_order_id"]
         inst["validation_timer"] = _C.schedule_run(
             lambda ContextInfo, c=code, oid=order_id: _validation_timer(c, oid),
-            when, repeat_times=0, name="reseal_%s" % code)
+            when, repeat_times=0, name="order_validation_%s" % code)
     except Exception as exc:
         _log("[验证] %s 定时器创建失败 %r，将由handlebar兜底" % (inst["code"], exc))
 
@@ -593,9 +667,19 @@ def _bind_order_id(inst, order_id):
     inst["our_order_status"] = "submitted"
     _COUNTERS["orders"] += 1
     _log("[下单] %s %s 委托=%s" % (inst["code"], inst.get("submit_reason", ""), order_id))
-    if inst.get("submit_reason") == "回封":
+    if inst.get("submit_reason") in VALIDATED_SUBMIT_REASONS:
         inst["validation_order_id"] = order_id
         inst["validation_started"] = _now()
+        inst["verify_count"] = 0
+        inst["verify_large_count"] = 0
+        inst["verify_large_ids"].clear()
+        inst["cancel_started"] = None
+        inst["cancel_confirmed"] = False
+        inst["cancel_failed"] = False
+        inst["late_large_count"] = 0
+        inst["late_large_ids"].clear()
+        inst["follow_sent"] = False
+        inst["validation_passed"] = False
         _schedule_validation(inst)
     pending = inst.pop("pending_order_info", None)
     if pending:
@@ -613,7 +697,7 @@ def _schedule_order_lookup(inst):
         token = inst["submit_token"]
         inst["order_lookup_timer"] = _C.schedule_run(
             lambda ContextInfo, c=code, t=token: _resolve_order_id(c, t),
-            _dt.datetime.now() + _dt.timedelta(milliseconds=200),
+            _dt.datetime.now() + _dt.timedelta(seconds=8),
             repeat_times=0, name="qmt_order_lookup_%s" % code)
     except Exception as exc:
         _log("[下单] %s 委托号查询定时器失败 %r" % (inst["code"], exc))
@@ -622,24 +706,11 @@ def _schedule_order_lookup(inst):
 def _resolve_order_id(code, token):
     with _LOCK:
         inst = _INSTANCES.get(code)
-        if not inst or inst.get("submit_token") != token or not inst.get("submission_pending"):
+        if (not inst or inst["state"] in (STATE_DONE, STATE_SKIPPED) or
+                inst.get("submit_token") != token or not inst.get("submission_pending")):
             return
-        inst["order_lookup_attempts"] += 1
-        try:
-            order_id = get_last_order_id(ACCOUNT_ID, ACCOUNT_TYPE, "order", STRATEGY_NAME)
-        except TypeError:
-            order_id = get_last_order_id(ACCOUNT_ID, ACCOUNT_TYPE, "order")
-        except Exception as exc:
-            _log("[下单] %s 查询委托号失败 %r" % (code, exc))
-            order_id = ""
-        if _bind_order_id(inst, order_id):
-            return
-        if inst["order_lookup_attempts"] < 10:
-            _schedule_order_lookup(inst)
-        else:
-            inst["submission_pending"] = False
-            _log("[下单失败] %s 在限定次数内未取得委托号" % code)
-            _set_state(inst, STATE_DONE, "委托号未知")
+        inst["order_lookup_timer"] = None
+        _log("[下单待确认] %s token=%s 尚未收到可关联的委托回报，保留待报状态" % (code, token))
 
 
 def _order_fields(obj):
@@ -651,13 +722,13 @@ def _order_fields(obj):
     return {
         "id": str(_field(obj, "m_strOrderID", "m_nOrderID", "orderID", "order_id") or ""),
         "code": code,
-        "deal_id": str(_field(obj, "m_strTradeID", "m_strDealID", "tradeID", "dealID", "tradedID") or ""),
-        "user_order_id": str(_field(obj, "m_strRemark", "m_strUserOrderID", "userOrderId", "user_order_id", "remark") or ""),
-        "status": _field(obj, "m_nOrderStatus", "m_strOrderStatus", "status"),
-        "total": _safe_float(_field(obj, "m_nVolumeTotalOriginal", "m_nVolumeTotal", "orderVolume", "totalVolume")) or 0,
-        "traded": _safe_float(_field(obj, "m_nVolumeTraded", "tradedVolume", "volumeTraded")) or 0,
-        "deal_volume": _safe_float(_field(obj, "m_nVolume", "m_nTradeVolume", "deal_volume", "m_nVolumeTraded", "tradedVolume", "volume")) or 0,
-        "price": _safe_float(_field(obj, "m_dPrice", "price")) or 0,
+        "deal_id": str(_field(obj, "m_strTradeID", "m_strDealID", "tradeID", "dealID", "tradedID", "traded_id") or ""),
+        "user_order_id": str(_field(obj, "m_strRemark", "m_strUserOrderID", "userOrderId", "user_order_id", "order_remark", "remark") or ""),
+        "status": _field(obj, "m_nOrderStatus", "m_strOrderStatus", "order_status", "status"),
+        "total": _safe_float(_field(obj, "m_nVolumeTotalOriginal", "m_nVolumeTotal", "orderVolume", "order_volume", "totalVolume")) or 0,
+        "traded": _safe_float(_field(obj, "m_nVolumeTraded", "tradedVolume", "traded_volume", "volumeTraded")) or 0,
+        "deal_volume": _safe_float(_field(obj, "m_nVolume", "m_nTradeVolume", "deal_volume", "traded_volume", "m_nVolumeTraded", "tradedVolume", "volume")) or 0,
+        "price": _safe_float(_field(obj, "m_dPrice", "price", "order_price", "traded_price")) or 0,
     }
 
 
@@ -721,7 +792,12 @@ def _submit(inst, reason):
         inst["seen_deal_ids"].clear()
         inst["pending_deal_infos"] = []
         order_result = passorder(23, ORDER_TYPE_BUY, ACCOUNT_ID, inst["code"], PRICE_TYPE_LIMIT,
-                                 price, qty, STRATEGY_NAME, 1, inst["submit_token"], _C)
+                                 price, qty, STRATEGY_NAME, 2, inst["submit_token"], _C)
+        if order_result is False or str(order_result) == "-1":
+            inst["submission_pending"] = False
+            _log("[下单失败] %s 接口返回=%r" % (inst["code"], order_result))
+            _set_state(inst, STATE_DONE, "下单接口拒绝")
+            return False
         if isinstance(order_result, (str, int)) and not isinstance(order_result, bool) and str(order_result).strip() not in ("", "0", "-1"):
             _bind_order_id(inst, order_result)
         elif inst["submission_pending"]:
@@ -778,6 +854,12 @@ def _check_validation(inst):
         _request_cancel(inst)
     if inst.get("cancel_started") and not inst["cancel_confirmed"] and _now() - inst["cancel_started"] >= RESEAL_LATE_WINDOW_SECONDS:
         _set_state(inst, STATE_DONE, "撤单状态未知或补充窗口结束")
+    if inst.get("cancel_confirmed") and inst["our_traded_qty"] > 0:
+        _set_state(inst, STATE_DONE, "部分成交后余量撤单")
+        return
+    if inst.get("cancel_confirmed") and not RESEAL_VALIDATION_CONTINUE_ON_FAILURE:
+        _set_state(inst, STATE_DONE, "撤单后补单已关闭")
+        return
     if inst.get("cancel_confirmed") and not inst.get("follow_sent") and _now() - inst["cancel_started"] < RESEAL_LATE_WINDOW_SECONDS:
         if inst["late_large_count"] >= RESEAL_VERIFY_LARGE_COUNT and inst["last_tick"].get("bid_at_limit"):
             inst["follow_sent"] = True
@@ -787,7 +869,7 @@ def _check_validation(inst):
 def _handle_quote(code, period, payload):
     with _LOCK:
         inst = _INSTANCES.get(code)
-        if not inst:
+        if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
             return
         data = _owned_payload(code, payload)
         is_l2quote = period == "l2quote"
@@ -809,7 +891,10 @@ def _handle_quote(code, period, payload):
             if is_l2quote:
                 _check_validation(inst)
             return
-        if _skip_low_gain(inst):
+        if (period == "tick" and
+                _skip_negative_latest(inst, last, "tick",
+                                      _field(data, "time", "stime", "timestamp"),
+                                      received_at)):
             return
         if not is_l2quote:
             return
@@ -865,7 +950,7 @@ def _handle_quote(code, period, payload):
 def _handle_l2order(code, payload):
     with _LOCK:
         inst = _INSTANCES.get(code)
-        if not inst:
+        if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
             return
         data = _owned_payload(code, payload)
         _write_raw(code, "l2order", data)
@@ -886,16 +971,11 @@ def _handle_l2order(code, payload):
             return
         if order_id:
             inst["seen_order_ids"].add(order_id)
-        amount = _amount(price, volume)
-        if inst["state"] == STATE_READY and inst["initial_sealed"]:
-            if amount >= FIRST_LARGE_ORDER_MIN_AMOUNT:
-                if order_id not in inst["first_large_ids"]:
-                    inst["first_large_ids"].add(order_id)
-                    inst["first_large_total"] += amount
-            if inst["first_large_total"] > FIRST_LARGE_ORDER_TOTAL_AMOUNT and inst["open_price"] and inst["day_low"] is not None and inst["day_low"] < inst["open_price"] * 0.985:
-                _submit(inst, "首封")
-        elif inst.get("validation_order_id"):
-            if order_id == str(inst["validation_order_id"]):
+        amount = _order_amount(price, volume, _field(data, "amount"))
+
+        # Validate the active order before any entry path can consume this event.
+        if inst.get("validation_order_id"):
+            if order_id == str(inst["validation_order_id"]) or inst.get("validation_passed"):
                 return
             inst["verify_count"] += 1
             if amount >= RESEAL_VERIFY_LARGE_AMOUNT and order_id not in inst["verify_large_ids"]:
@@ -906,17 +986,48 @@ def _handle_l2order(code, payload):
                     inst["late_large_ids"].add(order_id)
                     inst["late_large_count"] += 1
             _check_validation(inst)
+            return
+
+        trigger_reason = None
+        if inst["state"] == STATE_READY and _is_large_order_trigger(volume, amount):
+            trigger_reason = "首封大单"
+        elif (
+            inst["state"] == STATE_WAIT_RESEAL
+            and inst.get("reseal_ready")
+            and inst.get("break_started") is not None
+            and _now() - inst["break_started"] >= RESEAL_BREAK_SECONDS
+            and _is_large_order_trigger(volume, amount)
+        ):
+            trigger_reason = "回封大单"
+        if trigger_reason:
+            if _submit(inst, trigger_reason):
+                _log("[大单触发] %s 路径=%s 委托=%s 数量=%d股(%.2f手) 金额=%.2f" % (
+                    inst["code"], trigger_reason, order_id or "无编号", int(volume),
+                    volume / 100.0, amount))
+            return
+
+        if inst["state"] == STATE_READY and inst["initial_sealed"]:
+            if amount >= FIRST_LARGE_ORDER_MIN_AMOUNT:
+                if order_id not in inst["first_large_ids"]:
+                    inst["first_large_ids"].add(order_id)
+                    inst["first_large_total"] += amount
+            if inst["first_large_total"] > FIRST_LARGE_ORDER_TOTAL_AMOUNT and inst["open_price"] and inst["day_low"] is not None and inst["day_low"] < inst["open_price"] * 0.985:
+                _submit(inst, "首封")
 
 
 def _subscribe(C, code, period):
     global _SUB_SUCCESS, _SUB_FAILED
+    inst = _INSTANCES.get(code)
+    if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+        return
     callback = (lambda data, c=code: _handle_l2order(c, data)) if period == "l2order" else (lambda data, c=code, p=period: _handle_quote(c, p, data))
     try:
         sub_id = C.subscribe_quote(code, period=period, dividend_type="follow", result_type="dict", callback=callback)
         if sub_id and sub_id > 0:
             _SUB_SUCCESS += 1
             _SUBSCRIPTIONS.append(sub_id)
-            _INSTANCES[code]["sub_ids"].append(sub_id)
+            inst["sub_ids"].append(sub_id)
+            inst["sub_periods"][sub_id] = period
             _log("[订阅] code=%s period=%s sub_id=%s" % (code, period, sub_id))
         else:
             _SUB_FAILED += 1
@@ -945,6 +1056,11 @@ def _initial_quote(C, inst, full_ticks=None):
         # Continuous-session low starts with the first valid quote after 09:30.
         inst["day_low"] = None
         stime = _event_time(_field(data, "stime", "time"))
+        if stime and _in_continuous(stime):
+            _, _, _, last, _ = _quote_values(inst, data, track_day=False)
+            if _skip_negative_latest(inst, last, "initial_snapshot",
+                                     _field(data, "time", "stime", "timestamp"), time.time()):
+                return
         raw_bid = _field(data, "bidPrice", "bid1")
         bid = _safe_float(raw_bid[0] if isinstance(raw_bid, (list, tuple)) else raw_bid)
         if stime and "092500" <= stime <= "092505" and inst["limit_up"] and bid:
@@ -1097,9 +1213,14 @@ def init(C):
         for inst in _INSTANCES.values():
             for period in PERIODS:
                 _subscribe(C, inst["code"], period)
-        _log("[运行] subscriptions=%d success=%d failed=%d expected=%d" %
+        expected_subscriptions = sum(
+            len(PERIODS) for inst in _INSTANCES.values()
+            if not inst.get("subscriptions_stopped"))
+        skipped_count = sum(1 for inst in _INSTANCES.values()
+                            if inst["state"] == STATE_SKIPPED)
+        _log("[运行] subscriptions=%d success=%d failed=%d expected=%d skipped=%d" %
              (len(_SUBSCRIPTIONS), _SUB_SUCCESS, _SUB_FAILED,
-              len(_INSTANCES) * len(PERIODS)))
+              expected_subscriptions, skipped_count))
         _schedule_raw_flush()
         _schedule_auction_retry()
         _LAST_SUMMARY = _now()
@@ -1109,6 +1230,9 @@ def init(C):
 
 def handlebar(C):
     global _LAST_SUMMARY
+    is_last_bar = getattr(C, "is_last_bar", None)
+    if callable(is_last_bar) and not is_last_bar():
+        return
     with _LOCK:
         for inst in _INSTANCES.values():
             _check_validation(inst)
@@ -1123,16 +1247,20 @@ def _apply_order_update(inst, item):
         inst.get("order_reported_traded_qty", 0), item["traded"])
     inst["our_traded_qty"] = max(
         inst.get("deal_traded_qty", 0), inst["order_reported_traded_qty"])
-    if item["traded"] > 0:
+    status = str(item["status"]).lower()
+    if inst["our_traded_qty"] >= inst["our_order_qty"] > 0 or status == "56":
         _cancel_timer(inst)
-        _set_state(inst, STATE_DONE, "订单已成交")
-    elif str(item["status"]).lower() in ("5", "6", "canceled", "cancelled", "撤单", "废单"):
+        _set_state(inst, STATE_DONE, "订单全部成交")
+    elif status in ("5", "6", "53", "54", "canceled", "cancelled", "撤单"):
         if inst.get("validation_order_id") == item["id"]:
             inst["cancel_confirmed"] = True
             if item["traded"] == 0:
                 _log("[撤单] %s 已完全撤单" % inst["code"])
         else:
             _set_state(inst, STATE_DONE, "订单结束")
+    elif status in ("57", "rejected", "废单"):
+        _cancel_timer(inst)
+        _set_state(inst, STATE_DONE, "订单废单")
 
 
 def _apply_deal_update(inst, item):
@@ -1150,16 +1278,32 @@ def _apply_deal_update(inst, item):
     inst["our_traded_qty"] = max(
         inst["deal_traded_qty"], inst.get("order_reported_traded_qty", 0))
     _COUNTERS["deals"] += 1
-    _cancel_timer(inst)
-    _set_state(inst, STATE_DONE, "成交回报")
+    if inst["our_traded_qty"] >= inst["our_order_qty"] > 0:
+        _cancel_timer(inst)
+        _set_state(inst, STATE_DONE, "订单全部成交")
     _log("[DEAL_CALLBACK] id=%s code=%s deal_id=%s volume=%s cum_volume=%s price=%s" % (
         item.get("id", ""), item.get("code", ""), deal_id, volume,
         inst["our_traded_qty"], item.get("price", 0)))
 
 
+def _is_ignored_exited_order_callback(inst, item):
+    if inst.get("state") != STATE_SKIPPED:
+        return False
+    order_id = str(item.get("id") or "")
+    for field in ("our_order_id", "validation_order_id"):
+        owned_id = str(inst.get(field) or "")
+        if order_id and owned_id and order_id == owned_id:
+            return True
+    token = str(inst.get("submit_token") or "")
+    return bool(token and str(item.get("user_order_id") or "") == token)
+
+
 def order_callback(ContextInfo, orderInfo):
     with _LOCK:
         item = _order_fields(orderInfo)
+        if any(_is_ignored_exited_order_callback(inst, item)
+               for inst in _INSTANCES.values()):
+            return
         for inst in _INSTANCES.values():
             if item["id"] and item["id"] == str(inst.get("our_order_id")):
                 _apply_order_update(inst, item)
@@ -1167,7 +1311,8 @@ def order_callback(ContextInfo, orderInfo):
                     item["id"], item["code"], item["user_order_id"], item["status"],
                     item["total"], item["traded"], item["price"]))
                 return
-        candidates = [inst for inst in _INSTANCES.values() if _pending_order_matches(inst, item)]
+        candidates = [inst for inst in _INSTANCES.values()
+                      if inst["state"] != STATE_SKIPPED and _pending_order_matches(inst, item)]
         if len(candidates) == 1:
             inst = candidates[0]
             if item["id"] and _bind_order_id(inst, item["id"]):
@@ -1189,11 +1334,15 @@ def order_callback(ContextInfo, orderInfo):
 def deal_callback(ContextInfo, dealInfo):
     with _LOCK:
         item = _order_fields(dealInfo)
+        if any(_is_ignored_exited_order_callback(inst, item)
+               for inst in _INSTANCES.values()):
+            return
         for inst in _INSTANCES.values():
             if item["id"] and item["id"] == str(inst.get("our_order_id")):
                 _apply_deal_update(inst, item)
                 return
-        candidates = [inst for inst in _INSTANCES.values() if _pending_order_matches(inst, item)]
+        candidates = [inst for inst in _INSTANCES.values()
+                      if inst["state"] != STATE_SKIPPED and _pending_order_matches(inst, item)]
         if len(candidates) == 1:
             inst = candidates[0]
             inst["pending_deal_infos"].append(item)

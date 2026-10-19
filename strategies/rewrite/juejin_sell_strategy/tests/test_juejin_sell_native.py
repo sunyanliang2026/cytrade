@@ -16,6 +16,12 @@ class _Context:
         self.ticks = ticks or {}
         self.subscriptions = []
         self.cancels = []
+        self.last_bar = True
+        self.schedules = []
+        self.canceled_schedules = []
+
+    def is_last_bar(self):
+        return self.last_bar
 
     def get_instrument_detail(self, code):
         return self.details.get(code, {})
@@ -30,6 +36,13 @@ class _Context:
     def unsubscribe_quote(self, sub_id):
         return sub_id
 
+    def schedule_run(self, callback, time_point, repeat_times, interval, name):
+        self.schedules.append((callback, time_point, repeat_times, interval, name))
+        return len(self.schedules)
+
+    def cancel_schedule_run(self, schedule_id):
+        self.canceled_schedules.append(schedule_id)
+
 
 class NativeSellModelTests(unittest.TestCase):
     def setUp(self):
@@ -39,6 +52,9 @@ class NativeSellModelTests(unittest.TestCase):
         MODEL._LOG = None
         MODEL.ENABLE_LIVE_ORDERS = False
         MODEL.ACCOUNT_ID = ""
+        MODEL._POSITION_CACHE["updated_at"] = 0.0
+        MODEL._POSITION_CACHE["available"] = {}
+        MODEL._POSITION_REFRESH_TIMER = None
         self.plan = {
             "code": "000001.SZ",
             "nick": "test",
@@ -151,6 +167,7 @@ class NativeSellModelTests(unittest.TestCase):
 
         MODEL.get_trade_detail_data = get_positions
         MODEL.passorder = lambda *args: calls.append(args) or "order-1"
+        self.assertTrue(MODEL._refresh_positions())
 
         order = MODEL._submit_sell(self.inst, 200, 10.0, "test", "test_action")
 
@@ -159,7 +176,191 @@ class NativeSellModelTests(unittest.TestCase):
         self.assertEqual(len(calls[0]), 11)
         self.assertEqual(calls[0][0:2], (MODEL.OP_TYPE_SELL, MODEL.ORDER_TYPE_LIMIT))
         self.assertEqual(calls[0][3:8], ("000001.SZ", MODEL.PRICE_TYPE_LIMIT, 10.0, 100, MODEL.STRATEGY_NAME))
+        self.assertEqual(calls[0][8], 2)
         self.assertEqual(queries, [("ACCOUNT", "stock", "POSITION")])
+
+    def test_quote_uses_cached_position_and_chooses_one_flag7_action(self):
+        MODEL.ENABLE_LIVE_ORDERS = True
+        MODEL.ACCOUNT_ID = "ACCOUNT"
+        calls = []
+        MODEL.get_trade_detail_data = lambda *args: [
+            {"stock_code": "000001.SZ", "can_use_volume": 200}
+        ]
+        self.assertTrue(MODEL._refresh_positions())
+        MODEL.get_trade_detail_data = lambda *args: self.fail("position query in quote callback")
+        MODEL.passorder = lambda *args: calls.append(args) or "order-1"
+        self.inst["flag"] = MODEL.FLAG_STRONG
+
+        self._l2("103000", 10.60, high=10.90)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(self.inst["orders"]), 1)
+        self.assertEqual(self.inst["orders"][0]["action"], "flag7_break7_after_high")
+        self.assertEqual(calls[0][8], 2)
+
+    def test_stale_position_cache_defers_and_rechecks_signal(self):
+        MODEL.ENABLE_LIVE_ORDERS = True
+        MODEL.ACCOUNT_ID = "ACCOUNT"
+        calls = []
+        MODEL.get_trade_detail_data = lambda *args: [
+            {"stock_code": "000001.SZ", "can_use_volume": 200}
+        ]
+        MODEL.passorder = lambda *args: calls.append(args) or "order-1"
+        self.inst["flag"] = MODEL.FLAG_STRONG
+
+        self._l2("103000", 10.60, high=10.90)
+        self.assertFalse(calls)
+        pending = self.inst["pending_after_cancel"]
+        self.assertIsNotNone(pending)
+        pending["created_at"] = MODEL._now() - 1
+        self.assertTrue(MODEL._refresh_positions())
+        MODEL._drain_all_pending()
+        self.assertEqual(len(calls), 1)
+
+    def test_stale_signal_is_dropped_after_quote_recovers(self):
+        MODEL.ENABLE_LIVE_ORDERS = True
+        MODEL.ACCOUNT_ID = "ACCOUNT"
+        MODEL.get_trade_detail_data = lambda *args: [
+            {"stock_code": "000001.SZ", "can_use_volume": 200}
+        ]
+        MODEL.passorder = lambda *args: self.fail("recovered signal placed an order")
+        self.inst["flag"] = MODEL.FLAG_STRONG
+
+        self._l2("103000", 10.60, high=10.90)
+        pending = self.inst["pending_after_cancel"]
+        pending["created_at"] = MODEL._now() - 1
+        self.inst["last_l2_quote"]["bid"] = 10.85
+        self.assertTrue(MODEL._refresh_positions())
+        MODEL._drain_all_pending()
+        self.assertIsNone(self.inst["pending_after_cancel"])
+        self.assertFalse(self.inst["orders"])
+
+    def test_pending_signal_rechecks_l2_after_intervening_tick(self):
+        MODEL.ENABLE_LIVE_ORDERS = True
+        MODEL.ACCOUNT_ID = "ACCOUNT"
+        MODEL.get_trade_detail_data = lambda *args: [
+            {"stock_code": "000001.SZ", "can_use_volume": 200}
+        ]
+        calls = []
+        MODEL.passorder = lambda *args: calls.append(args) or "order-1"
+        self.inst["flag"] = MODEL.FLAG_STRONG
+
+        self._l2("103000", 10.60, high=10.90)
+        self.inst["pending_after_cancel"]["created_at"] = MODEL._now() - 1
+        MODEL._handle_quote(self.inst["code"], "tick", self._quote("103001", 10.85, high=10.90))
+        self.assertTrue(MODEL._refresh_positions())
+        MODEL._drain_all_pending()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][5], 10.45)
+
+    def test_handlebar_only_refreshes_positions_on_latest_bar(self):
+        MODEL.ENABLE_LIVE_ORDERS = True
+        MODEL.ACCOUNT_ID = "ACCOUNT"
+        queries = []
+        MODEL.get_trade_detail_data = lambda *args: queries.append(args) or [
+            {"stock_code": "000001.SZ", "can_use_volume": 200}
+        ]
+        context = _Context()
+        context.last_bar = False
+        MODEL.handlebar(context)
+        self.assertFalse(queries)
+
+        context.last_bar = True
+        MODEL._LAST_SUMMARY = MODEL._now()
+        MODEL.handlebar(context)
+        self.assertEqual(len(queries), 1)
+
+    def test_failed_position_refresh_invalidates_previous_cache(self):
+        MODEL.ENABLE_LIVE_ORDERS = True
+        MODEL.ACCOUNT_ID = "ACCOUNT"
+        MODEL.get_trade_detail_data = lambda *args: [
+            {"stock_code": "000001.SZ", "can_use_volume": 200}
+        ]
+        self.assertTrue(MODEL._refresh_positions())
+        self.assertEqual(MODEL._available_for_sell(self.inst), 200)
+
+        def fail_query(*args):
+            raise AttributeError("request_id unavailable")
+
+        MODEL.get_trade_detail_data = fail_query
+        self.assertFalse(MODEL._refresh_positions())
+        self.assertIsNone(MODEL._available_for_sell(self.inst))
+
+    def test_position_timer_refreshes_daily_bar_cache_and_drains_pending(self):
+        MODEL.ENABLE_LIVE_ORDERS = True
+        MODEL.ACCOUNT_ID = "ACCOUNT"
+        context = _Context()
+        MODEL._C = context
+        queries = []
+
+        def get_positions(*args):
+            queries.append(args)
+            return [{"stock_code": "000001.SZ", "can_use_volume": 200}]
+
+        MODEL.get_trade_detail_data = get_positions
+        calls = []
+        MODEL.passorder = lambda *args: calls.append(args) or "order-1"
+        MODEL._schedule_position_refresh(context)
+        self.assertEqual(len(context.schedules), 1)
+        self.assertEqual(context.schedules[0][2], -1)
+
+        self.inst["flag"] = MODEL.FLAG_STRONG
+        self._l2("103000", 10.60, high=10.90)
+        self.assertFalse(calls)
+        context.schedules[0][0](context)
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(len(calls), 1)
+
+        MODEL.stop(context)
+        self.assertEqual(context.canceled_schedules, [1])
+
+    def test_order_callback_with_different_id_and_token_cannot_bind(self):
+        MODEL.ENABLE_LIVE_ORDERS = True
+        MODEL.ACCOUNT_ID = "ACCOUNT"
+        MODEL.get_trade_detail_data = lambda *args: [
+            {"stock_code": "000001.SZ", "can_use_volume": 200}
+        ]
+        MODEL.passorder = lambda *args: "order-ours"
+        self.assertTrue(MODEL._refresh_positions())
+        order = MODEL._submit_sell(self.inst, 200, 10.0, "test", "our_action")
+
+        MODEL.order_callback(None, {
+            "order_id": "order-other", "stock_code": "000001.SZ",
+            "order_remark": "other-token", "order_volume": 200,
+            "order_price": 10.0, "order_status": 56,
+        })
+        self.assertEqual(order["order_id"], "order-ours")
+        self.assertEqual(order["status"], MODEL.ORDER_ACTIVE)
+
+        order["status"] = MODEL.ORDER_UNKNOWN
+        MODEL.order_callback(None, {
+            "order_id": "order-ours", "stock_code": "000001.SZ",
+            "order_remark": "broker-rewritten", "order_volume": 200,
+            "order_price": 10.0, "order_status": 50,
+        })
+        self.assertEqual(order["status"], MODEL.ORDER_ACTIVE)
+
+    def test_missing_order_callback_does_not_bind_unrelated_last_order(self):
+        MODEL.ENABLE_LIVE_ORDERS = True
+        MODEL.ACCOUNT_ID = "ACCOUNT"
+        MODEL.get_trade_detail_data = lambda *args: [
+            {"stock_code": "000001.SZ", "can_use_volume": 200}
+        ]
+        self.assertTrue(MODEL._refresh_positions())
+        MODEL.passorder = lambda *args: 0
+        MODEL.get_last_order_id = lambda *args: self.fail("blind order lookup")
+
+        order = MODEL._submit_sell(self.inst, 200, 10.0, "test", "unknown")
+        MODEL._resolve_order_id(self.inst["code"], order["token"])
+        self.assertEqual(order["status"], MODEL.ORDER_UNKNOWN)
+        self.assertTrue(MODEL._has_active_orders(self.inst))
+        MODEL.order_callback(None, {
+            "order_id": "real-order", "stock_code": "000001.SZ",
+            "order_remark": order["token"], "order_volume": 200,
+            "order_price": 10.0, "order_status": 50,
+        })
+        self.assertEqual(order["order_id"], "real-order")
+        self.assertEqual(order["status"], MODEL.ORDER_ACTIVE)
 
     def test_native_detail_uses_qmt_limit_price_field_names(self):
         context = _Context(
@@ -184,6 +385,7 @@ class NativeSellModelTests(unittest.TestCase):
             {"stock_code": "000001.SZ", "can_use_volume": 200}
         ]
         MODEL.passorder = lambda *args: "order-native"
+        self.assertTrue(MODEL._refresh_positions())
 
         order = MODEL._submit_sell(self.inst, 200, 10.0, "test", "native_order")
         MODEL.order_callback(None, {
@@ -206,6 +408,7 @@ class NativeSellModelTests(unittest.TestCase):
             {"stock_code": "000001.SZ", "can_use_volume": 200}
         ]
         MODEL.passorder = lambda *args: "order-native"
+        self.assertTrue(MODEL._refresh_positions())
 
         order = MODEL._submit_sell(self.inst, 200, 10.0, "test", "native_trade")
         trade = {
@@ -229,6 +432,7 @@ class NativeSellModelTests(unittest.TestCase):
             {"stock_code": "000001.SZ", "can_use_volume": 200}
         ]
         MODEL.passorder = lambda *args: "0"
+        self.assertTrue(MODEL._refresh_positions())
 
         order = MODEL._submit_sell(self.inst, 200, 10.0, "test", "pending_native_trade")
         MODEL.deal_callback(None, {
@@ -255,6 +459,7 @@ class NativeSellModelTests(unittest.TestCase):
         ]
         MODEL.passorder = lambda *args: calls.append(args) or str(len(calls))
         MODEL.cancel = lambda *args: True
+        self.assertTrue(MODEL._refresh_positions())
 
         first = MODEL._submit_sell(self.inst, 200, 10.0, "first", "first_action")
         self.assertEqual(first["status"], MODEL.ORDER_ACTIVE)
@@ -299,6 +504,7 @@ class NativeSellModelTests(unittest.TestCase):
             {"m_strInstrumentID": "000001.SZ", "m_nCanUseVolume": 200}
         ]
         MODEL.passorder = lambda *args: "order-1"
+        self.assertTrue(MODEL._refresh_positions())
 
         order = MODEL._submit_sell(self.inst, 200, 10.0, "test", "fill_action")
         MODEL.deal_callback(None, {
