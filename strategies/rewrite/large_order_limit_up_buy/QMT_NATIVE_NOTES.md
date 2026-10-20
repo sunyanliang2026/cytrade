@@ -48,13 +48,13 @@ passorder(23, ORDER_TYPE_BUY, ACCOUNT_ID, code,
 
 大单路径使用 `l2order.volume` 的股数单位；9000 手按 100 股/手换算为 900000 股，触发条件为严格大于 900000 股且委托金额严格大于 500 万元。委托金额优先取 `amount`，缺失时按 `price * volume` 计算。`l2quote.bid1_volume` 才是手数，封单金额按 `bid1 * bid1_volume * 100` 计算。该单位映射与已实盘验证的原 Python 策略一致。
 
-订阅回调中的即时委托使用 `quickTrade=2`。回报回调签名为 `order_callback(ContextInfo, orderInfo)` 和 `deal_callback(ContextInfo, dealInfo)`；撤单使用 `cancel(orderId, accountId, accountType, ContextInfo)`。`passorder` 没有返回委托号时保持待报，等待唯一备注或股票、价格、数量可关联的回报，不将账户最近委托号直接绑定到某只股票。超时仅记录待确认状态，不自动重发。这些接口的字段名可能随 QMT 版本不同，仍需以当前券商版本的实际回报为准。
+订阅回调中的即时委托使用 `quickTrade=2`。按官网问答说明，`passorder` 调用后立即发出委托并返回，不等待委托回报，也不阻塞 Python 线程；验证计时因此可在调用前启动。模型仍按单线程顺序处理回调，后续 L2 回调在当前信号回调返回后进入策略处理。回报回调签名为 `order_callback(ContextInfo, orderInfo)` 和 `deal_callback(ContextInfo, dealInfo)`；撤单使用 `cancel(orderId, accountId, accountType, ContextInfo)`。`passorder` 返回 0 且没有委托号时保持待报，以 100ms 间隔最多查询 10 次 `get_trade_detail_data(ACCOUNT_ID, ACCOUNT_TYPE, "order")`。查单和回报仅按唯一备注令牌，或包含令牌的策略名，关联订单；不按账户最新委托、同代码或相似价格数量盲目关联。查单结束仍无唯一结果时保留待撤状态，等待后续回报，不自动重发。这些接口的字段名可能随 QMT 版本不同，仍需以当前券商版本的实际回报为准。
 
-订单和成交回调需要分别确认 `m_nOrderID`、证券代码及市场、订单累计成交量和成交回报单笔数量。回调可能先于订单号查询到达；订单号未知时，只能用唯一的待提交订单及代码、价格、数量进行关联。成交回报用 `m_nVolume` 等单笔成交量累计，并用 `m_nVolumeTraded` 作为订单侧累计量交叉核验。
+订单和成交回调需要分别确认 `m_strOrderSysID` / `order_sysid`、证券代码及市场、订单累计成交量和成交回报单笔数量。回调可能先于订单号查询到达；订单号未知时，仅使用唯一的备注令牌或策略名包含令牌进行关联。成交回报用 `m_nVolume` 等单笔成交量累计，并用 `m_nVolumeTraded` 作为订单侧累计量交叉核验。
 
 ## 编码、路径和日志
 
-`QMT_LARGE_ORDER_LIMIT_UP_BUY.py` 保持 `# coding: gbk`，以兼容现有 QMT 原生 Python 编辑器。股票池用 UTF-8-SIG CSV 读取；日志和原始 JSONL 使用脚本运行目录、当前工作目录及 QMT 根目录逐级查找可用路径。实盘验证时应记录实际生成的文件路径，不要凭默认路径推断“没有回调”。原累计首封、单笔大单首封和两种回封入口均启动订单验证；撤单后补充追随不再启动第二轮验证。
+`QMT_LARGE_ORDER_LIMIT_UP_BUY.py` 保持 `# coding: gbk`，以兼容现有 QMT 原生 Python 编辑器。股票池用 UTF-8-SIG CSV 读取；日志和原始 JSONL 使用脚本运行目录、当前工作目录及 QMT 根目录逐级查找可用路径。实盘验证时应记录实际生成的文件路径，不要凭默认路径推断“没有回调”。原累计首封、单笔大单首封和两种回封入口在下单决策及本地前置检查通过后、调用 `passorder` 前开始观察后续涨停买入委托；接口拒单或调用抛出异常时停止该轮验证。150 笔内出现 2 笔不低于 150 万元即通过，否则满 150 笔或 1 秒窗口到期即撤单。触发事件和事件时间不晚于下单决策时刻的积压事件不计入；撤单后补充追随不再启动第二轮验证。提交日志记录触发行情延时和 `passorder` 调用耗时。
 
 ## 验证重点
 
