@@ -1,9 +1,5 @@
 # coding: gbk
-"""Native QMT model for overnight limit-up buy orders.
-
-This file is self-contained for the QMT embedded Python runtime. Live orders
-are disabled until an operator reviews and changes the constants below.
-"""
+"""Native QMT model for overnight limit-up buy orders."""
 
 import csv
 import datetime
@@ -15,13 +11,22 @@ import uuid
 
 
 # ------------------------- operator configuration -------------------------
-ENABLE_LIVE_ORDERS = False
-ACCOUNT_ID = ""
+ENABLE_LIVE_ORDERS = True
+ACCOUNT_ID = "32011276"
 ACCOUNT_TYPE = "stock"
 STRATEGY_NAME = "overnight_limit_up_buy_native"
 ORDER_TYPE_BUY = 1101
 PRICE_TYPE_LIMIT = 11
 QUICK_TRADE = 2
+ORDER_STATUS_PART_CANCEL = 53
+ORDER_STATUS_CANCELED = 54
+ORDER_STATUS_PART_SUCCEEDED = 55
+ORDER_STATUS_SUCCEEDED = 56
+ORDER_STATUS_JUNK = 57
+TERMINAL_ORDER_STATUSES = (
+    ORDER_STATUS_PART_CANCEL, ORDER_STATUS_CANCELED,
+    ORDER_STATUS_PART_SUCCEEDED, ORDER_STATUS_SUCCEEDED, ORDER_STATUS_JUNK,
+)
 
 QMT_HOME = u"C:/\u5149\u5927\u8bc1\u5238\u91d1\u9633\u5149QMT\u5b9e\u76d8"
 ORDER_CSV_PATH = os.path.join(QMT_HOME, "python", "overnight_orders.csv")
@@ -33,7 +38,7 @@ SUBMIT_HOUR = 8
 SUBMIT_MINUTE = 30
 LATEST_SUBMIT_HOUR = 15
 LATEST_SUBMIT_MINUTE = 0
-MAX_PREOPEN_RETRIES = 2
+MAX_REJECT_RETRIES = 2
 RETRY_DELAY_MS = 100
 PREFLIGHT_ROWS_PER_TURN = 5
 SUBMIT_ROWS_PER_TURN = 5
@@ -80,6 +85,41 @@ def _float_value(value):
     except (TypeError, ValueError, OverflowError):
         pass
     return 0.0
+
+
+def _int_value(value):
+    try:
+        number = float(value)
+        if number == number and number not in (float("inf"), float("-inf")):
+            return int(number)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return None
+
+
+def _order_status_value(source):
+    return _int_value(_field(
+        source, "m_nOrderStatus", "order_status", "m_strOrderStatus", "status"
+    ))
+
+
+def _traded_volume(source):
+    return max(0, int(_float_value(_field(
+        source, "m_nVolumeTraded", "traded_volume", "tradedVolume",
+        "volumeTraded", "m_nTradeVolume"
+    ))))
+
+
+def _is_terminal_zero_fill(status, traded_volume):
+    return status in TERMINAL_ORDER_STATUSES and int(traded_volume or 0) == 0
+
+
+def _is_terminal_order_status(status):
+    return status in TERMINAL_ORDER_STATUSES
+
+
+def _reject_callback_key(row_no, attempt):
+    return "reject:%s:%s" % (row_no, attempt.get("attempt", ""))
 
 
 def _normalize_code(value):
@@ -268,6 +308,7 @@ def _query_order_records():
     """Read broker orders when deciding whether an old reservation is stale."""
     getter = globals().get("get_trade_detail_data")
     if not callable(getter):
+        _log("STATE_ORDER_QUERY_RESULT unavailable=api_missing")
         return None
     try:
         data = getter(ACCOUNT_ID, ACCOUNT_TYPE, "order")
@@ -275,10 +316,29 @@ def _query_order_records():
         _log("STATE_ORDER_QUERY_FAILED reason=%r" % (exc,))
         return None
     if data is None:
+        _log("STATE_ORDER_QUERY_RESULT unavailable=none")
         return None
     if isinstance(data, (list, tuple)):
-        return list(data)
-    return [data]
+        records = list(data)
+    else:
+        records = [data]
+    _log("STATE_ORDER_QUERY_RESULT count=%s" % len(records))
+    return records
+
+
+def _broker_order_id(record):
+    return str(_field(
+        record, "m_strOrderSysID", "order_sysid", "m_strOrderID",
+        "m_nOrderID", "orderID", "order_id", "orderId"
+    ) or "").strip()
+
+
+def _broker_order_token(record):
+    return str(_field(
+        record, "m_strRemark", "m_strOrderRemark", "m_strUserOrderID",
+        "m_strUserOrderId", "userOrderId", "user_order_id", "remark",
+        "order_remark"
+    ) or "").strip()
 
 
 def _order_record_matches_plan(record, plan):
@@ -291,17 +351,24 @@ def _order_record_matches_plan(record, plan):
     strategy = str(_field(
         record, "m_strStrategyName", "strategyName", "strategy_name"
     ) or "").strip()
-    if strategy and strategy != STRATEGY_NAME:
+    token = _broker_order_token(record)
+    expected_token = str(plan.get("last_token") or "").strip()
+    strategy_matches = (
+        not strategy
+        or strategy == STRATEGY_NAME
+        or (
+            strategy.startswith(STRATEGY_NAME + "_&&&_")
+            and (not expected_token or
+                 strategy.startswith(STRATEGY_NAME + "_&&&_" + expected_token + "_&&&_"))
+        )
+    )
+    if not strategy_matches:
         return False
-    token = str(_field(
-        record, "m_strRemark", "m_strOrderRemark", "m_strUserOrderID",
-        "m_strUserOrderId", "userOrderId", "user_order_id", "remark"
-    ) or "").strip()
-    if token and token == str(plan.get("last_token") or ""):
+    if token and token == expected_token:
         return True
     quantity = _float_value(_field(
-        record, "m_nVolumeTotalOriginal", "m_nVolume", "volume",
-        "quantity", "order_volume"
+        record, "m_nVolumeTotalOriginal", "m_nVolumeTotal", "m_nVolume",
+        "volume", "quantity", "order_volume"
     ))
     price = _float_value(_field(
         record, "m_dPrice", "price", "order_price", "m_dOrderPrice"
@@ -314,24 +381,153 @@ def _order_record_matches_plan(record, plan):
     )
 
 
-def _reservation_has_broker_order(batch):
+def _saved_attempt_history(saved):
+    history = saved.get("attempt_history")
+    if isinstance(history, list) and history:
+        return [dict(item) for item in history if isinstance(item, dict)]
+    attempts = _int_value(saved.get("attempts")) or 0
+    if attempts <= 0 and (saved.get("order_id") or saved.get("last_token")):
+        attempts = 1
+    if attempts <= 0:
+        return []
+    return [{
+        "attempt": attempts,
+        "token": saved.get("last_token", ""),
+        "order_id": saved.get("order_id", ""),
+        "status": saved.get("status", ""),
+        "order_status": saved.get("order_status"),
+        "traded_volume": saved.get("traded_volume", 0),
+        "fill_uncertain": saved.get("fill_uncertain", False),
+    }]
+
+
+def _find_broker_order_for_attempt(records, saved, attempt):
+    order_id = str(attempt.get("order_id") or "").strip()
+    if order_id:
+        matches = [record for record in records
+                   if _broker_order_id(record) == order_id]
+        if len(matches) == 1:
+            return matches[0]
+
+    token = str(attempt.get("token") or "").strip()
+    if token:
+        matches = [record for record in records
+                   if _broker_order_token(record) == token]
+        if len(matches) == 1:
+            return matches[0]
+
+    plan = {
+        "stock_code": saved.get("stock_code"),
+        "quantity": saved.get("quantity"),
+        "limit_up_price": saved.get("limit_up_price"),
+        "last_token": token,
+    }
+    matches = [record for record in records
+               if _order_record_matches_plan(record, plan)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _broker_order_match_counts(records, saved, attempt):
+    order_id = str(attempt.get("order_id") or "").strip()
+    token = str(attempt.get("token") or "").strip()
+    plan = {
+        "stock_code": saved.get("stock_code"),
+        "quantity": saved.get("quantity"),
+        "limit_up_price": saved.get("limit_up_price"),
+        "last_token": token,
+    }
+    return (
+        sum(1 for record in records if order_id and _broker_order_id(record) == order_id),
+        sum(1 for record in records if token and _broker_order_token(record) == token),
+        sum(1 for record in records if _order_record_matches_plan(record, plan)),
+    )
+
+
+def _reconcile_reservation(batch):
     orders = batch.get("orders", {}) if isinstance(batch, dict) else {}
-    for saved in orders.values():
-        if saved.get("order_id"):
-            return True
-    records = _query_order_records()
-    if records is None:
-        return True
-    for saved in orders.values():
-        plan = {
-            "stock_code": saved.get("stock_code"),
-            "quantity": saved.get("quantity"),
-            "limit_up_price": saved.get("limit_up_price"),
-            "last_token": saved.get("last_token", ""),
+    records = None
+    histories = {}
+    for row_key, saved in orders.items():
+        if not isinstance(saved, dict):
+            return False, {}, "invalid saved order row %s" % row_key
+        if saved.get("fill_uncertain"):
+            return False, {}, "fill state is uncertain for row %s" % row_key
+        attempts = _int_value(saved.get("attempts")) or 0
+        history = _saved_attempt_history(saved)
+        if not history:
+            histories[int(row_key)] = {"attempts": 0, "attempt_history": []}
+            continue
+        for attempt in history:
+            if attempt.get("fill_uncertain"):
+                return False, {}, "fill state is uncertain for row %s" % row_key
+            status = _int_value(attempt.get("order_status"))
+            traded = max(0, _int_value(attempt.get("traded_volume")) or 0)
+            if not _is_terminal_zero_fill(status, traded):
+                if records is None:
+                    records = _query_order_records()
+                if records is None:
+                    return False, {}, "broker order query is unavailable"
+                record = _find_broker_order_for_attempt(records, saved, attempt)
+                if record is None:
+                    id_count, token_count, plan_count = _broker_order_match_counts(
+                        records, saved, attempt
+                    )
+                    return False, {}, (
+                        "row %s order is not verifiably terminal "
+                        "(query_records=%s id_matches=%s token_matches=%s "
+                        "plan_matches=%s)" % (
+                            row_key, len(records), id_count, token_count, plan_count
+                        )
+                    )
+                record_status = _order_status_value(record)
+                if record_status is not None:
+                    status = record_status
+                traded = max(traded, _traded_volume(record))
+                attempt["order_status"] = status
+                attempt["traded_volume"] = traded
+                attempt["order_id"] = str(_field(
+                    record, "m_strOrderSysID", "order_sysid", "m_strOrderID",
+                    "m_nOrderID", "orderID", "order_id", "orderId"
+                ) or attempt.get("order_id") or "")
+                attempt["token"] = _broker_order_token(record) or attempt.get("token") or ""
+            if not _is_terminal_zero_fill(status, traded):
+                return False, {}, (
+                    "row %s order status=%s traded=%s" % (row_key, status, traded)
+                )
+            attempt["status"] = (
+                "rejected" if status == ORDER_STATUS_JUNK else "terminal"
+            )
+        histories[int(row_key)] = {
+            "attempts": attempts,
+            "attempt_history": history,
         }
-        if any(_order_record_matches_plan(record, plan) for record in records):
-            return True
-    return False
+        saved["attempts"] = attempts
+        saved["attempt_history"] = history
+        latest = history[-1]
+        saved["order_status"] = latest.get("order_status")
+        saved["traded_volume"] = latest.get("traded_volume", 0)
+        saved["status"] = latest.get("status", saved.get("status", ""))
+    return True, histories, "all submitted orders are terminal with zero fills"
+
+
+def _current_csv_matches_batch(batch):
+    saved_orders = batch.get("orders", {}) if isinstance(batch, dict) else {}
+    saved_rows = sorted(saved_orders.items(), key=lambda item: int(item[0]))
+    current_rows = _SESSION.get("orders", [])
+    if len(saved_rows) != len(current_rows):
+        return False
+    for (saved_row, saved), current in zip(saved_rows, current_rows):
+        if int(saved_row) != int(current["row_no"]):
+            return False
+        if saved.get("stock_code") != current.get("stock_code"):
+            return False
+        try:
+            saved_amount = decimal.Decimal(str(saved.get("amount")))
+        except (decimal.InvalidOperation, TypeError, ValueError):
+            return False
+        if saved_amount != current["amount"]:
+            return False
+    return True
 
 
 def _format_plan():
@@ -352,16 +548,51 @@ def _preflight_step(C):
         day = _SESSION["trade_day"]
         batch = _SESSION["state"].get("trade_days", {}).get(day)
         if batch:
-            if ENABLE_LIVE_ORDERS and not _reservation_has_broker_order(batch):
-                _log("STATE_STALE_NO_BROKER_ORDER day=%s; releasing prior reservation" % day)
-                del _SESSION["state"]["trade_days"][day]
-                try:
-                    _state_save()
-                except Exception as exc:
-                    _abort("could not release stale reservation: %r" % (exc,))
-                    return
-            else:
+            if not ENABLE_LIVE_ORDERS:
                 _abort("a submission reservation already exists for trade day %s" % day)
+                return
+            safe_to_reopen, histories, reason = _reconcile_reservation(batch)
+            if not safe_to_reopen:
+                _abort("same-day reservation is still active, filled, or unknown: %s" % reason)
+                return
+            same_csv = _current_csv_matches_batch(batch)
+            if same_csv:
+                resume = {}
+                for row_key, saved in batch.get("orders", {}).items():
+                    row_no = int(row_key)
+                    history_info = histories.get(row_no, {"attempts": 0,
+                                                           "attempt_history": []})
+                    attempts = history_info["attempts"]
+                    history = history_info["attempt_history"]
+                    if attempts <= 0:
+                        continue
+                    if not history or history[-1].get("order_status") != ORDER_STATUS_JUNK:
+                        _abort("same-day row %s ended without a retryable junk order" % row_no)
+                        return
+                    if attempts >= 1 + MAX_REJECT_RETRIES:
+                        _abort("same-day row %s already used the maximum %s retries" % (
+                            row_no, MAX_REJECT_RETRIES
+                        ))
+                        return
+                    resume[row_no] = {
+                        "attempts": attempts,
+                        "attempt_history": history,
+                    }
+                _SESSION["resume_attempts_by_row"] = resume
+                if resume:
+                    _log("STATE_RETRY_RESUME day=%s rows=%s verified=terminal_zero_fill" % (
+                        day, len(resume)
+                    ))
+                else:
+                    _log("STATE_RELEASED_UNSUBMITTED day=%s; no prior order was sent" % day)
+            else:
+                _SESSION["resume_attempts_by_row"] = {}
+                _log("STATE_RELEASED_TERMINAL_ZERO_FILL day=%s csv_changed=true" % day)
+            del _SESSION["state"]["trade_days"][day]
+            try:
+                _state_save()
+            except Exception as exc:
+                _abort("could not release terminal reservation: %r" % (exc,))
                 return
         _SESSION["state_checked"] = True
         _log("TRADING_DAY_CHECK_SKIPPED day=%s; clock schedule controls submission" % day)
@@ -384,6 +615,10 @@ def _preflight_step(C):
                 raise ValueError("budget is below one board lot for %s" % code)
             amount = float(order["amount"])
             estimate = round(price * quantity, 2)
+            resume = _SESSION.get("resume_attempts_by_row", {}).get(
+                order["row_no"], {}
+            )
+            history = [dict(item) for item in resume.get("attempt_history", [])]
             _SESSION["plans"].append({
                 "row_no": order["row_no"],
                 "stock_code": code,
@@ -391,13 +626,30 @@ def _preflight_step(C):
                 "limit_up_price": price,
                 "quantity": quantity,
                 "estimated_amount": estimate,
-                "attempts": 0,
-                "status": "planned",
-                "last_token": "",
-                "order_id": "",
+                "attempts": resume.get("attempts", 0),
+                "status": "retry_wait" if history else "planned",
+                "last_token": history[-1].get("token", "") if history else "",
+                "order_id": history[-1].get("order_id", "") if history else "",
+                "order_status": history[-1].get("order_status") if history else None,
+                "traded_volume": 0,
+                "fill_uncertain": False,
+                "attempt_history": history,
             })
             plan = _SESSION["plans"][-1]
             _SESSION["plan_by_row"][order["row_no"]] = plan
+            for attempt in history:
+                token = str(attempt.get("token") or "")
+                order_id = str(attempt.get("order_id") or "")
+                if token:
+                    _SESSION["token_to_plan"][token] = plan
+                    _SESSION["token_to_attempt"][token] = attempt
+                if order_id:
+                    _SESSION["order_id_to_plan"][order_id] = plan
+                    _SESSION["order_id_to_attempt"][order_id] = attempt
+                if attempt.get("order_status") == ORDER_STATUS_JUNK:
+                    _SESSION["handled_callbacks"].add(
+                        _reject_callback_key(order["row_no"], attempt)
+                    )
             _log("PLAN row=%s code=%s budget=%.2f limit_up=%.3f qty=%s estimate=%.2f" % (
                 plan["row_no"], plan["stock_code"], plan["amount"],
                 plan["limit_up_price"], plan["quantity"], plan["estimated_amount"]
@@ -415,6 +667,13 @@ def _preflight_step(C):
     if _SESSION["failures"]:
         _abort("preflight failed rows=%s" % len(_SESSION["failures"]))
         return
+
+    now_mono = time.monotonic()
+    for plan in _SESSION["plans"]:
+        if plan.get("status") == "retry_wait":
+            _SESSION["retry_due"][plan["row_no"]] = (
+                now_mono + max(0, RETRY_DELAY_MS) / 1000.0
+            )
 
     required = sum(item["estimated_amount"] for item in _SESSION["plans"])
     if ENABLE_LIVE_ORDERS:
@@ -454,8 +713,15 @@ def _reserve_batch():
             "amount": item["amount"],
             "limit_up_price": item["limit_up_price"],
             "quantity": item["quantity"],
-            "status": "reserved",
-            "attempts": 0,
+            "status": item["status"],
+            "attempts": item["attempts"],
+            "last_token": item["last_token"],
+            "order_id": item["order_id"],
+            "order_status": item.get("order_status"),
+            "traded_volume": item.get("traded_volume", 0),
+            "fill_uncertain": item.get("fill_uncertain", False),
+            "attempt_history": [dict(attempt)
+                                for attempt in item.get("attempt_history", [])],
         }
     _STATE.setdefault("trade_days", {})[day] = batch
     try:
@@ -482,11 +748,16 @@ def _update_reserved_order(plan):
         saved["attempts"] = plan["attempts"]
         saved["last_token"] = plan["last_token"]
         saved["order_id"] = plan["order_id"]
+        saved["order_status"] = plan.get("order_status")
+        saved["traded_volume"] = plan.get("traded_volume", 0)
+        saved["fill_uncertain"] = plan.get("fill_uncertain", False)
+        saved["attempt_history"] = [dict(attempt)
+                                    for attempt in plan.get("attempt_history", [])]
 
 
 def _persist_outcomes(batch_status):
     if not _SESSION.get("reserved"):
-        return
+        return True
     batch = _STATE.get("trade_days", {}).get(_SESSION["trade_day"], {})
     batch["status"] = batch_status
     batch["updated_at"] = datetime.datetime.now().isoformat()
@@ -494,8 +765,10 @@ def _persist_outcomes(batch_status):
         _update_reserved_order(plan)
     try:
         _state_save()
+        return True
     except Exception as exc:
         _log("STATE_UPDATE_FAILED reason=%r; original reservation remains" % (exc,))
+        return False
 
 
 def _is_preopen_rejection(message):
@@ -512,13 +785,36 @@ def _submit_plan(C, plan):
     token = "%s_%s_%s_%s" % (
         _SESSION["trade_day"], plan["row_no"], plan["attempts"], uuid.uuid4().hex[:8]
     )
+    attempt = {
+        "attempt": plan["attempts"],
+        "token": token,
+        "order_id": "",
+        "status": "sending",
+        "order_status": None,
+        "traded_volume": 0,
+        "fill_uncertain": False,
+    }
+    plan.setdefault("attempt_history", []).append(attempt)
     plan["last_token"] = token
+    plan["order_id"] = ""
+    plan["order_status"] = None
+    plan["traded_volume"] = 0
+    plan["fill_uncertain"] = False
     plan["status"] = "sending"
     _update_reserved_order(plan)
     _SESSION["token_to_plan"][token] = plan
+    _SESSION["token_to_attempt"][token] = attempt
+    if not _persist_outcomes("dispatching"):
+        plan["status"] = "unknown"
+        attempt["status"] = "unknown"
+        _SESSION["phase"] = "PARTIAL_STOP"
+        _log("SEND_UNKNOWN reason=attempt_state_not_persisted row=%s; passorder skipped" %
+             plan["row_no"])
+        return False
     sender = globals().get("passorder")
     if not callable(sender):
         plan["status"] = "unknown"
+        attempt["status"] = "unknown"
         _SESSION["phase"] = "PARTIAL_STOP"
         _persist_outcomes("partial_unknown")
         _log("SEND_UNKNOWN reason=passorder_unavailable row=%s; remaining rows halted" %
@@ -532,6 +828,7 @@ def _submit_plan(C, plan):
         )
     except Exception as exc:
         plan["status"] = "unknown"
+        attempt["status"] = "unknown"
         _SESSION["phase"] = "PARTIAL_STOP"
         _persist_outcomes("partial_unknown")
         _log("SEND_UNKNOWN row=%s token=%s error=%r; remaining rows halted" % (
@@ -541,6 +838,7 @@ def _submit_plan(C, plan):
 
     if result is False or (isinstance(result, (int, float)) and result < 0) or str(result) == "-1":
         plan["status"] = "unknown"
+        attempt["status"] = "unknown"
         _SESSION["phase"] = "PARTIAL_STOP"
         _persist_outcomes("partial_unknown")
         _log("SEND_UNKNOWN row=%s token=%s return=%r; remaining rows halted" % (
@@ -550,7 +848,9 @@ def _submit_plan(C, plan):
 
     if result == 0:
         plan["status"] = "accepted_no_id"
+        attempt["status"] = "accepted_no_id"
         _update_reserved_order(plan)
+        _persist_outcomes("monitoring")
         _log("ORDER_ACCEPTED_NO_ID row=%s code=%s price=%.3f qty=%s attempt=%s token=%s; "
              "waiting for broker callback" % (
                  plan["row_no"], plan["stock_code"], plan["limit_up_price"],
@@ -559,10 +859,14 @@ def _submit_plan(C, plan):
         return True
 
     plan["status"] = "sent"
+    attempt["status"] = "sent"
     if isinstance(result, (str, int)) and str(result) not in ("", "0", "-1"):
         plan["order_id"] = str(result)
+        attempt["order_id"] = str(result)
         _SESSION["order_id_to_plan"][str(result)] = plan
+        _SESSION["order_id_to_attempt"][str(result)] = attempt
     _update_reserved_order(plan)
+    _persist_outcomes("monitoring")
     _log("ORDER_SENT row=%s code=%s price=%.3f qty=%s attempt=%s token=%s return=%r" % (
         plan["row_no"], plan["stock_code"], plan["limit_up_price"],
         plan["quantity"], plan["attempts"], token, result
@@ -576,6 +880,18 @@ def _dispatch_step(C, now):
         if _SESSION["retry_due"][row_no] <= time.monotonic():
             del _SESSION["retry_due"][row_no]
             plan = _SESSION["plan_by_row"][row_no]
+            if plan.get("fill_uncertain") or plan.get("traded_volume", 0) > 0:
+                plan["status"] = (
+                    "partial_filled" if plan.get("traded_volume", 0) > 0
+                    else "fill_unverified"
+                )
+                _update_reserved_order(plan)
+                _persist_outcomes("monitoring")
+                _log("RETRY_CANCELED_AFTER_FILL row=%s traded=%s fill_uncertain=%s" % (
+                    row_no, plan.get("traded_volume", 0),
+                    plan.get("fill_uncertain", False)
+                ))
+                continue
             if not _submit_plan(C, plan):
                 return
             return
@@ -585,6 +901,9 @@ def _dispatch_step(C, now):
            and sent_this_turn < SUBMIT_ROWS_PER_TURN):
         plan = _SESSION["plans"][_SESSION["dispatch_cursor"]]
         _SESSION["dispatch_cursor"] += 1
+        if plan.get("status") == "retry_wait":
+            sent_this_turn += 1
+            continue
         if ENABLE_LIVE_ORDERS:
             if not _submit_plan(C, plan):
                 return
@@ -692,11 +1011,15 @@ def init(C):
         "available_cash": 0.0,
         "retry_due": {},
         "token_to_plan": {},
+        "token_to_attempt": {},
         "order_id_to_plan": {},
+        "order_id_to_attempt": {},
         "handled_callbacks": set(),
+        "handled_deals": set(),
         "unmatched_callback_count": 0,
         "unmatched_callback_last_log": 0.0,
         "reserved": False,
+        "resume_attempts_by_row": {},
         "task_id": None,
     }
     script_file = globals().get("__file__", "<absent>")
@@ -761,16 +1084,17 @@ def handlebar(C):
 def _callback_identity(info):
     token = str(_field(
         info, "m_strRemark", "m_strOrderRemark", "m_strUserOrderID",
-        "m_strUserOrderId", "userOrderId", "user_order_id", "remark", "Remark"
+        "m_strUserOrderId", "userOrderId", "user_order_id", "remark", "Remark",
+        "order_remark"
     ) or "")
     order_id = str(_field(
         info, "m_strOrderSysID", "m_strOrderID", "m_nOrderID",
-        "orderID", "order_id", "orderId"
+        "order_sysid", "orderID", "order_id", "orderId"
     ) or "")
     return token, order_id
 
 
-def _find_callback_plan(info):
+def _find_callback_plan(info, is_deal=False):
     token, order_id = _callback_identity(info)
     plan = _SESSION.get("token_to_plan", {}).get(token)
     if plan is None and order_id:
@@ -782,12 +1106,13 @@ def _find_callback_plan(info):
         info, "m_strInstrumentID", "m_strOrderCode", "orderCode",
         "stock_code", "code"
     ))
-    quantity = _float_value(_field(
-        info, "m_nVolumeTotalOriginal", "m_nVolume", "volume",
-        "quantity", "order_volume"
+    quantity = 0.0 if is_deal else _float_value(_field(
+        info, "m_nVolumeTotalOriginal", "m_nVolumeTotal", "m_nVolume",
+        "volume", "quantity", "order_volume"
     ))
     price = _float_value(_field(
-        info, "m_dPrice", "price", "order_price", "m_dOrderPrice"
+        info, "m_dPrice", "price", "order_price", "m_dOrderPrice",
+        "traded_price"
     ))
     candidates = []
     for candidate in _SESSION.get("plans", []):
@@ -801,6 +1126,16 @@ def _find_callback_plan(info):
     if len(candidates) == 1:
         return candidates[0], token, order_id, True
     return None, token, order_id, False
+
+
+def _attempt_for_callback(plan, token, order_id):
+    attempt = _SESSION.get("token_to_attempt", {}).get(token)
+    if attempt is None and order_id:
+        attempt = _SESSION.get("order_id_to_attempt", {}).get(order_id)
+    if attempt is not None:
+        return attempt
+    history = plan.get("attempt_history", [])
+    return history[-1] if history else None
 
 
 def order_callback(ContextInfo, orderInfo):
@@ -818,6 +1153,12 @@ def order_callback(ContextInfo, orderInfo):
                 _SESSION["unmatched_callback_count"], order_id, token
             ))
         return
+    if (fallback and not token and not order_id
+            and len(plan.get("attempt_history", [])) > 1):
+        _log("ORDER_CALLBACK_AMBIGUOUS row=%s status=%s attempts=%s; ignored" % (
+            plan["row_no"], _order_status_value(orderInfo), plan["attempts"]
+        ))
+        return
     if fallback:
         _log("ORDER_CALLBACK_ASSOCIATED_BY_FIELDS id=%s code=%s" % (
             order_id, plan["stock_code"]
@@ -826,39 +1167,94 @@ def order_callback(ContextInfo, orderInfo):
         orderInfo, "m_strStatusMsg", "m_strErrorMsg", "m_strOrderStatusMsg",
         "status_msg", "error_msg", "statusMessage", "message"
     )
+    status = _order_status_value(orderInfo)
+    traded = _traded_volume(orderInfo)
     if order_id:
         plan["order_id"] = order_id
         _SESSION["order_id_to_plan"][order_id] = plan
-    callback_key = token or order_id
-    if callback_key and callback_key in _SESSION["handled_callbacks"]:
+    attempt = _attempt_for_callback(plan, token, order_id)
+    if attempt is None:
+        attempt = {"attempt": plan.get("attempts", 0), "status": "unknown"}
+        plan.setdefault("attempt_history", []).append(attempt)
+    if order_id:
+        attempt["order_id"] = order_id
+        _SESSION["order_id_to_attempt"][order_id] = attempt
+    if token:
+        attempt["token"] = token
+        _SESSION["token_to_attempt"][token] = attempt
+    previous_status = _int_value(attempt.get("order_status"))
+    previous_traded = _int_value(attempt.get("traded_volume")) or 0
+    was_terminal = _is_terminal_order_status(previous_status)
+    if was_terminal and traded <= previous_traded:
         return
-    if _is_preopen_rejection(message):
-        if callback_key:
-            _SESSION["handled_callbacks"].add(callback_key)
-        if plan["attempts"] <= MAX_PREOPEN_RETRIES:
+    if status is not None and (not was_terminal or status == previous_status):
+        attempt["order_status"] = status
+        plan["order_status"] = status
+    elif was_terminal:
+        status = previous_status
+    attempt["traded_volume"] = max(
+        _int_value(attempt.get("traded_volume")) or 0, traded
+    )
+    plan["traded_volume"] = max(
+        _int_value(plan.get("traded_volume")) or 0, traded
+    )
+    retryable_rejection = (
+        status == ORDER_STATUS_JUNK
+        or (status is None and _is_preopen_rejection(message))
+    )
+    if retryable_rejection:
+        attempt["status"] = "rejected"
+        reject_key = _reject_callback_key(plan["row_no"], attempt)
+        if plan["traded_volume"] > 0 or plan.get("fill_uncertain"):
+            _SESSION["handled_callbacks"].add(reject_key)
+            _SESSION["retry_due"].pop(plan["row_no"], None)
+            plan["status"] = "rejected_after_fill"
+            _log("ORDER_JUNK_NO_RETRY row=%s attempt=%s traded=%s fill_uncertain=%s" % (
+                plan["row_no"], plan["attempts"], plan["traded_volume"],
+                plan.get("fill_uncertain", False)
+            ))
+        elif reject_key in _SESSION["handled_callbacks"]:
+            return
+        elif plan["attempts"] <= MAX_REJECT_RETRIES:
+            _SESSION["handled_callbacks"].add(reject_key)
             plan["status"] = "retry_wait"
             _SESSION["retry_due"][plan["row_no"]] = (
                 time.monotonic() + max(0, RETRY_DELAY_MS) / 1000.0
             )
-            _log("PREOPEN_REJECT row=%s attempt=%s retry_at_delay_ms=%s message=%s" % (
-                plan["row_no"], plan["attempts"], RETRY_DELAY_MS, message
+            _log("ORDER_JUNK_RETRY_SCHEDULED row=%s attempt=%s retry=%s/%s "
+                 "delay_ms=%s id=%s message=%s" % (
+                plan["row_no"], plan["attempts"], plan["attempts"],
+                MAX_REJECT_RETRIES, RETRY_DELAY_MS, order_id, message
             ))
         else:
-            plan["status"] = "rejected_preopen_max_retries"
-            _log("PREOPEN_REJECT_FINAL row=%s attempts=%s message=%s" % (
-                plan["row_no"], plan["attempts"], message
+            _SESSION["handled_callbacks"].add(reject_key)
+            plan["status"] = "rejected_max_retries"
+            _log("ORDER_JUNK_FINAL row=%s attempts=%s max_retries=%s id=%s message=%s" % (
+                plan["row_no"], plan["attempts"], MAX_REJECT_RETRIES,
+                order_id, message
             ))
     else:
-        plan["status"] = "callback_received"
-        _log("ORDER_CALLBACK row=%s id=%s status=%s message=%s; no automatic retry" % (
-            plan["row_no"], order_id,
-            _field(orderInfo, "m_nOrderStatus", "status", "order_status"), message
+        if status == ORDER_STATUS_SUCCEEDED or plan["traded_volume"] >= plan["quantity"]:
+            plan["status"] = "filled"
+            attempt["status"] = "filled"
+        elif plan["traded_volume"] > 0 or status == ORDER_STATUS_PART_SUCCEEDED:
+            plan["status"] = "partial_filled"
+            attempt["status"] = "partial_filled"
+        else:
+            plan["status"] = "callback_received"
+            if status is not None:
+                attempt["status"] = (
+                    "terminal" if _is_terminal_order_status(status) else "active"
+                )
+        _log("ORDER_CALLBACK row=%s id=%s status=%s traded=%s message=%s" % (
+            plan["row_no"], order_id, status, plan["traded_volume"], message
         ))
     _update_reserved_order(plan)
+    _persist_outcomes("monitoring")
 
 
 def deal_callback(ContextInfo, dealInfo):
-    plan, token, order_id, fallback = _find_callback_plan(dealInfo)
+    plan, token, order_id, fallback = _find_callback_plan(dealInfo, is_deal=True)
     if plan is None:
         _log("DEAL_CALLBACK_UNMATCHED id=%s token=%s" % (order_id, token))
         return
@@ -866,13 +1262,56 @@ def deal_callback(ContextInfo, dealInfo):
         _log("DEAL_CALLBACK_ASSOCIATED_BY_FIELDS id=%s code=%s" % (
             order_id, plan["stock_code"]
         ))
-    plan["status"] = "filled"
+    deal_id = str(_field(
+        dealInfo, "m_strTradeID", "m_strDealID", "tradeID", "dealID",
+        "tradedID", "traded_id"
+    ) or "").strip()
+    attempt = _attempt_for_callback(plan, token, order_id)
+    if not deal_id:
+        plan["fill_uncertain"] = True
+        plan["status"] = "fill_unverified"
+        _SESSION["retry_due"].pop(plan["row_no"], None)
+        if attempt is not None:
+            attempt["fill_uncertain"] = True
+        _update_reserved_order(plan)
+        _persist_outcomes("monitoring")
+        _log("DEAL_CALLBACK_UNVERIFIED row=%s id=%s; retries blocked" % (
+            plan["row_no"], order_id
+        ))
+        return
+    if deal_id in _SESSION["handled_deals"]:
+        return
+    _SESSION["handled_deals"].add(deal_id)
+    deal_volume = max(0, _int_value(_field(
+        dealInfo, "m_nVolume", "m_nTradeVolume", "deal_volume",
+        "traded_volume", "tradedVolume", "volume"
+    )) or 0)
+    if deal_volume <= 0:
+        plan["fill_uncertain"] = True
+        plan["status"] = "fill_unverified"
+    else:
+        plan["traded_volume"] = (
+            _int_value(plan.get("traded_volume")) or 0
+        ) + deal_volume
+        plan["status"] = (
+            "filled" if plan["traded_volume"] >= plan["quantity"]
+            else "partial_filled"
+        )
+    if plan.get("fill_uncertain") or deal_volume > 0:
+        _SESSION["retry_due"].pop(plan["row_no"], None)
+    if attempt is not None and deal_volume > 0:
+        attempt["traded_volume"] = (
+            _int_value(attempt.get("traded_volume")) or 0
+        ) + deal_volume
     if order_id:
         plan["order_id"] = order_id
+        _SESSION["order_id_to_plan"][order_id] = plan
+        if attempt is not None:
+            _SESSION["order_id_to_attempt"][order_id] = attempt
     _update_reserved_order(plan)
+    _persist_outcomes("monitoring")
     _log("DEAL_CALLBACK row=%s id=%s qty=%s" % (
-        plan["row_no"], order_id,
-        _field(dealInfo, "m_nVolume", "volume", "deal_volume")
+        plan["row_no"], order_id, deal_volume
     ))
 
 
