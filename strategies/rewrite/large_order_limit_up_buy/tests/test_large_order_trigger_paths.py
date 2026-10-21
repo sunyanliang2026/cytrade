@@ -67,20 +67,25 @@ class LargeOrderTriggerPathTests(unittest.TestCase):
             data["amount"] = amount
         QMT._handle_l2order(self.inst["code"], data)
 
-    def test_large_order_requires_strict_share_and_amount_thresholds(self):
-        self.inst["limit_up"] = 10.0
-        self._order("exact_shares", price=10.0, volume=900000)
+    def test_large_order_triggers_when_share_or_amount_threshold_is_exceeded(self):
         self.inst["limit_up"] = 5.0
-        self._order("exact_amount", price=5.0, volume=1000000)
+        self._order("share_only", price=5.0, volume=900001)
+        self.assertEqual(len(self.calls), 1)
+
+        self.calls[:] = []
+        self.inst = self._instance()
+        self.inst["limit_up"] = 10.0
+        self._order("amount_only", price=10.0, volume=500000, amount=5000001.0)
+        self.assertEqual(len(self.calls), 1)
+
+        self.calls[:] = []
+        self.inst = self._instance()
+        self.inst["limit_up"] = 5.0
+        self._order("exact_thresholds", price=5.0, volume=900000, amount=5000000.0)
         self.assertEqual(self.calls, [])
 
-        self.inst["limit_up"] = 5.01
-        self._order("qualifying", price=5.01, volume=1000000)
-
-        self.assertEqual(len(self.calls), 1)
-        self.assertEqual(self.inst["submit_reason"], "首封大单")
-        self.assertEqual(self.inst["validation_order_id"], "501")
-        self.assertTrue(any("数量=1000000股(10000.00手)" in line for line in self.logs))
+        self.assertIsNone(self.inst["submit_reason"])
+        self.assertIsNone(self.inst["validation_order_id"])
 
     def test_l2quote_amount_keeps_lots_to_shares_conversion(self):
         self.assertEqual(QMT._amount(10.0, 10000), 10000000.0)

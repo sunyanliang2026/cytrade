@@ -35,6 +35,8 @@ RESEAL_VERIFY_LARGE_COUNT = 2
 RESEAL_VALIDATION_WINDOW_SECONDS = 1.0
 RESEAL_VALIDATION_CONTINUE_ON_FAILURE = False
 RESEAL_LATE_WINDOW_SECONDS = 5.0
+RESEAL_PRE_SUBMIT_ORDER_MAX_COUNT = 200
+RESEAL_PRE_SUBMIT_ORDER_MAX_AGE_SECONDS = 2.0
 ORDER_LOOKUP_RETRY_INTERVAL_SECONDS = 0.1
 ORDER_LOOKUP_MAX_ATTEMPTS = 10
 
@@ -219,6 +221,10 @@ def _event_has_milliseconds(value=None):
     return 9 <= len(digits) <= 12
 
 
+def _format_local_timestamp(timestamp):
+    return _dt.datetime.fromtimestamp(timestamp).strftime("%Y%m%d%H%M%S.%f")[:-3]
+
+
 def _latency_ms(event_value, received_at):
     if not _event_has_milliseconds(event_value):
         return None
@@ -267,6 +273,7 @@ def _json_default(value):
 def _write_raw(code, period, payload):
     global _RAW_DROPPED
     received_at = time.time()
+    received_time = _format_local_timestamp(received_at)
     event_value = _field(payload, "stime", "time")
     latency_value = _field(payload, "time", "stime")
     event_time = _event_time(event_value)
@@ -298,17 +305,19 @@ def _write_raw(code, period, payload):
             now = _now()
             if now - _LATENCY_LAST_WARN.get(period, 0.0) >= DEBUG_LATENCY_WARN_INTERVAL_SECONDS:
                 _LATENCY_LAST_WARN[period] = now
-                _log("[延时警告] period=%s code=%s delay=%.0fms event_time=%s received_at=%.3f" %
-                     (period, code, latency_ms, event_time or "", received_at))
+                _log("[延时警告] period=%s code=%s delay=%.0fms event_time=%s received_time=%s" %
+                     (period, code, latency_ms, event_time or "", received_time))
     if period not in _FIRST_CALLBACKS:
         _FIRST_CALLBACKS[period] = {
             "code": code, "event_time": event_time, "received_at": received_at,
+            "received_time": received_time,
             "latency_ms": latency_ms,
         }
-        _log("[回调首条] period=%s code=%s event_time=%s received_at=%.3f" %
-             (period, code, event_time or "", received_at))
+        _log("[回调首条] period=%s code=%s event_time=%s received_time=%s" %
+             (period, code, event_time or "", received_time))
     record = {
-        "received_at": received_at, "event_time": event_time,
+        "received_at": received_at, "received_time": received_time,
+        "event_time": event_time,
         "event_time_raw": str(event_value) if event_value is not None else "",
         "latency_time_raw": str(latency_value) if latency_value is not None else "",
         "latency_ms": latency_ms,
@@ -335,11 +344,13 @@ def _observe_first_limit_up(code, period, event_time, event_raw, received_at, li
         return
     observed[period] = {
         "received_at": received_at,
+        "received_time": _format_local_timestamp(received_at),
         "event_time": event_time,
         "event_raw": str(event_raw) if event_raw is not None else "",
     }
-    _log("[LIMIT_UP_FIRST] code=%s period=%s bid1=%.3f limit_up=%.3f event_time=%s event_raw=%s received_at=%.3f" %
-         (code, period, bid, limit_up, event_time, observed[period]["event_raw"], received_at))
+    _log("[LIMIT_UP_FIRST] code=%s period=%s bid1=%.3f limit_up=%.3f event_time=%s event_raw=%s received_time=%s" %
+         (code, period, bid, limit_up, event_time, observed[period]["event_raw"],
+          observed[period]["received_time"]))
     if "tick" not in observed or "l2quote" not in observed or observed.get("compared"):
         return
     tick_at = observed["tick"]["received_at"]
@@ -349,9 +360,10 @@ def _observe_first_limit_up(code, period, event_time, event_raw, received_at, li
     observed["compared"] = True
     observed["winner"] = winner
     observed["gap_ms"] = abs(delta_ms)
-    _log("[LIMIT_UP_COMPARE] code=%s winner=%s gap_ms=%.3f tick_event=%s l2quote_event=%s tick_received_at=%.3f l2quote_received_at=%.3f" %
+    _log("[LIMIT_UP_COMPARE] code=%s winner=%s gap_ms=%.3f tick_event=%s l2quote_event=%s tick_received_time=%s l2quote_received_time=%s" %
          (code, winner, abs(delta_ms), observed["tick"]["event_raw"],
-          observed["l2quote"]["event_raw"], tick_at, l2quote_at))
+          observed["l2quote"]["event_raw"], observed["tick"]["received_time"],
+          observed["l2quote"]["received_time"]))
 
 
 def _flush_raw(max_records=1000):
@@ -470,8 +482,10 @@ def _new_instance(code, amount):
         "last_event_time": "", "last_tick": {}, "auction_checked": False,
         "initial_sealed": False, "seal_started": None, "seal_peak": 0.0,
         "break_started": None, "reseal_ready": False, "first_large_total": 0.0,
-        "first_large_ids": set(), "seen_order_ids": set(), "verify_count": 0,
+        "first_large_ids": set(), "seen_order_ids": set(), "l2order_history": [],
+        "verify_count": 0,
         "verify_large_count": 0, "verify_large_ids": set(), "validation_started": None,
+        "validation_pre_count": 0, "validation_pre_large_count": 0,
         "validation_active": False, "validation_deadline": None,
         "validation_event_cutoff_seconds": None, "validation_stale_count": 0,
         "validation_timer": None, "validation_order_id": None, "cancel_started": None,
@@ -556,7 +570,7 @@ def _order_amount(price, volume, reported_amount=None):
 def _is_large_order_trigger(volume, amount):
     volume = _safe_float(volume) or 0.0
     amount = _safe_float(amount) or 0.0
-    return volume > LARGE_ORDER_MIN_VOLUME_SHARES and amount > LARGE_ORDER_MIN_AMOUNT
+    return volume > LARGE_ORDER_MIN_VOLUME_SHARES or amount > LARGE_ORDER_MIN_AMOUNT
 
 
 def _limit_price(inst, quote=None):
@@ -674,20 +688,67 @@ def _schedule_validation(inst):
         _log("[验证] %s 定时器创建失败 %r，将由handlebar兜底" % (inst["code"], exc))
 
 
-def _start_validation(inst):
+def _remember_l2order(inst, event_key, order_id, event_raw, event_time,
+                      price, direction, volume, amount, received_at, received_mono):
+    # The caller has already restricted this record to an exact limit-up buy order.
+    history = inst.setdefault("l2order_history", [])
+    history.append({
+        "event_key": event_key,
+        "large_key": order_id or event_key,
+        "order_id": order_id,
+        "event_raw": str(event_raw) if event_raw is not None else "",
+        "event_time": event_time or "",
+        "event_seconds": _event_seconds(event_raw),
+        "received_at": received_at,
+        "received_mono": received_mono,
+        "price": price,
+        "direction": direction,
+        "volume": volume,
+        "amount": amount,
+    })
+    if len(history) > RESEAL_PRE_SUBMIT_ORDER_MAX_COUNT:
+        del history[:-RESEAL_PRE_SUBMIT_ORDER_MAX_COUNT]
+
+
+def _pre_submit_validation_records(inst, cutoff_seconds, now, trigger_order_key=None):
+    records = []
+    for record in inst.get("l2order_history", []):
+        if trigger_order_key and record.get("event_key") == trigger_order_key:
+            continue
+        received_mono = record.get("received_mono")
+        if received_mono is None:
+            continue
+        age = now - received_mono
+        if age < 0.0 or age > RESEAL_PRE_SUBMIT_ORDER_MAX_AGE_SECONDS:
+            continue
+        event_seconds = record.get("event_seconds")
+        if event_seconds is None or event_seconds > cutoff_seconds:
+            continue
+        records.append(record)
+    return records
+
+
+def _start_validation(inst, trigger_order_key=None):
     if (inst.get("submit_reason") not in VALIDATED_SUBMIT_REASONS or
             inst["state"] in (STATE_DONE, STATE_SKIPPED)):
         return
     now = _now()
+    cutoff_seconds = _wall_seconds_since_midnight()
+    pre_records = _pre_submit_validation_records(
+        inst, cutoff_seconds, now, trigger_order_key)
+    pre_large_ids = set(record.get("large_key") for record in pre_records
+                         if record.get("amount", 0.0) >= RESEAL_VERIFY_LARGE_AMOUNT)
     inst["validation_started"] = now
     inst["validation_deadline"] = now + RESEAL_VALIDATION_WINDOW_SECONDS
-    inst["validation_event_cutoff_seconds"] = _wall_seconds_since_midnight()
+    inst["validation_event_cutoff_seconds"] = cutoff_seconds
     inst["validation_stale_count"] = 0
     inst["validation_active"] = True
     inst["validation_order_id"] = inst.get("our_order_id")
-    inst["verify_count"] = 0
-    inst["verify_large_count"] = 0
-    inst["verify_large_ids"].clear()
+    inst["validation_pre_count"] = len(pre_records)
+    inst["validation_pre_large_count"] = len(pre_large_ids)
+    inst["verify_count"] = len(pre_records)
+    inst["verify_large_count"] = len(pre_large_ids)
+    inst["verify_large_ids"] = pre_large_ids
     inst["cancel_started"] = None
     inst["cancel_confirmed"] = False
     inst["cancel_failed"] = False
@@ -698,15 +759,29 @@ def _start_validation(inst):
     inst["follow_sent"] = False
     inst["validation_passed"] = False
     _log("[FOLLOW_VERIFY_START] code=%s token=%s order_id=%s window=%.0fms "
-         "max_events=%d required_large=%d min_amount=%.0f signal_period=%s "
+         "max_events=%d required_large=%d min_amount=%.0f pre_events=%d "
+         "pre_large=%d history_max=%d history_age=%.1fs signal_period=%s "
          "signal_age_ms=%s" % (
              inst["code"], inst.get("submit_token"),
              inst.get("validation_order_id") or "pending",
              RESEAL_VALIDATION_WINDOW_SECONDS * 1000.0,
              RESEAL_VERIFY_ORDER_COUNT, RESEAL_VERIFY_LARGE_COUNT,
-             RESEAL_VERIFY_LARGE_AMOUNT, inst.get("last_signal_period") or "unknown",
+             RESEAL_VERIFY_LARGE_AMOUNT, inst["validation_pre_count"],
+             inst["validation_pre_large_count"],
+             RESEAL_PRE_SUBMIT_ORDER_MAX_COUNT,
+             RESEAL_PRE_SUBMIT_ORDER_MAX_AGE_SECONDS,
+             inst.get("last_signal_period") or "unknown",
              "%.0f" % inst["last_latency_ms"] if inst.get("last_latency_ms") is not None else "n/a"))
-    _schedule_validation(inst)
+    if inst["validation_pre_large_count"] >= RESEAL_VERIFY_LARGE_COUNT:
+        inst["validation_active"] = False
+        inst["validation_passed"] = True
+        _log("[FOLLOW_VERIFY_PREPASS] code=%s events=%d/%d large=%d/%d "
+             "reason=pre_submit_history; order remains active" % (
+                 inst["code"], inst["validation_pre_count"],
+                 RESEAL_VERIFY_ORDER_COUNT, inst["validation_pre_large_count"],
+                 RESEAL_VERIFY_LARGE_COUNT))
+    else:
+        _schedule_validation(inst)
 
 
 def _stop_validation(inst, reason):
@@ -861,7 +936,7 @@ def _query_order_records(inst):
     return list(data) if isinstance(data, (list, tuple)) else [data]
 
 
-def _submit(inst, reason):
+def _submit(inst, reason, trigger_order_key=None):
     is_follow = reason == "撤单后跟随"
     if inst["state"] in (STATE_DONE, STATE_SKIPPED) or inst.get("submission_pending") or (inst.get("our_order_id") and not is_follow):
         return False
@@ -898,7 +973,7 @@ def _submit(inst, reason):
             max(0.0, (time.time() - signal_received_at) * 1000.0)
             if signal_received_at is not None else None)
         if reason in VALIDATED_SUBMIT_REASONS:
-            _start_validation(inst)
+            _start_validation(inst, trigger_order_key)
         passorder_started = _now()
         try:
             order_result = passorder(23, ORDER_TYPE_BUY, ACCOUNT_ID, inst["code"], PRICE_TYPE_LIMIT,
@@ -1143,6 +1218,9 @@ def _handle_l2order(code, payload):
             return
         inst["seen_order_ids"].add(event_key)
         amount = _order_amount(price, volume, _field(data, "amount"))
+        _remember_l2order(
+            inst, event_key, order_id, event_raw, event_time, price, direction,
+            volume, amount, received_at, _now())
 
         # Start validating from the accepted submit, excluding delayed market events.
         if inst.get("validation_started") is not None and inst.get("submit_reason") in VALIDATED_SUBMIT_REASONS:
@@ -1202,7 +1280,7 @@ def _handle_l2order(code, payload):
         ):
             trigger_reason = "回封大单"
         if trigger_reason:
-            if _submit(inst, trigger_reason):
+            if _submit(inst, trigger_reason, event_key):
                 _log("[大单触发] %s 路径=%s 委托=%s 数量=%d股(%.2f手) 金额=%.2f" % (
                     inst["code"], trigger_reason, order_id or "无编号", int(volume),
                     volume / 100.0, amount))

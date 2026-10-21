@@ -26,6 +26,7 @@ class QMTOrderCallbackTests(unittest.TestCase):
         self.original_account = QMT.ACCOUNT_ID
         self.original_live_orders = QMT.ENABLE_LIVE_ORDERS
         self.original_continue_on_failure = QMT.RESEAL_VALIDATION_CONTINUE_ON_FAILURE
+        self.original_wall_seconds = QMT._wall_seconds_since_midnight
         self.had_order_query = hasattr(QMT, "get_trade_detail_data")
         self.old_order_query = getattr(QMT, "get_trade_detail_data", None)
         self.had_cancel = hasattr(QMT, "cancel")
@@ -37,6 +38,7 @@ class QMTOrderCallbackTests(unittest.TestCase):
         QMT._log = self.logs.append
         QMT.ACCOUNT_ID = "TEST_ACCOUNT"
         QMT.ENABLE_LIVE_ORDERS = True
+        QMT._wall_seconds_since_midnight = lambda: 36001.5
         QMT._C = self.context
         QMT._INSTANCES.clear()
         QMT._COUNTERS.update({"orders": 0, "deals": 0, "cancels": 0})
@@ -51,6 +53,7 @@ class QMTOrderCallbackTests(unittest.TestCase):
         QMT.ACCOUNT_ID = self.original_account
         QMT.ENABLE_LIVE_ORDERS = self.original_live_orders
         QMT.RESEAL_VALIDATION_CONTINUE_ON_FAILURE = self.original_continue_on_failure
+        QMT._wall_seconds_since_midnight = self.original_wall_seconds
         if self.had_order_query:
             QMT.get_trade_detail_data = self.old_order_query
         elif hasattr(QMT, "get_trade_detail_data"):
@@ -289,6 +292,55 @@ class QMTOrderCallbackTests(unittest.TestCase):
         self.assertEqual(self.inst["verify_large_count"], 2)
         self.assertTrue(self.inst["validation_passed"])
         self.assertFalse(self.inst["validation_active"])
+
+    def test_pre_submit_history_passes_without_waiting_or_cancel(self):
+        QMT.passorder = lambda *args: 0
+
+        self._send_order("pre-large-1", event_time="100000", volume=150000)
+        self._send_order("pre-large-2", event_time="100001", volume=150000)
+        self._send_order("trigger", event_time="100002", volume=900001)
+
+        self.assertEqual(self.inst["validation_pre_count"], 2)
+        self.assertEqual(self.inst["validation_pre_large_count"], 2)
+        self.assertEqual(self.inst["verify_count"], 2)
+        self.assertEqual(self.inst["verify_large_count"], 2)
+        self.assertTrue(self.inst["validation_passed"])
+        self.assertFalse(self.inst["validation_active"])
+        self.assertTrue(any("FOLLOW_VERIFY_PREPASS" in line for line in self.logs))
+
+    def test_pre_submit_history_can_supply_one_large_order(self):
+        QMT.passorder = lambda *args: 0
+
+        self._send_order("pre-large", event_time="100000", volume=150000)
+        self._send_order("trigger", event_time="100001", volume=900001)
+
+        self.assertEqual(self.inst["validation_pre_large_count"], 1)
+        self.assertTrue(self.inst["validation_active"])
+        self._send_order("post-large", event_time="100002", volume=150000)
+
+        self.assertEqual(self.inst["verify_count"], 2)
+        self.assertEqual(self.inst["verify_large_count"], 2)
+        self.assertTrue(self.inst["validation_passed"])
+        self.assertFalse(self.inst["validation_active"])
+
+    def test_pre_submit_history_is_bounded_and_old_records_are_ignored(self):
+        now = QMT._now()
+        for index in range(QMT.RESEAL_PRE_SUBMIT_ORDER_MAX_COUNT + 20):
+            QMT._remember_l2order(
+                self.inst, "history-%d" % index, "history-%d" % index,
+                "100000", "100000", 10.0, "B", 150000, 1500000.0,
+                0.0, now)
+        self.assertEqual(
+            len(self.inst["l2order_history"]),
+            QMT.RESEAL_PRE_SUBMIT_ORDER_MAX_COUNT,
+        )
+
+        self.inst["l2order_history"][-1]["received_mono"] = (
+            now - QMT.RESEAL_PRE_SUBMIT_ORDER_MAX_AGE_SECONDS - 0.1)
+        QMT.passorder = lambda *args: 0
+        self._send_order("trigger", event_time="100001", volume=900001)
+        self.assertEqual(self.inst["validation_pre_count"], 198)
+        self.assertEqual(self.inst["validation_pre_large_count"], 198)
 
     def test_event_limit_failure_requests_cancel(self):
         cancel_calls = []
