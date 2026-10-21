@@ -60,6 +60,26 @@ class FreshnessGateTests(unittest.TestCase):
         self.assertFalse(accepted_older)
         self.assertEqual(QMT._FRESHNESS_DROPS["l2quote"]["last_reason"], "out_of_order")
 
+    def test_freshness_gate_rejects_empty_zero_and_nonnumeric_event_times(self):
+        received_at = QMT._dt.datetime(2026, 10, 21, 9, 30, 3).timestamp()
+        invalid_values = (None, "", "   ", 0, "0", "not-a-time")
+
+        for event_time in invalid_values:
+            with self.subTest(event_time=event_time):
+                accepted, _, delay_ms = QMT._freshness_gate(
+                    "000001.SZ", "l2quote", {"time": event_time}, received_at)
+
+                self.assertFalse(accepted)
+                self.assertIsNone(delay_ms)
+                expected_reason = (
+                    "missing_event_time"
+                    if event_time is None or
+                    isinstance(event_time, str) and not event_time.strip()
+                    else "invalid_event_time"
+                )
+                self.assertEqual(
+                    QMT._FRESHNESS_DROPS["l2quote"]["last_reason"], expected_reason)
+
     def test_handler_keeps_unmeasured_hhmmss_compatibility(self):
         inst = QMT._new_instance("000001.SZ", 10000)
         inst.update({"state": QMT.STATE_READY, "limit_up": 10.0,

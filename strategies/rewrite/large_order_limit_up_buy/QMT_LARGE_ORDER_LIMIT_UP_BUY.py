@@ -311,13 +311,21 @@ def _record_freshness_drop(code, period, reason, event_raw, delay_ms):
 def _freshness_gate(code, period, payload, received_at):
     """Reject replayed or delayed events before copying or persisting payloads."""
     event_raw = _field(payload, "time", "stime", "timestamp")
-    if event_raw in (None, ""):
+    event_text = "" if event_raw is None else str(event_raw).strip()
+    if not event_text:
         _record_freshness_drop(code, period, "missing_event_time", event_raw, None)
+        return False, event_raw, None
+    digits = "".join(ch for ch in event_text if ch.isdigit())
+    if not digits or not any(ch != "0" for ch in digits):
+        _record_freshness_drop(code, period, "invalid_event_time", event_raw, None)
         return False, event_raw, None
     # A six-digit HHMMSS value is useful for session routing but cannot be
     # compared to the local wall clock without a date. Keep it processable and
     # leave latency accounting to the existing invalid-time rules.
     if not _event_has_absolute_milliseconds(event_raw):
+        if _event_seconds(event_raw) is None:
+            _record_freshness_drop(code, period, "invalid_event_time", event_raw, None)
+            return False, event_raw, None
         return True, event_raw, None
     event_epoch = _event_epoch_seconds(event_raw, received_at)
     if event_epoch is None:
