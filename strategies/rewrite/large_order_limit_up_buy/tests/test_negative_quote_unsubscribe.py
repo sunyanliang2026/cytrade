@@ -32,11 +32,15 @@ class NegativeQuoteExitTests(unittest.TestCase):
         self.old_log = QMT._log
         self.old_context = QMT._C
         self.old_cancel = getattr(QMT, "cancel", None)
+        self.old_freshness_gate = QMT._freshness_gate
         self.had_cancel = hasattr(QMT, "cancel")
         self.logs = []
         self.cancel_calls = []
         self.context = FakeContext()
         QMT._log = self.logs.append
+        # These tests cover quote decisions after the entry gate has accepted.
+        QMT._freshness_gate = lambda _code, _period, payload, _received_at: (
+            True, QMT._field(payload, "time", "stime", "timestamp"), None)
         QMT._C = self.context
         QMT.cancel = lambda *args: self.cancel_calls.append(args)
         QMT._INSTANCES.clear()
@@ -70,6 +74,7 @@ class NegativeQuoteExitTests(unittest.TestCase):
     def tearDown(self):
         QMT._log = self.old_log
         QMT._C = self.old_context
+        QMT._freshness_gate = self.old_freshness_gate
         QMT._INSTANCES.clear()
         QMT._SUBSCRIPTIONS[:] = []
         if self.had_cancel:

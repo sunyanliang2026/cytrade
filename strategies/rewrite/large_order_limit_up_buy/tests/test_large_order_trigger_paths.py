@@ -17,6 +17,7 @@ class LargeOrderTriggerPathTests(unittest.TestCase):
         self.old_log = QMT._log
         self.old_schedule_validation = QMT._schedule_validation
         self.old_schedule_lookup = QMT._schedule_order_lookup
+        self.old_freshness_gate = QMT._freshness_gate
         self.had_passorder = hasattr(QMT, "passorder")
         self.old_passorder = getattr(QMT, "passorder", None)
         self.logs = []
@@ -28,6 +29,9 @@ class LargeOrderTriggerPathTests(unittest.TestCase):
         QMT._log = self.logs.append
         QMT._schedule_validation = lambda _inst: None
         QMT._schedule_order_lookup = lambda _inst: None
+        # These tests exercise trigger logic downstream of timestamp validation.
+        QMT._freshness_gate = lambda _code, _period, payload, _received_at: (
+            True, QMT._field(payload, "time", "stime", "timestamp"), None)
         QMT.passorder = lambda *args: self.calls.append(args) or "501"
         QMT._INSTANCES.clear()
         QMT._RAW_BUFFER.clear()
@@ -41,6 +45,7 @@ class LargeOrderTriggerPathTests(unittest.TestCase):
         QMT._log = self.old_log
         QMT._schedule_validation = self.old_schedule_validation
         QMT._schedule_order_lookup = self.old_schedule_lookup
+        QMT._freshness_gate = self.old_freshness_gate
         QMT._INSTANCES.clear()
         QMT._RAW_BUFFER.clear()
         if self.had_passorder:

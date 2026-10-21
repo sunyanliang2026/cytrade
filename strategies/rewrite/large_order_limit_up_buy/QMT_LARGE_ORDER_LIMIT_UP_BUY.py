@@ -47,8 +47,8 @@ DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS = 1000.0
 DEBUG_LATENCY_WARN_INTERVAL_SECONDS = 10.0
 MAX_SIGNAL_QUOTE_DELAY_MS = 1000.0
 FRESHNESS_MAX_DELAY_MS = {
-    "l2quote": 2000.0,
-    "l2order": 1000.0,
+    "l2quote": 3000.0,
+    "l2order": 2000.0,
 }
 FRESHNESS_FUTURE_TOLERANCE_MS = 1000.0
 RAW_BUFFER_MAX_RECORDS = 20000
@@ -226,27 +226,34 @@ def _event_seconds(value=None):
 def _event_has_milliseconds(value=None):
     if value is None:
         return False
+    if isinstance(value, _dt.datetime):
+        return True
     text = str(value).strip()
     integer, dot, fraction = text.partition(".")
     digits = "".join(ch for ch in integer if ch.isdigit())
     if dot and any(ch.isdigit() for ch in fraction):
         return True
-    if len(digits) == 13 or len(digits) >= 17:
+    if len(digits) == 13 or len(digits) >= 15:
         return True
-    return 9 <= len(digits) <= 12
+    return False
 
 
 def _event_has_absolute_milliseconds(value=None):
     """Return whether the value has enough date/time precision for a gate."""
     if not _event_has_milliseconds(value):
         return False
+    if isinstance(value, _dt.datetime):
+        return True
     text = str(value).strip()
-    integer, _, _ = text.partition(".")
+    integer, dot, fraction = text.partition(".")
     digits = "".join(ch for ch in integer if ch.isdigit())
-    # A bare HHMMSS.mmm value has no date and is intentionally left
-    # unverifiable. QMT's normal `time` value is epoch milliseconds and its
-    # `stime` value contains the full YYYYMMDD date.
-    return len(digits) >= 9
+    if len(digits) == 13:
+        return True
+    if len(digits) == 10:
+        return bool(dot and any(ch.isdigit() for ch in fraction))
+    # Full YYYYMMDD timestamps need at least one subsecond digit. A bare
+    # HHMMSS.mmm value remains useful for session routing, but has no date.
+    return len(digits) >= 14
 
 
 def _event_epoch_seconds(value=None, reference_at=None):
@@ -264,9 +271,11 @@ def _event_epoch_seconds(value=None, reference_at=None):
     fraction = "".join(ch for ch in fraction if ch.isdigit()) if dot else ""
     try:
         if len(digits) == 13:
-            return float(int(digits)) / 1000.0
+            fractional_ms = float("0." + fraction) if fraction else 0.0
+            return (float(int(digits)) + fractional_ms) / 1000.0
         if len(digits) == 10:
-            return float(int(digits))
+            fractional = float("0." + fraction) if fraction else 0.0
+            return float(int(digits)) + fractional
         if len(digits) >= 14:
             stamp = _dt.datetime.strptime(digits[:14], "%Y%m%d%H%M%S")
             extra = digits[14:] + fraction
@@ -309,7 +318,7 @@ def _record_freshness_drop(code, period, reason, event_raw, delay_ms):
 
 
 def _freshness_gate(code, period, payload, received_at):
-    """Reject replayed or delayed events before copying or persisting payloads."""
+    """Reject event times that cannot safely drive live strategy decisions."""
     event_raw = _field(payload, "time", "stime", "timestamp")
     event_text = "" if event_raw is None else str(event_raw).strip()
     if not event_text:
@@ -319,14 +328,14 @@ def _freshness_gate(code, period, payload, received_at):
     if not digits or not any(ch != "0" for ch in digits):
         _record_freshness_drop(code, period, "invalid_event_time", event_raw, None)
         return False, event_raw, None
-    # A six-digit HHMMSS value is useful for session routing but cannot be
-    # compared to the local wall clock without a date. Keep it processable and
-    # leave latency accounting to the existing invalid-time rules.
+    # Session-only or second-resolution timestamps can be logged, but cannot
+    # establish event freshness closely enough to drive strategy state.
     if not _event_has_absolute_milliseconds(event_raw):
         if _event_seconds(event_raw) is None:
             _record_freshness_drop(code, period, "invalid_event_time", event_raw, None)
             return False, event_raw, None
-        return True, event_raw, None
+        _record_freshness_drop(code, period, "unverifiable_event_time", event_raw, None)
+        return False, event_raw, None
     event_epoch = _event_epoch_seconds(event_raw, received_at)
     if event_epoch is None:
         _record_freshness_drop(code, period, "invalid_event_time", event_raw, None)
@@ -352,6 +361,13 @@ def _freshness_gate(code, period, payload, received_at):
     return True, event_raw, delay_ms
 
 
+def _persist_unverifiable_raw_event(code, period, payload, event_raw, received_at):
+    if (_event_seconds(event_raw) is None or
+            _event_has_absolute_milliseconds(event_raw)):
+        return
+    _write_raw(code, period, _owned_payload(code, payload), received_at)
+
+
 def _format_local_timestamp(timestamp):
     return _dt.datetime.fromtimestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
 
@@ -373,15 +389,12 @@ def _format_event_timestamp(value=None):
 
 
 def _latency_ms(event_value, received_at):
-    if not _event_has_milliseconds(event_value):
+    if not _event_has_absolute_milliseconds(event_value):
         return None
-    event_seconds = _event_seconds(event_value)
+    event_seconds = _event_epoch_seconds(event_value)
     if event_seconds is None:
         return None
-    received = _dt.datetime.fromtimestamp(received_at)
-    received_seconds = (received.hour * 3600.0 + received.minute * 60.0 +
-                        received.second + received.microsecond / 1000000.0)
-    delay_ms = (received_seconds - event_seconds) * 1000.0
+    delay_ms = (received_at - event_seconds) * 1000.0
     # A negative value means the two clocks are not directly comparable. Do not
     # turn clock skew into a false low-latency result or a warning.
     return delay_ms if delay_ms >= 0 else None
@@ -1293,6 +1306,8 @@ def _handle_quote(code, period, payload):
         source = _unwrap(code, payload)
         fresh, event_raw, _ = _freshness_gate(code, period, source, received_at)
         if not fresh:
+            _persist_unverifiable_raw_event(
+                code, period, payload, event_raw, received_at)
             return
         data = _owned_payload(code, payload)
         is_l2quote = period == "l2quote"
@@ -1392,6 +1407,8 @@ def _handle_l2order(code, payload):
         source = _unwrap(code, payload)
         fresh, event_raw, _ = _freshness_gate(code, "l2order", source, received_at)
         if not fresh:
+            _persist_unverifiable_raw_event(
+                code, "l2order", payload, event_raw, received_at)
             return
         data = _owned_payload(code, payload)
         received_at = _write_raw(code, "l2order", data, received_at)
@@ -1540,8 +1557,9 @@ def _initial_quote(C, inst, full_ticks=None):
         fresh, snapshot_event_raw, snapshot_delay_ms = _freshness_gate(
             inst["code"], "l2quote", data, snapshot_received_at)
         if not fresh:
-            _log("[初始快照过期] code=%s event_time=%s delay_ms=%s，等待新鲜 l2quote" % (
-                inst["code"], _format_event_timestamp(snapshot_event_raw) or
+            _log("[初始快照未通过新鲜度校验] code=%s session_time=%s event_time=%s delay_ms=%s，等待带绝对时间的有效 l2quote" % (
+                inst["code"], _event_time(_field(data, "stime", "time")) or "n/a",
+                _format_event_timestamp(snapshot_event_raw) or
                 str(snapshot_event_raw or ""),
                 "%.0f" % snapshot_delay_ms if snapshot_delay_ms is not None else "n/a"))
             return

@@ -27,6 +27,7 @@ class QMTOrderCallbackTests(unittest.TestCase):
         self.original_live_orders = QMT.ENABLE_LIVE_ORDERS
         self.original_continue_on_failure = QMT.RESEAL_VALIDATION_CONTINUE_ON_FAILURE
         self.original_wall_seconds = QMT._wall_seconds_since_midnight
+        self.original_freshness_gate = QMT._freshness_gate
         self.had_order_query = hasattr(QMT, "get_trade_detail_data")
         self.old_order_query = getattr(QMT, "get_trade_detail_data", None)
         self.had_cancel = hasattr(QMT, "cancel")
@@ -39,6 +40,9 @@ class QMTOrderCallbackTests(unittest.TestCase):
         QMT.ACCOUNT_ID = "TEST_ACCOUNT"
         QMT.ENABLE_LIVE_ORDERS = True
         QMT._wall_seconds_since_midnight = lambda: 36001.5
+        # These tests focus on order validation and callback state transitions.
+        QMT._freshness_gate = lambda _code, _period, payload, _received_at: (
+            True, QMT._field(payload, "time", "stime", "timestamp"), None)
         QMT._C = self.context
         QMT._INSTANCES.clear()
         QMT._COUNTERS.update({"orders": 0, "deals": 0, "cancels": 0})
@@ -56,6 +60,7 @@ class QMTOrderCallbackTests(unittest.TestCase):
         QMT.ENABLE_LIVE_ORDERS = self.original_live_orders
         QMT.RESEAL_VALIDATION_CONTINUE_ON_FAILURE = self.original_continue_on_failure
         QMT._wall_seconds_since_midnight = self.original_wall_seconds
+        QMT._freshness_gate = self.original_freshness_gate
         if self.had_order_query:
             QMT.get_trade_detail_data = self.old_order_query
         elif hasattr(QMT, "get_trade_detail_data"):
