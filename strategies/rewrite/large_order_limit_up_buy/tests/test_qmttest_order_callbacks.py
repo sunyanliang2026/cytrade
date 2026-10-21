@@ -425,7 +425,7 @@ class QMTOrderCallbackTests(unittest.TestCase):
             "cancel_started": QMT._now(),
             "cancel_confirmed": True,
             "late_large_count": QMT.RESEAL_VERIFY_LARGE_COUNT,
-            "last_tick": {"bid_at_limit": True},
+            "last_l2quote": {"bid_at_limit": True},
         })
         submitted = []
         old_submit = QMT._submit
@@ -446,7 +446,7 @@ class QMTOrderCallbackTests(unittest.TestCase):
             "cancel_started": QMT._now(),
             "cancel_confirmed": True,
             "late_large_count": QMT.RESEAL_VERIFY_LARGE_COUNT,
-            "last_tick": {"bid_at_limit": True},
+            "last_l2quote": {"bid_at_limit": True},
         })
         submitted = []
         old_submit = QMT._submit

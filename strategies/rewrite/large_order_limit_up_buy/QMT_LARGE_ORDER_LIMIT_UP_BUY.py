@@ -40,13 +40,13 @@ RESEAL_PRE_SUBMIT_ORDER_MAX_AGE_SECONDS = 2.0
 ORDER_LOOKUP_RETRY_INTERVAL_SECONDS = 0.1
 ORDER_LOOKUP_MAX_ATTEMPTS = 10
 
-PERIODS = ("tick", "l2quote", "l2order")
+PERIODS = ("l2quote", "l2order")
 DEBUG_SUMMARY_INTERVAL_SECONDS = 60
 DEBUG_LATENCY_WARN_THRESHOLD_MS = 2000.0
 DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS = 1000.0
 DEBUG_LATENCY_WARN_INTERVAL_SECONDS = 10.0
 MAX_SIGNAL_QUOTE_DELAY_MS = 1000.0
-L2_PERIODS = set(PERIODS[1:])
+L2_PERIODS = set(PERIODS)
 VALIDATED_SUBMIT_REASONS = frozenset(("首封", "首封大单", "回封", "回封大单"))
 STATE_WAIT_INITIAL = "WAIT_INITIAL_QUOTE"
 STATE_READY = "READY"
@@ -76,7 +76,7 @@ _LOG_PATH = ""
 _RAW_LOG_PATH = ""
 _DAY = ""
 _LAST_SUMMARY = 0.0
-_COUNTERS = {"orders": 0, "deals": 0, "cancels": 0, "l2": 0, "quotes": 0}
+_COUNTERS = {"orders": 0, "deals": 0, "cancels": 0, "l2": 0}
 _PERIOD_COUNTS = {}
 _FIRST_CALLBACKS = {}
 _LAST_EVENT_TIMES = {}
@@ -84,7 +84,6 @@ _LATENCY_STATS = {}
 _LATENCY_LAST_WARN = {}
 _LAST_RECEIVED_AT = {}
 _GAP_STATS = {}
-_LIMIT_UP_FIRSTS = {}
 _RAW_BUFFER = []
 _RAW_FLUSH_TIMER = None
 _RAW_DROPPED = 0
@@ -285,7 +284,7 @@ def _write_raw(code, period, payload):
     latency_value = _field(payload, "time", "stime")
     event_time = _event_time(event_value)
     latency_ms = _latency_ms(latency_value, received_at)
-    _COUNTERS["l2" if period in L2_PERIODS else "quotes"] += 1
+    _COUNTERS["l2"] += 1
     _PERIOD_COUNTS[period] = _PERIOD_COUNTS.get(period, 0) + 1
     _LAST_EVENT_TIMES[period] = event_time or ""
     stats = _LATENCY_STATS.setdefault(period, {
@@ -342,38 +341,6 @@ def _write_raw(code, period, payload):
     except Exception:
         pass
     return received_at
-
-
-def _observe_first_limit_up(code, period, event_time, event_raw, received_at, limit_up, bid):
-    if period not in ("tick", "l2quote") or not _in_continuous(event_time):
-        return
-    if not limit_up or not bid or abs(bid - limit_up) >= 1e-8:
-        return
-    observed = _LIMIT_UP_FIRSTS.setdefault(code, {})
-    if period in observed:
-        return
-    observed[period] = {
-        "received_at": received_at,
-        "received_time": _format_local_timestamp(received_at),
-        "event_time": event_time,
-        "event_raw": str(event_raw) if event_raw is not None else "",
-    }
-    _log("[LIMIT_UP_FIRST] code=%s period=%s bid1=%.3f limit_up=%.3f event_time=%s event_raw=%s received_time=%s" %
-         (code, period, bid, limit_up, event_time, observed[period]["event_raw"],
-          observed[period]["received_time"]))
-    if "tick" not in observed or "l2quote" not in observed or observed.get("compared"):
-        return
-    tick_at = observed["tick"]["received_at"]
-    l2quote_at = observed["l2quote"]["received_at"]
-    delta_ms = (tick_at - l2quote_at) * 1000.0
-    winner = "tick" if delta_ms < 0 else "l2quote" if delta_ms > 0 else "tie"
-    observed["compared"] = True
-    observed["winner"] = winner
-    observed["gap_ms"] = abs(delta_ms)
-    _log("[LIMIT_UP_COMPARE] code=%s winner=%s gap_ms=%.3f tick_event=%s l2quote_event=%s tick_received_time=%s l2quote_received_time=%s" %
-         (code, winner, abs(delta_ms), observed["tick"]["event_raw"],
-          observed["l2quote"]["event_raw"], observed["tick"]["received_time"],
-          observed["l2quote"]["received_time"]))
 
 
 def _flush_raw(max_records=1000):
@@ -489,7 +456,7 @@ def _new_instance(code, amount):
     return {
         "code": code, "name": "未命名", "plan_amount": amount, "state": STATE_WAIT_INITIAL,
         "limit_up": None, "last_close": None, "open_price": None, "day_low": None,
-        "last_event_time": "", "last_tick": {}, "auction_checked": False,
+        "last_event_time": "", "last_l2quote": {}, "auction_checked": False,
         "initial_sealed": False, "seal_started": None, "seal_peak": 0.0,
         "break_started": None, "reseal_ready": False, "first_large_total": 0.0,
         "first_large_ids": set(), "seen_order_ids": set(), "l2order_history": [],
@@ -586,7 +553,7 @@ def _is_large_order_trigger(volume, amount):
 def _limit_price(inst, quote=None):
     if inst["limit_up"]:
         return inst["limit_up"]
-    value = _limit_from(quote or {}, inst.get("last_tick"))
+    value = _limit_from(quote or {}, inst.get("last_l2quote"))
     if value:
         inst["limit_up"] = value
     return value
@@ -652,7 +619,7 @@ def _skip_negative_latest(inst, last, source, event_time=None, received_at=None)
     change_pct = (last / previous_close - 1.0) * 100.0
     _cancel_timer(inst)
     _cancel_order_lookup(inst)
-    _set_state(inst, STATE_SKIPPED, "latest tick return < 0")
+    _set_state(inst, STATE_SKIPPED, "latest quote return < 0")
     unsubscribed, failed = _unsubscribe_instance(inst)
     _log("[NEGATIVE_RETURN_EXIT] code=%s source=%s last=%.4f prev_close=%.4f "
          "change_pct=%.4f unsubscribed=%d failed=%d active_subscriptions=%d "
@@ -1106,7 +1073,7 @@ def _check_validation(inst):
         return
     if (inst.get("cancel_confirmed") and not inst.get("follow_sent") and
             _now() - inst["cancel_started"] < RESEAL_LATE_WINDOW_SECONDS):
-        if inst["late_large_count"] >= RESEAL_VERIFY_LARGE_COUNT and inst["last_tick"].get("bid_at_limit"):
+        if inst["late_large_count"] >= RESEAL_VERIFY_LARGE_COUNT and inst["last_l2quote"].get("bid_at_limit"):
             inst["follow_sent"] = True
             _submit(inst, "撤单后跟随")
 
@@ -1119,7 +1086,7 @@ def _handle_quote(code, period, payload):
         data = _owned_payload(code, payload)
         is_l2quote = period == "l2quote"
         if is_l2quote:
-            inst["last_tick"] = data
+            inst["last_l2quote"] = data
         event_time = _event_time(_field(data, "stime", "time", "timestamp"))
         if event_time:
             inst["last_event_time"] = event_time
@@ -1132,17 +1099,14 @@ def _handle_quote(code, period, payload):
         limit_up = _limit_price(inst, data)
         is_continuous = bool(event_time and _in_continuous(event_time))
         bid, bid_vol, ask, last, low = _quote_values(inst, data, track_day=is_continuous)
-        _observe_first_limit_up(
-            code, period, event_time, _field(data, "time", "stime", "timestamp"),
-            received_at, limit_up, bid)
         if inst["last_close"] is None:
             inst["last_close"] = _safe_float(_field(data, "lastClose", "preClose", "pre_close"))
         if not is_continuous:
             if is_l2quote:
                 _check_validation(inst)
             return
-        if (period == "tick" and
-                _skip_negative_latest(inst, last, "tick",
+        if (is_l2quote and
+                _skip_negative_latest(inst, last, "l2quote",
                                       _field(data, "time", "stime", "timestamp"),
                                       received_at)):
             return
@@ -1152,7 +1116,7 @@ def _handle_quote(code, period, payload):
             return
         bid_at_limit = abs(bid - limit_up) < 1e-8
         seal_amount = _amount(bid, bid_vol)
-        inst["last_tick"]["bid_at_limit"] = bid_at_limit
+        inst["last_l2quote"]["bid_at_limit"] = bid_at_limit
         if inst["state"] == STATE_WAIT_INITIAL:
             if bid_at_limit:
                 _set_state(inst, STATE_WAIT_REOPEN, "盘中启动时已在涨停价，等待回封")
@@ -1339,7 +1303,7 @@ def _initial_quote(C, inst, full_ticks=None):
                 pass
         full = full_ticks if full_ticks is not None else C.get_full_tick([inst["code"]])
         data = _unwrap(inst["code"], full)
-        inst["last_tick"] = data
+        inst["last_l2quote"] = data
         inst["limit_up"] = inst["limit_up"] or _limit_from(data)
         inst["last_close"] = inst["last_close"] or _safe_float(_field(data, "lastClose", "preClose", "pre_close"))
         inst["open_price"] = _safe_float(_field(data, "open", "openPrice"))
@@ -1375,33 +1339,6 @@ def _initial_quote_batch(C, instances):
         _initial_quote(C, inst, full_ticks)
 
 
-def _limit_up_first_summary():
-    tick_seen = sum(1 for value in _LIMIT_UP_FIRSTS.values() if "tick" in value)
-    l2quote_seen = sum(1 for value in _LIMIT_UP_FIRSTS.values() if "l2quote" in value)
-    paired = [value for value in _LIMIT_UP_FIRSTS.values() if value.get("compared")]
-    tick_first = sum(1 for value in paired if value["winner"] == "tick")
-    l2quote_first = sum(1 for value in paired if value["winner"] == "l2quote")
-    ties = sum(1 for value in paired if value["winner"] == "tie")
-    gaps = [value["gap_ms"] for value in paired]
-    average = sum(gaps) / len(gaps) if gaps else None
-    minimum = min(gaps) if gaps else None
-    maximum = max(gaps) if gaps else None
-    tick_only = sum(1 for value in _LIMIT_UP_FIRSTS.values()
-                    if "tick" in value and "l2quote" not in value)
-    l2quote_only = sum(1 for value in _LIMIT_UP_FIRSTS.values()
-                       if "l2quote" in value and "tick" not in value)
-    unseen = max(0, len(_INSTANCES) - len(_LIMIT_UP_FIRSTS))
-    return ("stocks=%d tick_seen=%d l2quote_seen=%d paired=%d tick_first=%d "
-            "l2quote_first=%d tie=%d gap_avg/min/max_ms=%s/%s/%s "
-            "tick_only=%d l2quote_only=%d unseen=%d" %
-            (len(_INSTANCES), tick_seen, l2quote_seen, len(paired), tick_first,
-             l2quote_first, ties,
-             "%.1f" % average if average is not None else "n/a",
-             "%.1f" % minimum if minimum is not None else "n/a",
-             "%.1f" % maximum if maximum is not None else "n/a",
-             tick_only, l2quote_only, unseen))
-
-
 def _summary():
     by_state = {}
     for inst in _INSTANCES.values():
@@ -1434,15 +1371,14 @@ def _summary():
             "%.0fms" % gap_average if gap_average is not None else "n/a",
             "%.0fms" % gaps.get("max_ms") if gap_count else "n/a",
             len([key for key in _LAST_RECEIVED_AT if key[0] == period]))
-    _log("[汇总] 监控=%d 下单=%d 成交=%d 撤单=%d L2=%d 行情=%d 订阅=%d成功/%d失败 "
+    _log("[汇总] 监控=%d 下单=%d 成交=%d 撤单=%d L2=%d 订阅=%d成功/%d失败 "
          "回调=%s 首条=%s 延时=%s 缓冲=%d 丢弃=%d 最近事件=%s 状态=%s" %
          (len(_INSTANCES), _COUNTERS["orders"], _COUNTERS["deals"], _COUNTERS["cancels"],
-          _COUNTERS["l2"], _COUNTERS["quotes"], _SUB_SUCCESS, _SUB_FAILED,
+          _COUNTERS["l2"], _SUB_SUCCESS, _SUB_FAILED,
           period_counts, "%d/%d[%s]" % (len(_FIRST_CALLBACKS), len(PERIODS), first_callbacks),
           ";".join(latency_parts), len(_RAW_BUFFER), _RAW_DROPPED,
           last_events,
           ";".join("%s:%s" % (k, ",".join(v)) for k, v in sorted(by_state.items()))))
-    _log("[涨停首报汇总] %s" % _limit_up_first_summary())
 
 
 def init(C):
@@ -1481,12 +1417,12 @@ def init(C):
         _log("[运行] raw_log_path=%s" % (_RAW_LOG_PATH or "<unavailable>"))
         _log("[运行] ENABLE_LIVE_ORDERS=%s PERIODS=%s" %
              (ENABLE_LIVE_ORDERS, ",".join(PERIODS)))
-        _log("[运行] latency_warning_thresholds=tick:%.0fms,l2quote:%.0fms,l2order:%.0fms "
+        _log("[运行] latency_warning_thresholds=l2quote:%.0fms,l2order:%.0fms "
              "warn_interval=%ss" %
-             (DEBUG_LATENCY_WARN_THRESHOLD_MS, DEBUG_LATENCY_WARN_THRESHOLD_MS,
+             (DEBUG_LATENCY_WARN_THRESHOLD_MS,
               DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS,
               DEBUG_LATENCY_WARN_INTERVAL_SECONDS))
-        _COUNTERS.update({"orders": 0, "deals": 0, "cancels": 0, "l2": 0, "quotes": 0})
+        _COUNTERS.update({"orders": 0, "deals": 0, "cancels": 0, "l2": 0})
         _PERIOD_COUNTS.clear()
         _FIRST_CALLBACKS.clear()
         _LAST_EVENT_TIMES.clear()
@@ -1494,7 +1430,6 @@ def init(C):
         _LATENCY_LAST_WARN.clear()
         _LAST_RECEIVED_AT.clear()
         _GAP_STATS.clear()
-        _LIMIT_UP_FIRSTS.clear()
         del _RAW_BUFFER[:]
         _RAW_FLUSH_TIMER = None
         _RAW_DROPPED = 0
