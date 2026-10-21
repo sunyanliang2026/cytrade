@@ -7,13 +7,15 @@
 因此当前脚本：
 
 - 不导入 `threading`，不使用线程池、Future 或 `sleep`。
-- 不在回调中做不可控的网络、磁盘批量写入或长时间重试。
+- 不在回调中做不可控的网络、磁盘批量写入或长时间重试；回调只把已通过新鲜度闸门的原始记录放入有界缓冲区，JSON 序列化和落盘由 `schedule_run` 分片完成。
 - 把需要稍后完成的工作拆成有限片段，由 `schedule_run` 或下一次 `handlebar` 继续执行。
 - `_NoopLock` 只提供统一的上下文写法，不等待、不产生并发互斥；它不是线程安全机制。
 
 ## 回调参数和状态
 
-QMT 回调传入的数据对象可能是复用对象，并具有深拷贝和回滚语义。回调结束后不能依赖对参数对象的修改。当前实现通过 `_owned_payload()` 深拷贝数据，再放入 `_INSTANCES`、`_RAW_BUFFER` 等脚本自有容器。跨回调字段必须从这些容器读取。
+QMT 回调传入的数据对象可能是复用对象，并具有深拷贝和回滚语义。回调结束后不能依赖对参数对象的修改。当前实现先用事件时间过滤回放、过期和乱序事件，再通过 `_owned_payload()` 复制顶层字段和盘口数组，放入 `_INSTANCES`、`_RAW_BUFFER` 等脚本自有容器；不在高频路径执行递归 `deepcopy` 或 JSON 序列化。跨回调字段必须从这些容器读取。
+
+`l2quote` 事件延时超过 2000ms、`l2order` 事件延时超过 1000ms 时，事件在回调入口丢弃；启动时早于水位线的回放事件和同股票倒退的事件时间也丢弃。缺少绝对毫秒时间的 `HHMMSS` 只用于时段判断，不参与新鲜度判定。汇总中的 `freshness_drop` 按周期统计被过滤的事件数。
 
 不要把以下状态写回 `ContextInfo` 或行情回调参数：
 
@@ -31,6 +33,8 @@ C.subscribe_quote(code, period=period, dividend_type="follow",
 C.schedule_run(callback, time_point, repeat_times, interval, name)
 C.cancel_schedule_run(task_id_or_name)
 ```
+
+打板模型启动时先订阅 `l2quote`；`l2order` 在 09:29:50 通过一次性 `schedule_run` 建立，盘中启动立即建立，收盘后启动预约下一日。这样竞价期间不会把策略不使用的逐笔委托回放压入单线程回调队列。
 
 一次性任务使用 `repeat_times=0`，持续任务使用 `repeat_times=-1`。定时器回调显式接收 `ContextInfo`，闭包只捕获稳定的股票代码、订单号或提交令牌，防止旧任务误操作新订单。停止模型时必须取消所有定时器和订阅。
 

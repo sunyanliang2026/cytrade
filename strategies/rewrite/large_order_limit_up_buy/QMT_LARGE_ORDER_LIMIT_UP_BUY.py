@@ -6,7 +6,7 @@ ENABLE_LIVE_ORDERS 默认为 True，使用配置的 QMT 资金账号运行。
 """
 
 import csv
-import copy
+from collections import deque
 import datetime as _dt
 import json
 import os
@@ -46,6 +46,16 @@ DEBUG_LATENCY_WARN_THRESHOLD_MS = 2000.0
 DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS = 1000.0
 DEBUG_LATENCY_WARN_INTERVAL_SECONDS = 10.0
 MAX_SIGNAL_QUOTE_DELAY_MS = 1000.0
+FRESHNESS_MAX_DELAY_MS = {
+    "l2quote": 2000.0,
+    "l2order": 1000.0,
+}
+FRESHNESS_FUTURE_TOLERANCE_MS = 1000.0
+RAW_BUFFER_MAX_RECORDS = 20000
+RAW_FLUSH_INTERVAL_SECONDS = 0.5
+RAW_FLUSH_BATCH = 500
+SEEN_ORDER_KEY_MAX_COUNT = 1000
+L2ORDER_SUBSCRIBE_SECONDS = 9 * 60 * 60 + 29 * 60 + 50
 L2_PERIODS = set(PERIODS)
 VALIDATED_SUBMIT_REASONS = frozenset(("首封", "首封大单", "回封", "回封大单"))
 STATE_WAIT_INITIAL = "WAIT_INITIAL_QUOTE"
@@ -84,10 +94,15 @@ _LATENCY_STATS = {}
 _LATENCY_LAST_WARN = {}
 _LAST_RECEIVED_AT = {}
 _GAP_STATS = {}
-_RAW_BUFFER = []
+_LATEST_EVENT_EPOCH = {}
+_STARTUP_EVENT_WATERMARK = {}
+_FRESHNESS_DROPS = {}
+_FRESHNESS_LAST_LOG = {}
+_RAW_BUFFER = deque()
 _RAW_FLUSH_TIMER = None
 _RAW_DROPPED = 0
 _AUCTION_RETRY_TIMER = None
+_L2ORDER_SUBSCRIBE_TIMER = None
 _POOL_PATH = ""
 
 
@@ -221,6 +236,114 @@ def _event_has_milliseconds(value=None):
     return 9 <= len(digits) <= 12
 
 
+def _event_has_absolute_milliseconds(value=None):
+    """Return whether the value has enough date/time precision for a gate."""
+    if not _event_has_milliseconds(value):
+        return False
+    text = str(value).strip()
+    integer, _, _ = text.partition(".")
+    digits = "".join(ch for ch in integer if ch.isdigit())
+    # A bare HHMMSS.mmm value has no date and is intentionally left
+    # unverifiable. QMT's normal `time` value is epoch milliseconds and its
+    # `stime` value contains the full YYYYMMDD date.
+    return len(digits) >= 9
+
+
+def _event_epoch_seconds(value=None, reference_at=None):
+    """Convert an absolute QMT event value to local epoch seconds."""
+    if value is None:
+        return None
+    if isinstance(value, _dt.datetime):
+        try:
+            return value.timestamp()
+        except Exception:
+            return None
+    text = str(value).strip()
+    integer, dot, fraction = text.partition(".")
+    digits = "".join(ch for ch in integer if ch.isdigit())
+    fraction = "".join(ch for ch in fraction if ch.isdigit()) if dot else ""
+    try:
+        if len(digits) == 13:
+            return float(int(digits)) / 1000.0
+        if len(digits) == 10:
+            return float(int(digits))
+        if len(digits) >= 14:
+            stamp = _dt.datetime.strptime(digits[:14], "%Y%m%d%H%M%S")
+            extra = digits[14:] + fraction
+            micros = int((extra + "000000")[:6]) if extra else 0
+            return stamp.timestamp() + micros / 1000000.0
+        if len(digits) < 6:
+            return None
+        hhmmss = digits[:6]
+        hour, minute, second = (int(hhmmss[:2]), int(hhmmss[2:4]),
+                                int(hhmmss[4:6]))
+        if hour > 23 or minute > 59 or second > 59:
+            return None
+        extra = digits[6:] + fraction
+        micros = int((extra + "000000")[:6]) if extra else 0
+        reference = _dt.datetime.fromtimestamp(
+            time.time() if reference_at is None else reference_at)
+        stamp = _dt.datetime.combine(
+            reference.date(), _dt.time(hour, minute, second, micros))
+        return stamp.timestamp()
+    except Exception:
+        return None
+
+
+def _record_freshness_drop(code, period, reason, event_raw, delay_ms):
+    stats = _FRESHNESS_DROPS.setdefault(period, {
+        "count": 0, "last_reason": "", "last_delay_ms": None,
+    })
+    stats["count"] += 1
+    stats["last_reason"] = reason
+    stats["last_delay_ms"] = delay_ms
+    key = (period, code)
+    now = _now()
+    if now - _FRESHNESS_LAST_LOG.get(key, 0.0) < DEBUG_LATENCY_WARN_INTERVAL_SECONDS:
+        return
+    _FRESHNESS_LAST_LOG[key] = now
+    _log("[FRESHNESS_DROP] period=%s code=%s reason=%s delay_ms=%s event_time=%s" % (
+        period, code, reason,
+        "%.0f" % delay_ms if delay_ms is not None else "n/a",
+        _format_event_timestamp(event_raw) or str(event_raw or "")))
+
+
+def _freshness_gate(code, period, payload, received_at):
+    """Reject replayed or delayed events before copying or persisting payloads."""
+    event_raw = _field(payload, "time", "stime", "timestamp")
+    if event_raw in (None, ""):
+        _record_freshness_drop(code, period, "missing_event_time", event_raw, None)
+        return False, event_raw, None
+    # A six-digit HHMMSS value is useful for session routing but cannot be
+    # compared to the local wall clock without a date. Keep it processable and
+    # leave latency accounting to the existing invalid-time rules.
+    if not _event_has_absolute_milliseconds(event_raw):
+        return True, event_raw, None
+    event_epoch = _event_epoch_seconds(event_raw, received_at)
+    if event_epoch is None:
+        _record_freshness_drop(code, period, "invalid_event_time", event_raw, None)
+        return False, event_raw, None
+    delay_ms = (received_at - event_epoch) * 1000.0
+    if delay_ms < -FRESHNESS_FUTURE_TOLERANCE_MS:
+        _record_freshness_drop(code, period, "future_event", event_raw, delay_ms)
+        return False, event_raw, delay_ms
+    max_delay_ms = FRESHNESS_MAX_DELAY_MS.get(period)
+    if max_delay_ms is not None and delay_ms > max_delay_ms:
+        _record_freshness_drop(code, period, "stale_event", event_raw, delay_ms)
+        return False, event_raw, delay_ms
+    watermark = _STARTUP_EVENT_WATERMARK.get((period, code))
+    if (watermark is not None and
+            event_epoch < watermark - (max_delay_ms or 0.0) / 1000.0):
+        _record_freshness_drop(code, period, "startup_replay", event_raw, delay_ms)
+        return False, event_raw, delay_ms
+    previous = _LATEST_EVENT_EPOCH.get((period, code))
+    if previous is not None and event_epoch < previous - 0.001:
+        _record_freshness_drop(code, period, "out_of_order", event_raw, delay_ms)
+        return False, event_raw, delay_ms
+    _LATEST_EVENT_EPOCH[(period, code)] = max(previous or event_epoch, event_epoch)
+    return True, event_raw, delay_ms
+
+
 def _format_local_timestamp(timestamp):
     return _dt.datetime.fromtimestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
 
@@ -292,9 +415,9 @@ def _json_default(value):
         return repr(value)
 
 
-def _write_raw(code, period, payload):
+def _write_raw(code, period, payload, received_at=None):
     global _RAW_DROPPED
-    received_at = time.time()
+    received_at = time.time() if received_at is None else received_at
     received_time = _format_local_timestamp(received_at)
     event_value = _field(payload, "stime", "time")
     latency_value = _field(payload, "time", "stime")
@@ -349,11 +472,12 @@ def _write_raw(code, period, payload):
         "code": code, "period": period, "data": payload,
     }
     try:
-        line = json.dumps(record, ensure_ascii=True, default=_json_default) + "\n"
-        if len(_RAW_BUFFER) >= 20000:
-            _RAW_BUFFER.pop(0)
+        # Keep serialization and file I/O out of the high-frequency callback.
+        # The bounded timer below converts these records to JSON in small batches.
+        if len(_RAW_BUFFER) >= RAW_BUFFER_MAX_RECORDS:
+            _RAW_BUFFER.popleft()
             _RAW_DROPPED += 1
-        _RAW_BUFFER.append(line)
+        _RAW_BUFFER.append(record)
     except Exception:
         pass
     return received_at
@@ -362,17 +486,21 @@ def _write_raw(code, period, payload):
 def _flush_raw(max_records=1000):
     if not _RAW_LOG or not _RAW_BUFFER:
         return
-    records = _RAW_BUFFER[:max_records]
-    del _RAW_BUFFER[:len(records)]
+    records = []
+    for _ in range(min(max_records, len(_RAW_BUFFER))):
+        records.append(_RAW_BUFFER.popleft())
     try:
-        _RAW_LOG.write("".join(records))
+        lines = [json.dumps(record, ensure_ascii=True, default=_json_default) + "\n"
+                 for record in records]
+        _RAW_LOG.write("".join(lines))
         _RAW_LOG.flush()
     except Exception:
-        _RAW_BUFFER[0:0] = records
+        for record in reversed(records):
+            _RAW_BUFFER.appendleft(record)
 
 
 def _raw_flush_timer(ContextInfo):
-    _flush_raw(200)
+    _flush_raw(RAW_FLUSH_BATCH)
 
 
 def _schedule_raw_flush():
@@ -382,9 +510,47 @@ def _schedule_raw_flush():
     try:
         _RAW_FLUSH_TIMER = _C.schedule_run(
             _raw_flush_timer, _dt.datetime.now() + _dt.timedelta(seconds=1),
-            repeat_times=-1, interval=_dt.timedelta(seconds=1), name="qmt_raw_flush")
+            repeat_times=-1, interval=_dt.timedelta(seconds=RAW_FLUSH_INTERVAL_SECONDS),
+            name="qmt_raw_flush")
     except Exception as exc:
         _log("[日志] 原始数据定时落盘创建失败 %r" % (exc,))
+
+
+def _subscribe_l2order_now(C):
+    """Attach l2order only when it can contribute to continuous-session logic."""
+    global _L2ORDER_SUBSCRIBE_TIMER
+    _L2ORDER_SUBSCRIBE_TIMER = None
+    for inst in list(_INSTANCES.values()):
+        if inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+            continue
+        if "l2order" not in inst.get("sub_periods", {}).values():
+            _subscribe(C, inst["code"], "l2order")
+    _log("[SUBSCRIBE] l2order current-session fan-out complete success=%d failed=%d" %
+         (_SUB_SUCCESS, _SUB_FAILED))
+
+
+def _schedule_l2order_subscriptions(C):
+    """Schedule the l2order fan-out just before continuous trading starts."""
+    global _L2ORDER_SUBSCRIBE_TIMER
+    now = _dt.datetime.now()
+    now_seconds = (now.hour * 3600 + now.minute * 60 + now.second +
+                   now.microsecond / 1000000.0)
+    close_seconds = 14 * 60 * 60 + 57 * 60
+    target = now.replace(hour=9, minute=29, second=50, microsecond=0)
+    if L2ORDER_SUBSCRIBE_SECONDS <= now_seconds < close_seconds:
+        _subscribe_l2order_now(C)
+        return
+    if now_seconds >= close_seconds:
+        target += _dt.timedelta(days=1)
+    try:
+        _L2ORDER_SUBSCRIBE_TIMER = C.schedule_run(
+            lambda ContextInfo: _subscribe_l2order_now(ContextInfo), target,
+            repeat_times=0, name="qmt_l2order_subscribe")
+        _log("[SUBSCRIBE] l2order delayed until %s to avoid auction replay" %
+             target.strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception as exc:
+        _log("[SUBSCRIBE] delayed l2order timer failed %r; subscribing now" % (exc,))
+        _subscribe_l2order_now(C)
 
 
 def _auction_retry_timer(ContextInfo):
@@ -475,7 +641,8 @@ def _new_instance(code, amount):
         "last_event_time": "", "last_l2quote": {}, "auction_checked": False,
         "initial_sealed": False, "seal_started": None, "seal_peak": 0.0,
         "break_started": None, "reseal_ready": False, "first_large_total": 0.0,
-        "first_large_ids": set(), "seen_order_ids": set(), "l2order_history": [],
+        "first_large_ids": set(), "seen_order_ids": set(), "seen_order_queue": deque(),
+        "l2order_history": [],
         "verify_count": 0,
         "verify_large_count": 0, "verify_large_ids": set(), "validation_started": None,
         "validation_pre_count": 0, "validation_pre_large_count": 0,
@@ -507,12 +674,21 @@ def _unwrap(code, data):
 
 
 def _owned_payload(code, data):
-    """Detach callback data from QMT's rollback/reuse object."""
-    try:
-        return copy.deepcopy(_unwrap(code, data))
-    except Exception:
-        value = _unwrap(code, data)
-        return dict(value) if isinstance(value, dict) else {}
+    """Detach the top-level callback fields without recursive deepcopy."""
+    value = _unwrap(code, data)
+    if not isinstance(value, dict):
+        return {}
+    detached = {}
+    for key, item in value.items():
+        if isinstance(item, list):
+            detached[key] = list(item)
+        elif isinstance(item, tuple):
+            detached[key] = tuple(item)
+        elif isinstance(item, dict):
+            detached[key] = dict(item)
+        else:
+            detached[key] = item
+    return detached
 
 
 def _limit_from(data, tick=None):
@@ -1105,17 +1281,20 @@ def _handle_quote(code, period, payload):
         inst = _INSTANCES.get(code)
         if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
             return
+        received_at = time.time()
+        source = _unwrap(code, payload)
+        fresh, event_raw, _ = _freshness_gate(code, period, source, received_at)
+        if not fresh:
+            return
         data = _owned_payload(code, payload)
         is_l2quote = period == "l2quote"
-        if is_l2quote:
-            inst["last_l2quote"] = data
-        event_time = _event_time(_field(data, "stime", "time", "timestamp"))
+        event_time = _event_time(event_raw)
         if event_time:
             inst["last_event_time"] = event_time
-        received_at = _write_raw(code, period, data)
+        received_at = _write_raw(code, period, data, received_at)
         if is_l2quote:
             inst["last_signal_period"] = period
-            inst["last_signal_event_raw"] = _field(data, "time", "stime", "timestamp")
+            inst["last_signal_event_raw"] = event_raw
             inst["last_signal_received_at"] = received_at
             inst["last_latency_ms"] = _latency_ms(inst["last_signal_event_raw"], received_at)
         limit_up = _limit_price(inst, data)
@@ -1138,6 +1317,19 @@ def _handle_quote(code, period, payload):
             return
         bid_at_limit = abs(bid - limit_up) < 1e-8
         seal_amount = _amount(bid, bid_vol)
+        if is_l2quote:
+            # Keep only the latest scalar quote state; the detached full payload
+            # remains in the bounded raw queue until the scheduled flush.
+            inst["last_l2quote"] = {
+                "time": _field(data, "time"),
+                "stime": _field(data, "stime"),
+                "upLimit": limit_up,
+                "bidPrice": bid,
+                "bidVol": bid_vol,
+                "lastPrice": last,
+                "open": inst.get("open_price"),
+                "low": low,
+            }
         inst["last_l2quote"]["bid_at_limit"] = bid_at_limit
         if inst["state"] == STATE_WAIT_INITIAL:
             if bid_at_limit:
@@ -1188,9 +1380,13 @@ def _handle_l2order(code, payload):
         inst = _INSTANCES.get(code)
         if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
             return
+        received_at = time.time()
+        source = _unwrap(code, payload)
+        fresh, event_raw, _ = _freshness_gate(code, "l2order", source, received_at)
+        if not fresh:
+            return
         data = _owned_payload(code, payload)
-        received_at = _write_raw(code, "l2order", data)
-        event_raw = _field(data, "time", "stime", "timestamp")
+        received_at = _write_raw(code, "l2order", data, received_at)
         inst["last_signal_period"] = "l2order"
         inst["last_signal_event_raw"] = event_raw
         inst["last_signal_received_at"] = received_at
@@ -1213,6 +1409,10 @@ def _handle_l2order(code, payload):
         if event_key in inst["seen_order_ids"]:
             return
         inst["seen_order_ids"].add(event_key)
+        seen_queue = inst.setdefault("seen_order_queue", deque())
+        seen_queue.append(event_key)
+        while len(seen_queue) > SEEN_ORDER_KEY_MAX_COUNT:
+            inst["seen_order_ids"].discard(seen_queue.popleft())
         amount = _order_amount(price, volume, _field(data, "amount"))
         _remember_l2order(
             inst, event_key, order_id, event_raw, event_time, price, direction,
@@ -1328,7 +1528,25 @@ def _initial_quote(C, inst, full_ticks=None):
                 pass
         full = full_ticks if full_ticks is not None else C.get_full_tick([inst["code"]])
         data = _unwrap(inst["code"], full)
-        inst["last_l2quote"] = data
+        snapshot_received_at = time.time()
+        fresh, snapshot_event_raw, snapshot_delay_ms = _freshness_gate(
+            inst["code"], "l2quote", data, snapshot_received_at)
+        if not fresh:
+            _log("[初始快照过期] code=%s event_time=%s delay_ms=%s，等待新鲜 l2quote" % (
+                inst["code"], _format_event_timestamp(snapshot_event_raw) or
+                str(snapshot_event_raw or ""),
+                "%.0f" % snapshot_delay_ms if snapshot_delay_ms is not None else "n/a"))
+            return
+        inst["last_l2quote"] = {
+            "time": _field(data, "time"),
+            "stime": _field(data, "stime"),
+            "upLimit": _limit_from(data),
+            "bidPrice": _field(data, "bidPrice", "bid1"),
+            "bidVol": _field(data, "bidVol", "bidVolume", "bid1_volume"),
+            "lastPrice": _field(data, "lastPrice", "last", "price"),
+            "open": _field(data, "open", "openPrice"),
+            "low": _field(data, "low", "lowest", "lowPrice"),
+        }
         inst["limit_up"] = inst["limit_up"] or _limit_from(data)
         inst["last_close"] = inst["last_close"] or _safe_float(_field(data, "lastClose", "preClose", "pre_close"))
         inst["open_price"] = _safe_float(_field(data, "open", "openPrice"))
@@ -1375,6 +1593,9 @@ def _summary():
     period_counts = ",".join("%s:%d" % (period, _PERIOD_COUNTS.get(period, 0)) for period in PERIODS)
     first_callbacks = ",".join(sorted(_FIRST_CALLBACKS)) or "无"
     last_events = ",".join("%s:%s" % (period, _LAST_EVENT_TIMES.get(period, "")) for period in PERIODS)
+    freshness_drops = ",".join(
+        "%s:%d" % (period, _FRESHNESS_DROPS.get(period, {}).get("count", 0))
+        for period in PERIODS)
     latency_parts = []
     for period in PERIODS:
         stats = _LATENCY_STATS.get(period, {})
@@ -1398,18 +1619,19 @@ def _summary():
             "%.0fms" % gaps.get("max_ms") if gap_count else "n/a",
             len([key for key in _LAST_RECEIVED_AT if key[0] == period]))
     _log("[汇总] 监控=%d 下单=%d 成交=%d 撤单=%d L2=%d 订阅=%d成功/%d失败 "
-         "回调=%s 首条=%s 延时=%s 缓冲=%d 丢弃=%d 最近事件=%s 状态=%s" %
+         "回调=%s 首条=%s 延时=%s 缓冲=%d 丢弃=%d freshness_drop=%s 最近事件=%s 状态=%s" %
          (len(_INSTANCES), _COUNTERS["orders"], _COUNTERS["deals"], _COUNTERS["cancels"],
           _COUNTERS["l2"], _SUB_SUCCESS, _SUB_FAILED,
           period_counts, "%d/%d[%s]" % (len(_FIRST_CALLBACKS), len(PERIODS), first_callbacks),
-          ";".join(latency_parts), len(_RAW_BUFFER), _RAW_DROPPED,
+          ";".join(latency_parts), len(_RAW_BUFFER), _RAW_DROPPED, freshness_drops,
           last_events,
           ";".join("%s:%s" % (k, ",".join(v)) for k, v in sorted(by_state.items()))))
 
 
 def init(C):
     global _C, _LOG, _RAW_LOG, _LOG_PATH, _RAW_LOG_PATH, _DAY, _LAST_SUMMARY
-    global _RAW_FLUSH_TIMER, _RAW_DROPPED, _AUCTION_RETRY_TIMER, _SUB_SUCCESS, _SUB_FAILED
+    global _RAW_FLUSH_TIMER, _RAW_DROPPED, _AUCTION_RETRY_TIMER
+    global _L2ORDER_SUBSCRIBE_TIMER, _SUB_SUCCESS, _SUB_FAILED
     with _LOCK:
         _C = C
         if ACCOUNT_ID:
@@ -1456,28 +1678,42 @@ def init(C):
         _LATENCY_LAST_WARN.clear()
         _LAST_RECEIVED_AT.clear()
         _GAP_STATS.clear()
-        del _RAW_BUFFER[:]
+        _LATEST_EVENT_EPOCH.clear()
+        _STARTUP_EVENT_WATERMARK.clear()
+        _FRESHNESS_DROPS.clear()
+        _FRESHNESS_LAST_LOG.clear()
+        _RAW_BUFFER.clear()
         _RAW_FLUSH_TIMER = None
         _RAW_DROPPED = 0
         _AUCTION_RETRY_TIMER = None
+        _L2ORDER_SUBSCRIBE_TIMER = None
         _SUB_SUCCESS = 0
         _SUB_FAILED = 0
         _INSTANCES.clear()
         _SUBSCRIPTIONS[:] = []
         for item in _load_pool():
             _INSTANCES[item["code"]] = _new_instance(item["code"], item["plan_amount"])
-        _initial_quote_batch(C, list(_INSTANCES.values()))
+        startup_received_at = time.time()
         for inst in _INSTANCES.values():
             for period in PERIODS:
-                _subscribe(C, inst["code"], period)
+                _STARTUP_EVENT_WATERMARK[(period, inst["code"])] = startup_received_at
+        _initial_quote_batch(C, list(_INSTANCES.values()))
+        for inst in _INSTANCES.values():
+            _subscribe(C, inst["code"], "l2quote")
+        _schedule_l2order_subscriptions(C)
         expected_subscriptions = sum(
             len(PERIODS) for inst in _INSTANCES.values()
             if not inst.get("subscriptions_stopped"))
+        pending_l2order = sum(
+            1 for inst in _INSTANCES.values()
+            if (not inst.get("subscriptions_stopped") and
+                "l2order" not in inst.get("sub_periods", {}).values()))
         skipped_count = sum(1 for inst in _INSTANCES.values()
                             if inst["state"] == STATE_SKIPPED)
-        _log("[运行] subscriptions=%d success=%d failed=%d expected=%d skipped=%d" %
+        _log("[运行] subscriptions=%d success=%d failed=%d expected=%d "
+             "pending_l2order=%d skipped=%d" %
              (len(_SUBSCRIPTIONS), _SUB_SUCCESS, _SUB_FAILED,
-              expected_subscriptions, skipped_count))
+              expected_subscriptions, pending_l2order, skipped_count))
         _schedule_raw_flush()
         _schedule_auction_retry()
         _LAST_SUMMARY = _now()
@@ -1622,7 +1858,7 @@ def deal_callback(ContextInfo, dealInfo):
 
 def stop(C):
     with _LOCK:
-        global _RAW_FLUSH_TIMER, _AUCTION_RETRY_TIMER
+        global _RAW_FLUSH_TIMER, _AUCTION_RETRY_TIMER, _L2ORDER_SUBSCRIBE_TIMER
         if _RAW_FLUSH_TIMER is not None:
             try:
                 C.cancel_schedule_run(_RAW_FLUSH_TIMER)
@@ -1635,6 +1871,12 @@ def stop(C):
             except Exception:
                 pass
             _AUCTION_RETRY_TIMER = None
+        if _L2ORDER_SUBSCRIBE_TIMER is not None:
+            try:
+                C.cancel_schedule_run(_L2ORDER_SUBSCRIBE_TIMER)
+            except Exception:
+                pass
+            _L2ORDER_SUBSCRIBE_TIMER = None
         for inst in _INSTANCES.values():
             _cancel_timer(inst)
             _cancel_order_lookup(inst)

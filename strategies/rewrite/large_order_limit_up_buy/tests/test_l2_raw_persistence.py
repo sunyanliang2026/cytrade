@@ -42,13 +42,38 @@ class L2RawPersistenceTests(unittest.TestCase):
         with mock.patch.object(QMT.time, "time", return_value=received_at):
             QMT._write_raw("000001.SZ", "l2order", payload)
 
-        record = json.loads(QMT._RAW_BUFFER[-1])
+        record = QMT._RAW_BUFFER[-1]
         self.assertEqual(record["received_time"], "10:00:01.234")
         self.assertEqual(record["event_time"], "10:00:00.987")
         self.assertAlmostEqual(record["latency_ms"], 247.0, places=3)
         self.assertEqual(record["data"], payload)
         for field in ("received_at", "event_time_raw", "latency_time_raw"):
             self.assertNotIn(field, record)
+
+    def test_flush_serializes_records_outside_the_callback(self):
+        class RawLog:
+            def __init__(self):
+                self.text = ""
+
+            def write(self, value):
+                self.text += value
+
+            def flush(self):
+                pass
+
+        raw_log = RawLog()
+        old_raw_log = QMT._RAW_LOG
+        QMT._RAW_LOG = raw_log
+        try:
+            QMT._write_raw("000001.SZ", "l2order", {
+                "stime": "100000", "price": 10.0, "volume": 100,
+            }, received_at=QMT.time.time())
+            self.assertIsInstance(QMT._RAW_BUFFER[-1], dict)
+            QMT._flush_raw(1)
+        finally:
+            QMT._RAW_LOG = old_raw_log
+        self.assertEqual(len(QMT._RAW_BUFFER), 0)
+        self.assertEqual(json.loads(raw_log.text)["code"], "000001.SZ")
 
     def test_event_timestamp_falls_back_to_second_precision_stime(self):
         self.assertEqual(QMT._format_event_timestamp("100000"), "10:00:00.000")
