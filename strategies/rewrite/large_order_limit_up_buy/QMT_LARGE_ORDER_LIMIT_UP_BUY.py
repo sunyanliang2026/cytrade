@@ -42,7 +42,8 @@ ORDER_LOOKUP_MAX_ATTEMPTS = 10
 
 PERIODS = ("tick", "l2quote", "l2order")
 DEBUG_SUMMARY_INTERVAL_SECONDS = 60
-DEBUG_LATENCY_WARN_THRESHOLD_MS = 1000.0
+DEBUG_LATENCY_WARN_THRESHOLD_MS = 2000.0
+DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS = 1000.0
 DEBUG_LATENCY_WARN_INTERVAL_SECONDS = 10.0
 MAX_SIGNAL_QUOTE_DELAY_MS = 1000.0
 L2_PERIODS = set(PERIODS[1:])
@@ -240,6 +241,12 @@ def _latency_ms(event_value, received_at):
     return delay_ms if delay_ms >= 0 else None
 
 
+def _latency_warn_threshold(period):
+    if period == "l2order":
+        return DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS
+    return DEBUG_LATENCY_WARN_THRESHOLD_MS
+
+
 def _in_continuous(event_time):
     return "093000" <= event_time < "145700"
 
@@ -300,13 +307,16 @@ def _write_raw(code, period, payload):
         stats["sum_ms"] += latency_ms
         stats["last_ms"] = latency_ms
         stats["max_ms"] = latency_ms if stats["max_ms"] is None else max(stats["max_ms"], latency_ms)
-        if latency_ms > DEBUG_LATENCY_WARN_THRESHOLD_MS:
+        warn_threshold_ms = _latency_warn_threshold(period)
+        if latency_ms > warn_threshold_ms:
             stats["over_threshold"] += 1
             now = _now()
             if now - _LATENCY_LAST_WARN.get(period, 0.0) >= DEBUG_LATENCY_WARN_INTERVAL_SECONDS:
                 _LATENCY_LAST_WARN[period] = now
-                _log("[延时警告] period=%s code=%s delay=%.0fms event_time=%s received_time=%s" %
-                     (period, code, latency_ms, event_time or "", received_time))
+                _log("[延时警告] period=%s code=%s delay=%.0fms threshold=%.0fms "
+                     "event_time=%s received_time=%s" %
+                     (period, code, latency_ms, warn_threshold_ms,
+                      event_time or "", received_time))
     if period not in _FIRST_CALLBACKS:
         _FIRST_CALLBACKS[period] = {
             "code": code, "event_time": event_time, "received_at": received_at,
@@ -1410,8 +1420,10 @@ def _summary():
         average = stats.get("sum_ms", 0.0) / valid if valid else None
         maximum = stats.get("max_ms")
         latest = stats.get("last_ms")
-        latency_parts.append("%s:%d/%d,>1s=%d,avg=%s,max=%s,last=%s" %
-                             (period, valid, samples, stats.get("over_threshold", 0),
+        threshold_seconds = _latency_warn_threshold(period) / 1000.0
+        latency_parts.append("%s:%d/%d,>%.0fs=%d,avg=%s,max=%s,last=%s" %
+                             (period, valid, samples, threshold_seconds,
+                              stats.get("over_threshold", 0),
                               "%.0fms" % average if average is not None else "n/a",
                               "%.0fms" % maximum if maximum is not None else "n/a",
                               "%.0fms" % latest if latest is not None else "n/a"))
@@ -1427,7 +1439,8 @@ def _summary():
          (len(_INSTANCES), _COUNTERS["orders"], _COUNTERS["deals"], _COUNTERS["cancels"],
           _COUNTERS["l2"], _COUNTERS["quotes"], _SUB_SUCCESS, _SUB_FAILED,
           period_counts, "%d/%d[%s]" % (len(_FIRST_CALLBACKS), len(PERIODS), first_callbacks),
-          ";".join(latency_parts), len(_RAW_BUFFER), _RAW_DROPPED, last_events,
+          ";".join(latency_parts), len(_RAW_BUFFER), _RAW_DROPPED,
+          last_events,
           ";".join("%s:%s" % (k, ",".join(v)) for k, v in sorted(by_state.items()))))
     _log("[涨停首报汇总] %s" % _limit_up_first_summary())
 
@@ -1468,8 +1481,11 @@ def init(C):
         _log("[运行] raw_log_path=%s" % (_RAW_LOG_PATH or "<unavailable>"))
         _log("[运行] ENABLE_LIVE_ORDERS=%s PERIODS=%s" %
              (ENABLE_LIVE_ORDERS, ",".join(PERIODS)))
-        _log("[运行] latency_warning_threshold=%.0fms warn_interval=%ss" %
-             (DEBUG_LATENCY_WARN_THRESHOLD_MS, DEBUG_LATENCY_WARN_INTERVAL_SECONDS))
+        _log("[运行] latency_warning_thresholds=tick:%.0fms,l2quote:%.0fms,l2order:%.0fms "
+             "warn_interval=%ss" %
+             (DEBUG_LATENCY_WARN_THRESHOLD_MS, DEBUG_LATENCY_WARN_THRESHOLD_MS,
+              DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS,
+              DEBUG_LATENCY_WARN_INTERVAL_SECONDS))
         _COUNTERS.update({"orders": 0, "deals": 0, "cancels": 0, "l2": 0, "quotes": 0})
         _PERIOD_COUNTS.clear()
         _FIRST_CALLBACKS.clear()
