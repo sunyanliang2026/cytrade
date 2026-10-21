@@ -45,6 +45,8 @@ class QMTOrderCallbackTests(unittest.TestCase):
         self.inst = QMT._new_instance("000001.SZ", 10000)
         self.inst["state"] = QMT.STATE_READY
         self.inst["limit_up"] = 10.0
+        self.inst["open_price"] = 10.0
+        self.inst["day_low"] = 9.8
         QMT._INSTANCES[self.inst["code"]] = self.inst
         QMT._schedule_order_lookup = lambda _inst: None
 

@@ -52,6 +52,8 @@ class LargeOrderTriggerPathTests(unittest.TestCase):
         inst = QMT._new_instance("000001.SZ", 10000)
         inst["state"] = state
         inst["limit_up"] = 10.0
+        inst["open_price"] = 10.0
+        inst["day_low"] = 9.8
         QMT._INSTANCES[inst["code"]] = inst
         return inst
 
@@ -86,6 +88,40 @@ class LargeOrderTriggerPathTests(unittest.TestCase):
 
         self.assertIsNone(self.inst["submit_reason"])
         self.assertIsNone(self.inst["validation_order_id"])
+
+    def test_first_seal_large_order_requires_opening_low_filter(self):
+        self.inst["open_price"] = 10.0
+        self.inst["day_low"] = 9.85
+        self._order("low_at_threshold")
+
+        self.assertEqual(self.calls, [])
+
+        # The next L2 order callback uses the latest cached low; it does not wait
+        # for another quote callback once the opening-low filter is satisfied.
+        self.inst["day_low"] = 9.849
+        self._order("low_below_threshold")
+
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.inst["submit_reason"], "首封大单")
+
+    def test_intraday_snapshot_primes_filter_for_first_l2order(self):
+        self.inst["last_close"] = 9.9
+        self.inst["name"] = "test"
+        snapshot = {
+            self.inst["code"]: {
+                "stime": "100000",
+                "open": 10.0,
+                "low": 9.84,
+                "lastPrice": 9.95,
+            }
+        }
+
+        QMT._initial_quote(object(), self.inst, snapshot)
+        self.assertEqual(self.inst["day_low"], 9.84)
+
+        self._order("first_l2order_after_snapshot")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.inst["submit_reason"], "首封大单")
 
     def test_l2quote_amount_keeps_lots_to_shares_conversion(self):
         self.assertEqual(QMT._amount(10.0, 10000), 10000000.0)

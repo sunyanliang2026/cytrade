@@ -222,7 +222,23 @@ def _event_has_milliseconds(value=None):
 
 
 def _format_local_timestamp(timestamp):
-    return _dt.datetime.fromtimestamp(timestamp).strftime("%Y%m%d%H%M%S.%f")[:-3]
+    return _dt.datetime.fromtimestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
+
+
+def _format_event_timestamp(value=None):
+    """Format a QMT event timestamp as HH:MM:SS.mmm for raw records."""
+    seconds = _event_seconds(value)
+    if seconds is None:
+        return ""
+    whole_seconds = int(seconds)
+    milliseconds = int(round((seconds - whole_seconds) * 1000.0))
+    if milliseconds >= 1000:
+        whole_seconds += 1
+        milliseconds = 0
+    whole_seconds %= 24 * 60 * 60
+    hour, remainder = divmod(whole_seconds, 60 * 60)
+    minute, second = divmod(remainder, 60)
+    return "%02d:%02d:%02d.%03d" % (hour, minute, second, milliseconds)
 
 
 def _latency_ms(event_value, received_at):
@@ -283,6 +299,8 @@ def _write_raw(code, period, payload):
     event_value = _field(payload, "stime", "time")
     latency_value = _field(payload, "time", "stime")
     event_time = _event_time(event_value)
+    event_time_display = (_format_event_timestamp(latency_value) or
+                          _format_event_timestamp(event_value))
     latency_ms = _latency_ms(latency_value, received_at)
     _COUNTERS["l2"] += 1
     _PERIOD_COUNTS[period] = _PERIOD_COUNTS.get(period, 0) + 1
@@ -325,10 +343,8 @@ def _write_raw(code, period, payload):
         _log("[回调首条] period=%s code=%s event_time=%s received_time=%s" %
              (period, code, event_time or "", received_time))
     record = {
-        "received_at": received_at, "received_time": received_time,
-        "event_time": event_time,
-        "event_time_raw": str(event_value) if event_value is not None else "",
-        "latency_time_raw": str(latency_value) if latency_value is not None else "",
+        "received_time": received_time,
+        "event_time": event_time_display,
         "latency_ms": latency_ms,
         "code": code, "period": period, "data": payload,
     }
@@ -548,6 +564,12 @@ def _is_large_order_trigger(volume, amount):
     volume = _safe_float(volume) or 0.0
     amount = _safe_float(amount) or 0.0
     return volume > LARGE_ORDER_MIN_VOLUME_SHARES or amount > LARGE_ORDER_MIN_AMOUNT
+
+
+def _opening_low_filter_met(inst):
+    opening = _safe_float(inst.get("open_price"))
+    day_low = _safe_float(inst.get("day_low"))
+    return bool(opening and day_low is not None and day_low < opening * 0.985)
 
 
 def _limit_price(inst, quote=None):
@@ -1243,7 +1265,9 @@ def _handle_l2order(code, payload):
             return
 
         trigger_reason = None
-        if inst["state"] == STATE_READY and _is_large_order_trigger(volume, amount):
+        if (inst["state"] == STATE_READY
+                and _is_large_order_trigger(volume, amount)
+                and _opening_low_filter_met(inst)):
             trigger_reason = "首封大单"
         elif (
             inst["state"] == STATE_WAIT_RESEAL
@@ -1265,7 +1289,8 @@ def _handle_l2order(code, payload):
                 if order_id not in inst["first_large_ids"]:
                     inst["first_large_ids"].add(order_id)
                     inst["first_large_total"] += amount
-            if inst["first_large_total"] > FIRST_LARGE_ORDER_TOTAL_AMOUNT and inst["open_price"] and inst["day_low"] is not None and inst["day_low"] < inst["open_price"] * 0.985:
+            if (inst["first_large_total"] > FIRST_LARGE_ORDER_TOTAL_AMOUNT
+                    and _opening_low_filter_met(inst)):
                 _submit(inst, "首封")
 
 
@@ -1307,11 +1332,12 @@ def _initial_quote(C, inst, full_ticks=None):
         inst["limit_up"] = inst["limit_up"] or _limit_from(data)
         inst["last_close"] = inst["last_close"] or _safe_float(_field(data, "lastClose", "preClose", "pre_close"))
         inst["open_price"] = _safe_float(_field(data, "open", "openPrice"))
-        # Continuous-session low starts with the first valid quote after 09:30.
+        # Do not carry auction or prior-session values into the continuous-session low.
         inst["day_low"] = None
         stime = _event_time(_field(data, "stime", "time"))
         if stime and _in_continuous(stime):
-            _, _, _, last, _ = _quote_values(inst, data, track_day=False)
+            # Seed the cached intraday low before the first l2order can trigger.
+            _, _, _, last, _ = _quote_values(inst, data, track_day=True)
             if _skip_negative_latest(inst, last, "initial_snapshot",
                                      _field(data, "time", "stime", "timestamp"), time.time()):
                 return
