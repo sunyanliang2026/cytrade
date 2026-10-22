@@ -39,7 +39,7 @@ class NegativeQuoteExitTests(unittest.TestCase):
         self.context = FakeContext()
         QMT._log = self.logs.append
         # These tests cover quote decisions after the entry gate has accepted.
-        QMT._freshness_gate = lambda _code, _period, payload, _received_at: (
+        QMT._freshness_gate = lambda _code, _period, payload, _received_at, **_kwargs: (
             True, QMT._field(payload, "time", "stime", "timestamp"), None)
         QMT._C = self.context
         QMT.cancel = lambda *args: self.cancel_calls.append(args)

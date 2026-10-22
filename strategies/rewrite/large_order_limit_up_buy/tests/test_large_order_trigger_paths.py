@@ -30,7 +30,7 @@ class LargeOrderTriggerPathTests(unittest.TestCase):
         QMT._schedule_validation = lambda _inst: None
         QMT._schedule_order_lookup = lambda _inst: None
         # These tests exercise trigger logic downstream of timestamp validation.
-        QMT._freshness_gate = lambda _code, _period, payload, _received_at: (
+        QMT._freshness_gate = lambda _code, _period, payload, _received_at, **_kwargs: (
             True, QMT._field(payload, "time", "stime", "timestamp"), None)
         QMT.passorder = lambda *args: self.calls.append(args) or "501"
         QMT._INSTANCES.clear()

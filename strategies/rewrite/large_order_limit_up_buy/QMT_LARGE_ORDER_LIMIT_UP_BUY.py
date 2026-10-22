@@ -98,6 +98,7 @@ _LATEST_EVENT_EPOCH = {}
 _STARTUP_EVENT_WATERMARK = {}
 _FRESHNESS_DROPS = {}
 _FRESHNESS_LAST_LOG = {}
+_ENTRY_DROPS = {}
 _RAW_BUFFER = deque()
 _RAW_FLUSH_TIMER = None
 _RAW_DROPPED = 0
@@ -317,7 +318,15 @@ def _record_freshness_drop(code, period, reason, event_raw, delay_ms):
         _format_event_timestamp(event_raw) or str(event_raw or "")))
 
 
-def _freshness_gate(code, period, payload, received_at):
+def _record_entry_drop(period, reason):
+    """Count cheap callback rejects without retaining their payloads."""
+    stats = _ENTRY_DROPS.setdefault(period, {"count": 0, "reasons": {}})
+    stats["count"] += 1
+    reasons = stats["reasons"]
+    reasons[reason] = reasons.get(reason, 0) + 1
+
+
+def _freshness_gate(code, period, payload, received_at, record_latest=True):
     """Reject event times that cannot safely drive live strategy decisions."""
     event_raw = _field(payload, "time", "stime", "timestamp")
     event_text = "" if event_raw is None else str(event_raw).strip()
@@ -357,8 +366,23 @@ def _freshness_gate(code, period, payload, received_at):
     if previous is not None and event_epoch < previous - 0.001:
         _record_freshness_drop(code, period, "out_of_order", event_raw, delay_ms)
         return False, event_raw, delay_ms
-    _LATEST_EVENT_EPOCH[(period, code)] = max(previous or event_epoch, event_epoch)
+    if record_latest:
+        _record_latest_event(code, period, event_epoch)
     return True, event_raw, delay_ms
+
+
+def _record_latest_event(code, period, event_epoch):
+    key = (period, code)
+    previous = _LATEST_EVENT_EPOCH.get(key)
+    _LATEST_EVENT_EPOCH[key] = max(previous or event_epoch, event_epoch)
+
+
+def _record_accepted_event(code, period, event_raw, received_at):
+    if not _event_has_absolute_milliseconds(event_raw):
+        return
+    event_epoch = _event_epoch_seconds(event_raw, received_at)
+    if event_epoch is not None:
+        _record_latest_event(code, period, event_epoch)
 
 
 def _persist_unverifiable_raw_event(code, period, payload, event_raw, received_at):
@@ -1297,6 +1321,111 @@ def _check_validation(inst):
             _submit(inst, "撤单后跟随")
 
 
+def _quote_scalar(value):
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    return _safe_float(value)
+
+
+def _quote_entry_gate(inst, source):
+    """Return (accepted, event_time, reason) before copying a quote payload."""
+    event_time = _event_time(_field(source, "stime", "time", "timestamp"))
+    if not event_time or not _in_continuous(event_time):
+        return False, event_time, "outside_continuous"
+    if inst["state"] in (STATE_DONE, STATE_SKIPPED):
+        return False, event_time, "terminal_state"
+
+    last = _safe_float(_field(source, "lastPrice", "last", "price", "close"))
+    opening = _safe_float(_field(source, "open", "openPrice"))
+    low = _safe_float(_field(source, "low", "lowest", "lowPrice"))
+    previous_close = (_safe_float(inst.get("last_close")) or
+                      _safe_float(_field(source, "lastClose", "preClose", "pre_close")))
+    # A valid negative return can trigger the existing unsubscribe path even
+    # when the snapshot is missing a bid or upper-limit field.
+    if last and previous_close and last < previous_close:
+        return True, event_time, "negative_return"
+
+    limit_up = (_safe_float(inst.get("limit_up")) or
+                _limit_from(source, inst.get("last_l2quote")))
+    bid = _quote_scalar(_field(source, "bidPrice", "bid", "bid1", "bidPrice1"))
+    if limit_up and bid:
+        bid_at_limit = abs(bid - limit_up) < 1e-8
+        previous_quote = inst.get("last_l2quote", {})
+        previous = previous_quote.get("bid_at_limit")
+        current_bid_vol = _quote_scalar(
+            _field(source, "bidVol", "bidVolume", "bid1_volume", "bidVolume1"))
+        previous_bid_vol = _safe_float(previous_quote.get("bidVol"))
+        queue_growth = bool(
+            bid_at_limit and current_bid_vol and
+            (previous_bid_vol is None or current_bid_vol > previous_bid_vol))
+        if (previous is None or bool(previous) != bid_at_limit or queue_growth or
+                inst["state"] == STATE_WAIT_INITIAL):
+            reason = ("limit_up_queue_growth" if queue_growth else
+                      "limit_up_book" if bid_at_limit else "seal_transition")
+            return True, event_time, reason
+    day_low = _safe_float(inst.get("day_low"))
+    if ((opening and not inst.get("open_price")) or
+            (low and (day_low is None or low < day_low)) or
+            (last and (day_low is None or last < day_low)) or
+            (previous_close and not inst.get("last_close"))):
+        return True, event_time, "seed_price_state"
+    if not limit_up:
+        return False, event_time, "missing_limit_up"
+    if not bid:
+        return False, event_time, "missing_bid"
+    return False, event_time, "unchanged_quote"
+
+
+def _l2order_entry_gate(inst, source, event_raw):
+    """Return (accepted, event_time, reason, event_key) for useful orders."""
+    event_time = _event_time(_field(source, "stime", "time", "timestamp"))
+    if not event_time or not _in_continuous(event_time):
+        return False, event_time, "outside_continuous", None
+    if inst["state"] in (STATE_DONE, STATE_SKIPPED):
+        return False, event_time, "terminal_state", None
+
+    price = _safe_float(_field(source, "price"))
+    if not price:
+        return False, event_time, "invalid_price", None
+    volume = _safe_float(_field(source, "volume"))
+    if not volume:
+        return False, event_time, "invalid_volume", None
+    direction = str(_field(source, "entrustDirection", "direction", "side") or "").upper()
+    if direction not in ("B", "BUY", "1", "买", "买入"):
+        return False, event_time, "not_buy", None
+
+    limit_up = _safe_float(inst.get("limit_up"))
+    if not limit_up:
+        return False, event_time, "missing_limit_up", None
+    if abs(price - limit_up) >= 1e-8:
+        return False, event_time, "off_limit_up", None
+
+    order_id = str(_field(source, "entrustNo", "orderNo", "order_id") or "")
+    event_key = order_id or "event:%s:%s:%s:%s" % (
+        event_raw or event_time, price, volume, direction)
+    if event_key in inst["seen_order_ids"]:
+        return False, event_time, "duplicate", event_key
+    return True, event_time, "limit_up_buy", event_key
+
+
+def _snapshot_entry_gate(inst, source):
+    event_time = _event_time(_field(source, "stime", "time", "timestamp"))
+    if event_time and "092500" <= event_time <= "092505":
+        limit_up = (_safe_float(inst.get("limit_up")) or
+                    _limit_from(source, inst.get("last_l2quote")))
+        bid = _quote_scalar(_field(source, "bidPrice", "bid", "bid1", "bidPrice1"))
+        if limit_up and bid:
+            return True, event_time, "auction_book"
+        return False, event_time, "missing_auction_book"
+    if event_time and _in_continuous(event_time):
+        snapshot_price = (_safe_float(_field(source, "open", "openPrice")) or
+                          _safe_float(_field(source, "low", "lowest", "lowPrice")) or
+                          _safe_float(_field(source, "lastPrice", "last", "price", "close")))
+        if snapshot_price:
+            return True, event_time, "snapshot_price_state"
+    return _quote_entry_gate(inst, source)
+
+
 def _handle_quote(code, period, payload):
     with _LOCK:
         inst = _INSTANCES.get(code)
@@ -1304,14 +1433,19 @@ def _handle_quote(code, period, payload):
             return
         received_at = time.time()
         source = _unwrap(code, payload)
-        fresh, event_raw, _ = _freshness_gate(code, period, source, received_at)
+        fresh, event_raw, _ = _freshness_gate(
+            code, period, source, received_at, record_latest=False)
         if not fresh:
             _persist_unverifiable_raw_event(
                 code, period, payload, event_raw, received_at)
             return
+        accepted, event_time, drop_reason = _quote_entry_gate(inst, source)
+        if not accepted:
+            _record_entry_drop(period, drop_reason)
+            return
+        _record_accepted_event(code, period, event_raw, received_at)
         data = _owned_payload(code, payload)
         is_l2quote = period == "l2quote"
-        event_time = _event_time(event_raw)
         if event_time:
             inst["last_event_time"] = event_time
         received_at = _write_raw(code, period, data, received_at)
@@ -1405,34 +1539,32 @@ def _handle_l2order(code, payload):
             return
         received_at = time.time()
         source = _unwrap(code, payload)
-        fresh, event_raw, _ = _freshness_gate(code, "l2order", source, received_at)
+        fresh, event_raw, _ = _freshness_gate(
+            code, "l2order", source, received_at, record_latest=False)
         if not fresh:
             _persist_unverifiable_raw_event(
                 code, "l2order", payload, event_raw, received_at)
             return
+        accepted, event_time, drop_reason, event_key = _l2order_entry_gate(
+            inst, source, event_raw)
+        if not accepted:
+            _record_entry_drop("l2order", drop_reason)
+            return
+        _record_accepted_event(code, "l2order", event_raw, received_at)
         data = _owned_payload(code, payload)
         received_at = _write_raw(code, "l2order", data, received_at)
         inst["last_signal_period"] = "l2order"
         inst["last_signal_event_raw"] = event_raw
         inst["last_signal_received_at"] = received_at
         inst["last_latency_ms"] = _latency_ms(event_raw, received_at)
-        event_time = _event_time(_field(data, "stime", "time"))
         if event_time:
             inst["last_event_time"] = event_time
-        if not _in_continuous(event_time) or inst["state"] in (STATE_DONE, STATE_SKIPPED):
+        if inst["state"] in (STATE_DONE, STATE_SKIPPED):
             return
         price = _safe_float(_field(data, "price"))
         volume = _safe_float(_field(data, "volume"))
         direction = str(_field(data, "entrustDirection", "direction", "side") or "").upper()
         order_id = str(_field(data, "entrustNo", "orderNo", "order_id") or "")
-        if not price or not volume or not inst.get("limit_up") or abs(price - inst["limit_up"]) >= 1e-8:
-            return
-        if direction not in ("B", "BUY", "1", "买", "买入"):
-            return
-        event_key = order_id or "event:%s:%s:%s:%s" % (
-            event_raw or event_time, price, volume, direction)
-        if event_key in inst["seen_order_ids"]:
-            return
         inst["seen_order_ids"].add(event_key)
         seen_queue = inst.setdefault("seen_order_queue", deque())
         seen_queue.append(event_key)
@@ -1555,7 +1687,8 @@ def _initial_quote(C, inst, full_ticks=None):
         data = _unwrap(inst["code"], full)
         snapshot_received_at = time.time()
         fresh, snapshot_event_raw, snapshot_delay_ms = _freshness_gate(
-            inst["code"], "l2quote", data, snapshot_received_at)
+            inst["code"], "l2quote", data, snapshot_received_at,
+            record_latest=False)
         if not fresh:
             _log("[初始快照未通过新鲜度校验] code=%s session_time=%s event_time=%s delay_ms=%s，等待带绝对时间的有效 l2quote" % (
                 inst["code"], _event_time(_field(data, "stime", "time")) or "n/a",
@@ -1563,6 +1696,12 @@ def _initial_quote(C, inst, full_ticks=None):
                 str(snapshot_event_raw or ""),
                 "%.0f" % snapshot_delay_ms if snapshot_delay_ms is not None else "n/a"))
             return
+        accepted, _snapshot_time, drop_reason = _snapshot_entry_gate(inst, data)
+        if not accepted:
+            _record_entry_drop("l2quote", "snapshot_%s" % drop_reason)
+            return
+        _record_accepted_event(
+            inst["code"], "l2quote", snapshot_event_raw, snapshot_received_at)
         inst["last_l2quote"] = {
             "time": _field(data, "time"),
             "stime": _field(data, "stime"),
@@ -1622,6 +1761,13 @@ def _summary():
     freshness_drops = ",".join(
         "%s:%d" % (period, _FRESHNESS_DROPS.get(period, {}).get("count", 0))
         for period in PERIODS)
+    entry_drops = ",".join(
+        "%s:%d[%s]" % (
+            period,
+            _ENTRY_DROPS.get(period, {}).get("count", 0),
+            ",".join("%s=%d" % item for item in sorted(
+                _ENTRY_DROPS.get(period, {}).get("reasons", {}).items())) or "none")
+        for period in PERIODS)
     latency_parts = []
     for period in PERIODS:
         stats = _LATENCY_STATS.get(period, {})
@@ -1645,11 +1791,13 @@ def _summary():
             "%.0fms" % gaps.get("max_ms") if gap_count else "n/a",
             len([key for key in _LAST_RECEIVED_AT if key[0] == period]))
     _log("[汇总] 监控=%d 下单=%d 成交=%d 撤单=%d L2=%d 订阅=%d成功/%d失败 "
-         "回调=%s 首条=%s 延时=%s 缓冲=%d 丢弃=%d freshness_drop=%s 最近事件=%s 状态=%s" %
+         "回调=%s 首条=%s 延时=%s 缓冲=%d 丢弃=%d freshness_drop=%s "
+         "entry_drop=%s 最近事件=%s 状态=%s" %
          (len(_INSTANCES), _COUNTERS["orders"], _COUNTERS["deals"], _COUNTERS["cancels"],
           _COUNTERS["l2"], _SUB_SUCCESS, _SUB_FAILED,
           period_counts, "%d/%d[%s]" % (len(_FIRST_CALLBACKS), len(PERIODS), first_callbacks),
           ";".join(latency_parts), len(_RAW_BUFFER), _RAW_DROPPED, freshness_drops,
+          entry_drops,
           last_events,
           ";".join("%s:%s" % (k, ",".join(v)) for k, v in sorted(by_state.items()))))
 
@@ -1708,6 +1856,7 @@ def init(C):
         _STARTUP_EVENT_WATERMARK.clear()
         _FRESHNESS_DROPS.clear()
         _FRESHNESS_LAST_LOG.clear()
+        _ENTRY_DROPS.clear()
         _RAW_BUFFER.clear()
         _RAW_FLUSH_TIMER = None
         _RAW_DROPPED = 0

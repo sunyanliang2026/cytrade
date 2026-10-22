@@ -20,6 +20,7 @@ class FreshnessGateTests(unittest.TestCase):
         QMT._STARTUP_EVENT_WATERMARK.clear()
         QMT._FRESHNESS_DROPS.clear()
         QMT._FRESHNESS_LAST_LOG.clear()
+        QMT._ENTRY_DROPS.clear()
 
     def tearDown(self):
         QMT._log = self.old_log
@@ -135,6 +136,113 @@ class FreshnessGateTests(unittest.TestCase):
                 self.assertEqual(
                     QMT._FRESHNESS_DROPS["l2quote"]["last_reason"],
                     "unverifiable_event_time")
+
+    def test_l2order_entry_filters_irrelevant_and_duplicate_orders_before_copy(self):
+        inst = QMT._new_instance("000001.SZ", 10000)
+        inst.update({"state": QMT.STATE_READY, "limit_up": 10.0,
+                     "open_price": 10.0, "day_low": 9.8})
+        QMT._INSTANCES[inst["code"]] = inst
+        old_gate = QMT._freshness_gate
+        QMT._freshness_gate = lambda _code, _period, payload, _received_at, **_kwargs: (
+            True, QMT._field(payload, "time", "stime", "timestamp"), None)
+        try:
+            invalid_orders = (
+                {"stime": "100000", "price": 10.0, "volume": 1000,
+                 "direction": "S", "entrustNo": "sell"},
+                {"stime": "100001", "price": 9.99, "volume": 1000,
+                 "direction": "B", "entrustNo": "off-limit"},
+                {"stime": "100002", "price": 10.0, "volume": 0,
+                 "direction": "B", "entrustNo": "empty-volume"},
+                {"stime": "092959", "price": 10.0, "volume": 1000,
+                 "direction": "B", "entrustNo": "auction"},
+            )
+            with mock.patch.object(
+                    QMT, "_owned_payload", wraps=QMT._owned_payload) as owned_payload:
+                with mock.patch.object(QMT, "_write_raw", wraps=QMT._write_raw) as write_raw:
+                    for payload in invalid_orders:
+                        QMT._handle_l2order(inst["code"], payload)
+
+                    valid = {
+                        "stime": "100003", "price": 10.0, "volume": 1000,
+                        "direction": "B", "entrustNo": "valid-buy",
+                    }
+                    QMT._handle_l2order(inst["code"], valid)
+                    duplicate = dict(valid, volume=900001, stime="100004")
+                    QMT._handle_l2order(inst["code"], duplicate)
+
+                    self.assertEqual(owned_payload.call_count, 1)
+                    self.assertEqual(write_raw.call_count, 1)
+        finally:
+            QMT._freshness_gate = old_gate
+
+        self.assertEqual(len(QMT._RAW_BUFFER), 1)
+        self.assertEqual(len(inst["l2order_history"]), 1)
+        self.assertEqual(inst["last_signal_event_raw"], "100003")
+        self.assertEqual(inst["seen_order_ids"], {"valid-buy"})
+        self.assertEqual(QMT._ENTRY_DROPS["l2order"]["count"], 5)
+        self.assertEqual(QMT._ENTRY_DROPS["l2order"]["reasons"]["duplicate"], 1)
+
+    def test_quote_entry_skips_empty_quote_and_keeps_price_fields_that_seed_filter(self):
+        inst = QMT._new_instance("000001.SZ", 10000)
+        inst.update({"state": QMT.STATE_READY, "limit_up": 11.0,
+                     "last_close": 10.0})
+        QMT._INSTANCES[inst["code"]] = inst
+        old_gate = QMT._freshness_gate
+        QMT._freshness_gate = lambda _code, _period, payload, _received_at, **_kwargs: (
+            True, QMT._field(payload, "time", "stime", "timestamp"), None)
+        try:
+            with mock.patch.object(
+                    QMT, "_owned_payload", wraps=QMT._owned_payload) as owned_payload:
+                with mock.patch.object(QMT, "_write_raw", wraps=QMT._write_raw) as write_raw:
+                    QMT._handle_quote(inst["code"], "l2quote", {
+                        "stime": "100000", "upLimit": 11.0, "lastClose": 10.0,
+                    })
+                    self.assertEqual(owned_payload.call_count, 0)
+                    self.assertEqual(write_raw.call_count, 0)
+
+                    # The bid is absent, but these fresh fields seed the
+                    # opening-low filter used by large-order decisions.
+                    QMT._handle_quote(inst["code"], "l2quote", {
+                        "stime": "100001", "upLimit": 11.0, "lastClose": 10.0,
+                        "open": 10.0, "low": 9.8, "lastPrice": 10.2,
+                    })
+                    self.assertEqual(owned_payload.call_count, 1)
+                    self.assertEqual(write_raw.call_count, 1)
+        finally:
+            QMT._freshness_gate = old_gate
+
+        self.assertEqual(len(QMT._RAW_BUFFER), 1)
+        self.assertEqual(inst["open_price"], 10.0)
+        self.assertEqual(inst["day_low"], 9.8)
+        self.assertEqual(inst["last_event_time"], "100001")
+        self.assertEqual(QMT._ENTRY_DROPS["l2quote"]["reasons"]["missing_bid"], 1)
+
+    def test_irrelevant_quote_does_not_advance_out_of_order_watermark(self):
+        inst = QMT._new_instance("000001.SZ", 10000)
+        inst.update({"state": QMT.STATE_READY, "limit_up": 11.0,
+                     "last_close": 10.0, "day_low": 9.0})
+        QMT._INSTANCES[inst["code"]] = inst
+        received_at = QMT._dt.datetime(2026, 10, 21, 10, 0, 2).timestamp()
+        newer_irrelevant = received_at - 0.100
+        older_useful = received_at - 0.150
+
+        with mock.patch.object(QMT.time, "time", return_value=received_at):
+            QMT._handle_quote(inst["code"], "l2quote", {
+                "time": str(int(newer_irrelevant * 1000)),
+                "stime": "20261021100001.900", "upLimit": 11.0,
+            })
+            self.assertNotIn(("l2quote", inst["code"]), QMT._LATEST_EVENT_EPOCH)
+
+            QMT._handle_quote(inst["code"], "l2quote", {
+                "time": str(int(older_useful * 1000)),
+                "stime": "20261021100001.850", "upLimit": 11.0,
+                "bidPrice": [11.0], "bidVol": [5000],
+            })
+
+        self.assertEqual(len(QMT._RAW_BUFFER), 1)
+        self.assertAlmostEqual(
+            QMT._LATEST_EVENT_EPOCH[("l2quote", inst["code"])], older_useful, places=3)
+        self.assertEqual(QMT._ENTRY_DROPS["l2quote"]["reasons"]["missing_bid"], 1)
 
     def test_unverifiable_l2order_is_persisted_without_order_decision(self):
         inst = QMT._new_instance("000001.SZ", 10000)

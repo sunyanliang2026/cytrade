@@ -41,7 +41,7 @@ class QMTOrderCallbackTests(unittest.TestCase):
         QMT.ENABLE_LIVE_ORDERS = True
         QMT._wall_seconds_since_midnight = lambda: 36001.5
         # These tests focus on order validation and callback state transitions.
-        QMT._freshness_gate = lambda _code, _period, payload, _received_at: (
+        QMT._freshness_gate = lambda _code, _period, payload, _received_at, **_kwargs: (
             True, QMT._field(payload, "time", "stime", "timestamp"), None)
         QMT._C = self.context
         QMT._INSTANCES.clear()
