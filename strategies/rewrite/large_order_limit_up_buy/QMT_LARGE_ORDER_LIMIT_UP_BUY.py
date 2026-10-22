@@ -9,6 +9,7 @@ import csv
 from collections import deque
 import datetime as _dt
 import json
+import math
 import os
 import time
 
@@ -55,7 +56,11 @@ RAW_BUFFER_MAX_RECORDS = 20000
 RAW_FLUSH_INTERVAL_SECONDS = 0.5
 RAW_FLUSH_BATCH = 500
 SEEN_ORDER_KEY_MAX_COUNT = 1000
-L2ORDER_SUBSCRIBE_SECONDS = 9 * 60 * 60 + 29 * 60 + 50
+L2ORDER_SUBSCRIBE_SECONDS = 9 * 60 * 60 + 30 * 60 + 20
+L2ORDER_SUBSCRIBE_GAIN = 0.07
+L2ORDER_SUBSCRIBE_RETRY_SECONDS = 1.0
+L2ORDER_SUBSCRIBE_MAX_ATTEMPTS = 3
+L2ORDER_SUBSCRIBE_BATCH = 10
 L2_PERIODS = set(PERIODS)
 VALIDATED_SUBMIT_REASONS = frozenset(("首封", "首封大单", "回封", "回封大单"))
 STATE_WAIT_INITIAL = "WAIT_INITIAL_QUOTE"
@@ -88,6 +93,7 @@ _DAY = ""
 _LAST_SUMMARY = 0.0
 _COUNTERS = {"orders": 0, "deals": 0, "cancels": 0, "l2": 0}
 _PERIOD_COUNTS = {}
+_CALLBACK_COUNTS = {}
 _FIRST_CALLBACKS = {}
 _LAST_EVENT_TIMES = {}
 _LATENCY_STATS = {}
@@ -561,27 +567,101 @@ def _schedule_raw_flush():
         _log("[日志] 原始数据定时落盘创建失败 %r" % (exc,))
 
 
-def _subscribe_l2order_now(C):
-    """Attach l2order only when it can contribute to continuous-session logic."""
+def _cache_l2order_quote(inst, source, event_raw, received_at):
+    """Keep a separate price watermark before the business quote filter."""
+    if (inst.get("subscriptions_stopped") or
+            inst["state"] in (STATE_DONE, STATE_SKIPPED) or
+            "l2order" in inst.get("sub_periods", {}).values() or
+            not _event_has_absolute_milliseconds(event_raw)):
+        return
+    epoch = _event_epoch_seconds(event_raw, received_at)
+    previous = inst.get("l2order_candidate")
+    if epoch is None or (previous and epoch < previous[0]):
+        return
+    if not _in_continuous(_dt.datetime.fromtimestamp(epoch).strftime("%H%M%S")):
+        return
+    last = _safe_float(_field(source, "lastPrice", "last", "price", "close"))
+    previous_close = (_safe_float(inst.get("last_close")) or
+                      _safe_float(_field(source, "lastClose", "preClose", "pre_close")))
+    # A newer incomplete price invalidates the previous candidate; never carry
+    # an old above-threshold price across a newer quote with unknown prices.
+    inst["l2order_candidate"] = (epoch, last, previous_close)
+
+
+def _try_subscribe_l2order(C, inst, received_at=None):
+    """Request once above 7%, retain after opening, and bound failure retries."""
+    if (C is None or inst.get("subscriptions_stopped") or
+            inst["state"] in (STATE_DONE, STATE_SKIPPED) or
+            "l2order" in inst.get("sub_periods", {}).values()):
+        return False
+    received_at = time.time() if received_at is None else received_at
+    now = _dt.datetime.fromtimestamp(received_at)
+    seconds = now.hour * 3600 + now.minute * 60 + now.second
+    session_time = now.strftime("%H%M%S")
+    if (seconds < L2ORDER_SUBSCRIBE_SECONDS or
+            not _in_continuous(session_time) or "113000" <= session_time < "130000"):
+        return False
+    candidate = inst.get("l2order_candidate")
+    if not candidate:
+        return False
+    epoch, last, previous_close = candidate
+    delay_ms = (received_at - epoch) * 1000.0
+    if (delay_ms < -FRESHNESS_FUTURE_TOLERANCE_MS or
+            delay_ms > FRESHNESS_MAX_DELAY_MS["l2quote"] or
+            not last or not previous_close or
+            not math.isfinite(last) or not math.isfinite(previous_close) or
+            last - previous_close * (1.0 + L2ORDER_SUBSCRIBE_GAIN) <= 1e-8):
+        return False
+    attempts = inst.get("l2order_sub_attempts", 0)
+    requested_at = inst.get("l2order_requested_at")
+    if (attempts >= L2ORDER_SUBSCRIBE_MAX_ATTEMPTS or
+            (requested_at is not None and
+             received_at - requested_at < L2ORDER_SUBSCRIBE_RETRY_SECONDS)):
+        return False
+    inst["l2order_sub_attempts"] = attempts + 1
+    inst["l2order_requested_at"] = received_at
+    started = _now()
+    _subscribe(C, inst["code"], "l2order")
+    registered = "l2order" in inst.get("sub_periods", {}).values()
+    _log("[L2ORDER_REQUEST] code=%s reason=gain_gt_7pct gain=%.2f%% "
+         "event_time=%s quote_delay_ms=%.0f attempt=%d/%d "
+         "registered=%s call_ms=%.1f" % (
+             inst["code"], (last / previous_close - 1.0) * 100.0,
+             _format_local_timestamp(epoch), delay_ms, attempts + 1,
+             L2ORDER_SUBSCRIBE_MAX_ATTEMPTS, registered,
+             (_now() - started) * 1000.0))
+    return True
+
+
+def _subscribe_l2order_now(C, pending=None):
+    """At the opening boundary, check fresh candidates in bounded batches."""
     global _L2ORDER_SUBSCRIBE_TIMER
     _L2ORDER_SUBSCRIBE_TIMER = None
-    for inst in list(_INSTANCES.values()):
-        if inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
-            continue
-        if "l2order" not in inst.get("sub_periods", {}).values():
-            _subscribe(C, inst["code"], "l2order")
-    _log("[SUBSCRIBE] l2order current-session fan-out complete success=%d failed=%d" %
-         (_SUB_SUCCESS, _SUB_FAILED))
+    codes = list(_INSTANCES) if pending is None else pending
+    requested = 0
+    for index, code in enumerate(codes):
+        inst = _INSTANCES.get(code)
+        if inst and _try_subscribe_l2order(C, inst):
+            requested += 1
+        if requested >= L2ORDER_SUBSCRIBE_BATCH and index + 1 < len(codes):
+            remaining = codes[index + 1:]
+            try:
+                _L2ORDER_SUBSCRIBE_TIMER = C.schedule_run(
+                    lambda ContextInfo, rest=remaining: _subscribe_l2order_now(ContextInfo, rest),
+                    _dt.datetime.now() + _dt.timedelta(milliseconds=100),
+                    repeat_times=0, name="qmt_l2order_subscribe")
+            except Exception as exc:
+                _log("[SUBSCRIBE] l2order batch timer failed %r; wait for fresh quotes" % (exc,))
+            return
 
 
 def _schedule_l2order_subscriptions(C):
-    """Schedule the l2order fan-out just before continuous trading starts."""
+    """Before 09:30:20 keep only quotes; never fall back to early fan-out."""
     global _L2ORDER_SUBSCRIBE_TIMER
     now = _dt.datetime.now()
-    now_seconds = (now.hour * 3600 + now.minute * 60 + now.second +
-                   now.microsecond / 1000000.0)
+    now_seconds = now.hour * 3600 + now.minute * 60 + now.second
     close_seconds = 14 * 60 * 60 + 57 * 60
-    target = now.replace(hour=9, minute=29, second=50, microsecond=0)
+    target = now.replace(hour=9, minute=30, second=20, microsecond=0)
     if L2ORDER_SUBSCRIBE_SECONDS <= now_seconds < close_seconds:
         _subscribe_l2order_now(C)
         return
@@ -591,11 +671,10 @@ def _schedule_l2order_subscriptions(C):
         _L2ORDER_SUBSCRIBE_TIMER = C.schedule_run(
             lambda ContextInfo: _subscribe_l2order_now(ContextInfo), target,
             repeat_times=0, name="qmt_l2order_subscribe")
-        _log("[SUBSCRIBE] l2order delayed until %s to avoid auction replay" %
+        _log("[SUBSCRIBE] l2order eligible from %s, gain>7%%, retain after opening" %
              target.strftime("%Y-%m-%d %H:%M:%S"))
     except Exception as exc:
-        _log("[SUBSCRIBE] delayed l2order timer failed %r; subscribing now" % (exc,))
-        _subscribe_l2order_now(C)
+        _log("[SUBSCRIBE] l2order opening timer failed %r; wait for fresh quotes after 09:30:20" % (exc,))
 
 
 def _auction_retry_timer(ContextInfo):
@@ -705,6 +784,8 @@ def _new_instance(code, amount):
         "order_lookup_timer": None, "order_lookup_attempts": 0,
         "order_lookup_error_logged": False, "pending_order_info": None,
         "sub_ids": [], "sub_periods": {}, "subscriptions_stopped": False,
+        "l2order_candidate": None, "l2order_sub_attempts": 0,
+        "l2order_requested_at": None, "l2order_first_callback_at": None,
         "stale_negative_warned": False,
         "last_signal_period": "", "last_signal_event_raw": None,
         "last_signal_received_at": None,
@@ -1432,6 +1513,7 @@ def _handle_quote(code, period, payload):
         if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
             return
         received_at = time.time()
+        _CALLBACK_COUNTS[period] = _CALLBACK_COUNTS.get(period, 0) + 1
         source = _unwrap(code, payload)
         fresh, event_raw, _ = _freshness_gate(
             code, period, source, received_at, record_latest=False)
@@ -1439,6 +1521,9 @@ def _handle_quote(code, period, payload):
             _persist_unverifiable_raw_event(
                 code, period, payload, event_raw, received_at)
             return
+        if period == "l2quote":
+            _cache_l2order_quote(inst, source, event_raw, received_at)
+            _try_subscribe_l2order(_C, inst, received_at)
         accepted, event_time, drop_reason = _quote_entry_gate(inst, source)
         if not accepted:
             _record_entry_drop(period, drop_reason)
@@ -1538,7 +1623,16 @@ def _handle_l2order(code, payload):
         if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
             return
         received_at = time.time()
+        _CALLBACK_COUNTS["l2order"] = _CALLBACK_COUNTS.get("l2order", 0) + 1
         source = _unwrap(code, payload)
+        requested_at = inst.get("l2order_requested_at")
+        if requested_at is not None and inst.get("l2order_first_callback_at") is None:
+            inst["l2order_first_callback_at"] = received_at
+            delay_ms = _latency_ms(_field(source, "time", "stime", "timestamp"), received_at)
+            _log("[L2ORDER_FIRST_CALLBACK] code=%s request_to_callback_ms=%.0f "
+                 "event_delay_ms=%s" % (
+                     code, (received_at - requested_at) * 1000.0,
+                     "%.0f" % delay_ms if delay_ms is not None else "n/a"))
         fresh, event_raw, _ = _freshness_gate(
             code, "l2order", source, received_at, record_latest=False)
         if not fresh:
@@ -1696,6 +1790,7 @@ def _initial_quote(C, inst, full_ticks=None):
                 str(snapshot_event_raw or ""),
                 "%.0f" % snapshot_delay_ms if snapshot_delay_ms is not None else "n/a"))
             return
+        _cache_l2order_quote(inst, data, snapshot_event_raw, snapshot_received_at)
         accepted, _snapshot_time, drop_reason = _snapshot_entry_gate(inst, data)
         if not accepted:
             _record_entry_drop("l2quote", "snapshot_%s" % drop_reason)
@@ -1801,6 +1896,15 @@ def _summary():
           last_events,
           ";".join("%s:%s" % (k, ",".join(v)) for k, v in sorted(by_state.items()))))
 
+    registered = sum(1 for inst in _INSTANCES.values()
+                     if "l2order" in inst.get("sub_periods", {}).values())
+    first_callback = sum(1 for inst in _INSTANCES.values()
+                         if inst.get("l2order_first_callback_at") is not None)
+    _log("[L2ORDER_COVERAGE] pool=%d registered=%d first_callback=%d "
+         "ingress_quote=%d ingress_order=%d" % (
+             len(_INSTANCES), registered, first_callback,
+             _CALLBACK_COUNTS.get("l2quote", 0), _CALLBACK_COUNTS.get("l2order", 0)))
+
 
 def init(C):
     global _C, _LOG, _RAW_LOG, _LOG_PATH, _RAW_LOG_PATH, _DAY, _LAST_SUMMARY
@@ -1846,6 +1950,7 @@ def init(C):
               DEBUG_LATENCY_WARN_INTERVAL_SECONDS))
         _COUNTERS.update({"orders": 0, "deals": 0, "cancels": 0, "l2": 0})
         _PERIOD_COUNTS.clear()
+        _CALLBACK_COUNTS.clear()
         _FIRST_CALLBACKS.clear()
         _LAST_EVENT_TIMES.clear()
         _LATENCY_STATS.clear()
@@ -1875,9 +1980,13 @@ def init(C):
         _initial_quote_batch(C, list(_INSTANCES.values()))
         for inst in _INSTANCES.values():
             _subscribe(C, inst["code"], "l2quote")
+        _log("[运行] l2order_policy=start:09:30:20,gain>7%%,retain_after_opening; "
+             "retry_interval=%.1fs,max_attempts=%d" % (
+                 L2ORDER_SUBSCRIBE_RETRY_SECONDS, L2ORDER_SUBSCRIBE_MAX_ATTEMPTS))
         _schedule_l2order_subscriptions(C)
         expected_subscriptions = sum(
-            len(PERIODS) for inst in _INSTANCES.values()
+            1 + int("l2order" in inst.get("sub_periods", {}).values())
+            for inst in _INSTANCES.values()
             if not inst.get("subscriptions_stopped"))
         pending_l2order = sum(
             1 for inst in _INSTANCES.values()
@@ -1886,7 +1995,7 @@ def init(C):
         skipped_count = sum(1 for inst in _INSTANCES.values()
                             if inst["state"] == STATE_SKIPPED)
         _log("[运行] subscriptions=%d success=%d failed=%d expected=%d "
-             "pending_l2order=%d skipped=%d" %
+             "watching_l2order_candidates=%d skipped=%d" %
              (len(_SUBSCRIPTIONS), _SUB_SUCCESS, _SUB_FAILED,
               expected_subscriptions, pending_l2order, skipped_count))
         _schedule_raw_flush()
