@@ -1,8 +1,6 @@
 import datetime
 import importlib.util
-import json
 import os
-import tempfile
 import time
 import unittest
 
@@ -40,23 +38,16 @@ class FakeContext(object):
 
 class NativeModelTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
         self.day = datetime.date.today().strftime("%Y%m%d")
         self.model = self._load_model()
-        self.default_qmt_home = self.model.QMT_HOME
-        self.default_order_csv_path = self.model.ORDER_CSV_PATH
+        self.default_plan_trade_date = self.model.PLAN_TRADE_DATE
+        self.default_order_plan = self.model.ORDER_PLAN
         self.default_live_orders = self.model.ENABLE_LIVE_ORDERS
         self.default_account_id = self.model.ACCOUNT_ID
-        self.csv_path = os.path.join(self.temp.name, "orders.csv")
-        self.state_path = os.path.join(self.temp.name, "state.json")
-        self.model.ORDER_CSV_PATH = self.csv_path
-        self.model.STATE_FILE_PATH = self.state_path
+        self.model.PLAN_TRADE_DATE = self.day
+        self.model.ORDER_PLAN = (("603005", 26000),)
         self.model.ENABLE_LIVE_ORDERS = False
         self.model.ACCOUNT_ID = ""
-        self._write_csv("stock_code,amount\n603005,26000\n")
-
-    def tearDown(self):
-        self.temp.cleanup()
 
     def _load_model(self):
         spec = importlib.util.spec_from_file_location("qmt_overnight_native_test", MODEL_PATH)
@@ -64,13 +55,15 @@ class NativeModelTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
-    def _write_csv(self, text):
-        with open(self.csv_path, "w", encoding="utf-8") as handle:
-            handle.write(text)
+    def _set_order_plan(self, *rows):
+        self.model.ORDER_PLAN = tuple(rows)
 
-    def _write_state(self, state):
-        with open(self.state_path, "w", encoding="utf-8") as handle:
-            json.dump(state, handle)
+    def _live_trade_detail(self, account, account_type, kind):
+        if kind == "order":
+            return []
+        if kind == "account":
+            return [{"m_dAvailable": 100000}]
+        return []
 
     def _context(self, **kwargs):
         details = kwargs.pop("details", None)
@@ -81,15 +74,9 @@ class NativeModelTests(unittest.TestCase):
             }}
         return FakeContext(day=self.day, details=details, **kwargs)
 
-    def test_default_paths_target_a_separate_qmt_model_and_csv(self):
-        self.assertEqual(
-            self.default_qmt_home,
-            u"C:/\u5149\u5927\u8bc1\u5238\u91d1\u9633\u5149QMT\u5b9e\u76d8",
-        )
-        self.assertTrue(self.default_order_csv_path.endswith(
-            os.path.join("python", "overnight_orders.csv")
-        ))
-        self.assertNotIn("QMTTEST.py", self.default_order_csv_path)
+    def test_default_live_config_requires_daily_memory_plan(self):
+        self.assertEqual(self.default_plan_trade_date, "")
+        self.assertEqual(self.default_order_plan, ())
         self.assertTrue(self.default_live_orders)
         self.assertEqual(self.default_account_id, "32011276")
 
@@ -106,7 +93,6 @@ class NativeModelTests(unittest.TestCase):
         self._run_preflight(context, datetime.datetime.now().replace(hour=8, minute=31))
         self.assertEqual(self.model._SESSION["phase"], "COMPLETE")
         self.assertEqual(self.model._SESSION["plans"][0]["quantity"], 2000)
-        self.assertFalse(os.path.exists(self.state_path))
         self.assertIsNone(context.scheduled)
 
     def test_start_before_0830_waits_until_submit_time(self):
@@ -120,7 +106,7 @@ class NativeModelTests(unittest.TestCase):
         self.assertEqual(self.model._SESSION["phase"], "COMPLETE")
         
     def test_one_unverified_price_aborts_the_whole_batch(self):
-        self._write_csv("stock_code,amount\n603005,26000\n000530,26000\n")
+        self._set_order_plan(("603005", 26000), ("000530", 26000))
         context = self._context(details={
             "603005.SH": {"TradingDay": self.day, "UpStopPrice": 13.0},
             "000530.SZ": {"TradingDay": self.day},
@@ -152,9 +138,12 @@ class NativeModelTests(unittest.TestCase):
         value = time.mktime(datetime.datetime(2026, 10, 15, 9, 0).timetuple())
         self.assertEqual(self.model._normalize_day(str(int(value))), "20261015")
 
-    def test_existing_same_day_state_aborts_before_price_lookup(self):
-        with open(self.state_path, "w", encoding="utf-8") as handle:
-            json.dump({"trade_days": {self.day: {"status": "reserved"}}}, handle)
+    def test_unidentified_broker_order_aborts_before_price_lookup(self):
+        self.model.ENABLE_LIVE_ORDERS = True
+        self.model.ACCOUNT_ID = "TEST_ACCOUNT"
+        self.model.get_trade_detail_data = lambda account, account_type, kind: (
+            [{"order_id": "unknown"}] if kind == "order" else []
+        )
         context = self._context()
         self.model.init(context)
         self.model._drive(context, now=datetime.datetime.now())
@@ -164,15 +153,14 @@ class NativeModelTests(unittest.TestCase):
     def test_insufficient_live_cash_aborts_before_reservation_or_order(self):
         self.model.ENABLE_LIVE_ORDERS = True
         self.model.ACCOUNT_ID = "TEST_ACCOUNT"
-        self.model.get_trade_detail_data = lambda account, account_type, kind: [
-            {"m_dAvailable": 100}
-        ]
+        self.model.get_trade_detail_data = lambda account, account_type, kind: (
+            [] if kind == "order" else [{"m_dAvailable": 100}]
+        )
         self.model.passorder = lambda *args: self.fail("insufficient cash sent an order")
         context = self._context()
         self.model.init(context)
         self._run_preflight(context, datetime.datetime.now().replace(hour=8, minute=31))
         self.assertEqual(self.model._SESSION["phase"], "ABORTED")
-        self.assertFalse(os.path.exists(self.state_path))
 
     def test_late_after_close_does_not_dispatch(self):
         context = self._context()
@@ -182,7 +170,7 @@ class NativeModelTests(unittest.TestCase):
         self.assertEqual(self.model._SESSION["dispatch_cursor"], 0)
 
     def test_close_time_stops_remaining_dispatch_slices(self):
-        self._write_csv("stock_code,amount\n603005,26000\n603005,26000\n")
+        self._set_order_plan(("603005", 26000), ("603005", 26000))
         self.model.SUBMIT_ROWS_PER_TURN = 1
         context = self._context()
         self.model.init(context)
@@ -201,12 +189,13 @@ class NativeModelTests(unittest.TestCase):
         self.model.ACCOUNT_ID = "TEST_ACCOUNT"
         context = self._context()
         calls = []
-        self.model.get_trade_detail_data = lambda account, account_type, kind: [
-            {"m_dAvailable": 100000}
-        ]
+        self.model.get_trade_detail_data = lambda account, account_type, kind: (
+            [] if kind == "order" else [{"m_dAvailable": 100000}]
+        )
 
         def fake_passorder(*args):
-            self.assertTrue(os.path.isfile(self.state_path))
+            self.assertTrue(self.model._SESSION["startup_orders_clear"])
+            self.assertTrue(self.model._SESSION["reserved"])
             calls.append(args)
             return "123456"
 
@@ -258,33 +247,39 @@ class NativeModelTests(unittest.TestCase):
         self.assertEqual(plan["status"], "callback_received")
         self.assertEqual(plan["order_id"], "9")
 
-    def test_restart_blocks_when_submitted_order_cannot_be_reconciled(self):
+    def test_restart_blocks_when_qmt_reports_this_strategy_order(self):
         self.model.ENABLE_LIVE_ORDERS = True
         self.model.ACCOUNT_ID = "TEST_ACCOUNT"
         context = self._context()
         calls = []
+        orders = []
 
         def fake_trade_detail(account, account_type, kind):
             if kind == "account":
                 return [{"m_dAvailable": 100000}]
             if kind == "order":
-                return []
+                return list(orders)
             return []
 
         self.model.get_trade_detail_data = fake_trade_detail
-        self.model.passorder = lambda *args: calls.append(args) or 0
+
+        def fake_passorder(*args):
+            calls.append(args)
+            orders.append({"m_strStrategyName": self.model.STRATEGY_NAME})
+            return 0
+
+        self.model.passorder = fake_passorder
         now = datetime.datetime.now().replace(hour=8, minute=31)
 
         self.model.init(context)
         self._run_preflight(context, now)
         self.assertEqual(self.model._SESSION["phase"], "MONITORING")
-        self.assertTrue(os.path.isfile(self.state_path))
 
         self.model.init(context)
         self._run_preflight(context, now)
         self.assertEqual(self.model._SESSION["phase"], "ABORTED")
         self.assertEqual(len(calls), 1)
-        self.assertIn("query_records=0", self.model._SESSION["reason"])
+        self.assertIn("strategy order found in query", self.model._SESSION["reason"])
 
     def test_junk_status_without_message_retries_twice(self):
         self.model.ENABLE_LIVE_ORDERS = True
@@ -292,9 +287,7 @@ class NativeModelTests(unittest.TestCase):
         self.model.RETRY_DELAY_MS = 0
         context = self._context()
         calls = []
-        self.model.get_trade_detail_data = lambda account, account_type, kind: [
-            {"m_dAvailable": 100000}
-        ]
+        self.model.get_trade_detail_data = self._live_trade_detail
         self.model.passorder = lambda *args: calls.append(args) or str(len(calls))
         self.model.init(context)
         now = datetime.datetime.now().replace(hour=8, minute=31)
@@ -324,9 +317,7 @@ class NativeModelTests(unittest.TestCase):
         self.model.RETRY_DELAY_MS = 0
         context = self._context()
         calls = []
-        self.model.get_trade_detail_data = lambda account, account_type, kind: [
-            {"m_dAvailable": 100000}
-        ]
+        self.model.get_trade_detail_data = self._live_trade_detail
         self.model.passorder = lambda *args: calls.append(args) or str(len(calls))
         self.model.init(context)
         now = datetime.datetime.now().replace(hour=8, minute=31)
@@ -353,9 +344,7 @@ class NativeModelTests(unittest.TestCase):
         self.model.ACCOUNT_ID = "TEST_ACCOUNT"
         context = self._context()
         calls = []
-        self.model.get_trade_detail_data = lambda account, account_type, kind: [
-            {"m_dAvailable": 100000}
-        ]
+        self.model.get_trade_detail_data = self._live_trade_detail
         self.model.passorder = lambda *args: calls.append(args) or str(len(calls))
         self.model.init(context)
         now = datetime.datetime.now().replace(hour=8, minute=31)
@@ -386,9 +375,7 @@ class NativeModelTests(unittest.TestCase):
         self.model.ACCOUNT_ID = "TEST_ACCOUNT"
         context = self._context()
         calls = []
-        self.model.get_trade_detail_data = lambda account, account_type, kind: [
-            {"m_dAvailable": 100000}
-        ]
+        self.model.get_trade_detail_data = self._live_trade_detail
         self.model.passorder = lambda *args: calls.append(args) or str(len(calls))
         self.model.init(context)
         now = datetime.datetime.now().replace(hour=8, minute=31)
@@ -410,9 +397,7 @@ class NativeModelTests(unittest.TestCase):
         self.model.ACCOUNT_ID = "TEST_ACCOUNT"
         context = self._context()
         calls = []
-        self.model.get_trade_detail_data = lambda account, account_type, kind: [
-            {"m_dAvailable": 100000}
-        ]
+        self.model.get_trade_detail_data = self._live_trade_detail
         self.model.passorder = lambda *args: calls.append(args) or str(len(calls))
         self.model.init(context)
         now = datetime.datetime.now().replace(hour=8, minute=31)
@@ -440,41 +425,25 @@ class NativeModelTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(plan["status"], "partial_filled")
 
-    def test_changed_csv_releases_only_a_verified_zero_fill_junk_order(self):
+    def test_existing_strategy_order_blocks_changed_memory_plan(self):
         self.model.ENABLE_LIVE_ORDERS = True
         self.model.ACCOUNT_ID = "TEST_ACCOUNT"
-        self._write_csv("stock_code,amount\n603278,10000\n")
-        self._write_state({"trade_days": {self.day: {
-            "status": "stopped_monitoring",
-            "orders": {"2": {
-                "stock_code": "603005.SH",
-                "amount": 26000.0,
-                "limit_up_price": 13.0,
-                "quantity": 2000,
-                "attempts": 1,
-                "last_token": "old-token",
-                "order_id": "old-id",
-                "status": "callback_received",
-            }},
-        }}})
+        self._set_order_plan(("603278", 10000))
         context = self._context(details={
             "603278.SH": {"TradingDay": self.day, "UpStopPrice": 13.0},
         })
         calls = []
+        order = {
+            "m_strStrategyName": (
+                "overnight_limit_up_buy_native_&&&_old-token_&&&_OVERNIGHT_LIMIT_UP_BUY"
+            ),
+        }
 
         def fake_trade_detail(account, account_type, kind):
             if kind == "account":
                 return [{"m_dAvailable": 100000}]
             if kind == "order":
-                return [{
-                    "order_id": "old-id",
-                    "order_remark": "old-token",
-                    "stock_code": "603005.SH",
-                    "order_volume": 2000,
-                    "price": 13.0,
-                    "order_status": 57,
-                    "traded_volume": 0,
-                }]
+                return [order]
             return []
 
         self.model.get_trade_detail_data = fake_trade_detail
@@ -482,39 +451,21 @@ class NativeModelTests(unittest.TestCase):
         self.model.init(context)
         self._run_preflight(context, datetime.datetime.now().replace(hour=8, minute=31))
 
-        self.assertEqual(self.model._SESSION["phase"], "MONITORING")
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][3], "603278.SH")
+        self.assertEqual(self.model._SESSION["phase"], "ABORTED")
+        self.assertIn("strategy order found in query", self.model._SESSION["reason"])
+        self.assertEqual(self.model._SESSION["preflight_cursor"], 0)
+        self.assertEqual(calls, [])
 
-    def test_qmt_order_sysid_reconciles_legacy_rejected_order(self):
+    def test_identified_unrelated_order_does_not_block_memory_plan(self):
         self.model.ENABLE_LIVE_ORDERS = True
         self.model.ACCOUNT_ID = "TEST_ACCOUNT"
-        self._write_csv("stock_code,amount\n603278,10000\n")
-        self._write_state({"trade_days": {self.day: {
-            "status": "stopped_monitoring",
-            "orders": {"2": {
-                "stock_code": "603197.SH",
-                "amount": 10000.0,
-                "limit_up_price": 32.33,
-                "quantity": 300,
-                "attempts": 1,
-                "last_token": "old-token",
-                "order_id": "xt1209008129",
-                "status": "callback_received",
-            }},
-        }}})
+        self._set_order_plan(("603278", 10000))
         context = self._context(details={
             "603278.SH": {"TradingDay": self.day, "UpStopPrice": 12.5},
         })
         calls = []
         order = type("XtOrder", (), {
-            "stock_code": "603197.SH",
-            "order_sysid": "xt1209008129",
-            "order_volume": 300,
-            "price": 32.33,
-            "order_status": 57,
-            "traded_volume": 0,
-            "strategy_name": "overnight_limit_up_buy_native_&&&_old-token_&&&_OVERNIGHT_LIMIT_UP_BUY",
+            "strategy_name": "another_strategy",
         })()
 
         def fake_trade_detail(account, account_type, kind):
@@ -533,22 +484,9 @@ class NativeModelTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][3], "603278.SH")
 
-    def test_same_csv_restart_resumes_retry_count_after_verified_junk(self):
+    def test_order_query_unavailable_blocks_live_start(self):
         self.model.ENABLE_LIVE_ORDERS = True
         self.model.ACCOUNT_ID = "TEST_ACCOUNT"
-        self._write_state({"trade_days": {self.day: {
-            "status": "stopped_monitoring",
-            "orders": {"2": {
-                "stock_code": "603005.SH",
-                "amount": 26000.0,
-                "limit_up_price": 13.0,
-                "quantity": 2000,
-                "attempts": 1,
-                "last_token": "old-token",
-                "order_id": "old-id",
-                "status": "callback_received",
-            }},
-        }}})
         context = self._context()
         calls = []
 
@@ -556,27 +494,17 @@ class NativeModelTests(unittest.TestCase):
             if kind == "account":
                 return [{"m_dAvailable": 100000}]
             if kind == "order":
-                return [{
-                    "order_id": "old-id",
-                    "order_remark": "old-token",
-                    "stock_code": "603005.SH",
-                    "order_volume": 2000,
-                    "price": 13.0,
-                    "order_status": 57,
-                    "traded_volume": 0,
-                }]
+                return None
             return []
 
         self.model.get_trade_detail_data = fake_trade_detail
-        self.model.passorder = lambda *args: calls.append(args) or "new-id"
+        self.model.passorder = lambda *args: calls.append(args) or "blocked"
         self.model.init(context)
-        self._run_preflight(context, datetime.datetime.now().replace(hour=8, minute=31))
+        self._run_preflight(context, datetime.datetime.now())
 
-        plan = self.model._SESSION["plans"][0]
-        self.assertEqual(self.model._SESSION["phase"], "DISPATCHING")
-        self.assertEqual(plan["attempts"], 1)
-        self.assertEqual(plan["status"], "retry_wait")
-        self.assertIn(plan["row_no"], self.model._SESSION["retry_due"])
+        self.assertEqual(self.model._SESSION["phase"], "ABORTED")
+        self.assertIn("startup order query is unavailable", self.model._SESSION["reason"])
+        self.assertEqual(self.model._SESSION["preflight_cursor"], 0)
         self.assertEqual(calls, [])
 
 

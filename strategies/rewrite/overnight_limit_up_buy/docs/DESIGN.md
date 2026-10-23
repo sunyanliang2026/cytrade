@@ -2,7 +2,7 @@
 
 ## 行为
 
-模型读取 `stock_code,amount` 两列 CSV，每行是一笔独立买单，允许同一股票重复出现。下单价取 QMT `ContextInfo.get_instrument_detail()` 返回的有效 `UpStopPrice`；股数按预算除以涨停价向下取整至 100 股。任何 CSV、价格、整手或可用资金检查失败，整批都不会发单。
+当日输入配置在入口常量 `PLAN_TRADE_DATE` 和 `ORDER_PLAN` 中。计划支持 `(stock_code, amount)` 二元组或含 `stock_code`、`amount` 的字典；交易日必须是 `YYYYMMDD` 且匹配本机日期。默认日期和计划均为空，未配置或计划无效时模型停止。QMT 升级后不再从模型中读取 CSV 或其他文件。下单价取 QMT `ContextInfo.get_instrument_detail()` 返回的有效 `UpStopPrice`；股数按预算除以涨停价向下取整至 100 股。任何计划、价格、整手或可用资金检查失败，整批都不会发单。
 
 启动后按最多 5 行为一片处理预检，提交也按最多 5 笔一片执行。计划行和失败原因随预检分片输出，末尾只打印汇总。模型不使用线程、线程池、`sleep` 或回调参数保存状态。`init`、定时器和交易回调间的状态保存在脚本全局容器。模型不调用交易日历接口，也不会因日历服务返回上一交易日而中止；详情中的 `TradingDay` 仅作提示，`UpStopPrice` 有效即可继续。模型在整批中止、模拟提交完成或收盘后取消定时任务；实盘提交后定时任务保留到收盘，以处理异步拒单和有限重试。
 
@@ -13,18 +13,17 @@ QMT 的 `[quote] start simulation mode` 只用于仿真，不代表实盘委托�
 ## 安全与状态
 
 - 默认 `ENABLE_LIVE_ORDERS=True`、`ACCOUNT_ID="32011276"`。该设置会调用真实账户；测试必须显式覆盖为模拟账户或关闭实盘。
-- 实盘启动会注册账户、检查可用资金，并在第一笔 `passorder` 前把当天整批计划原子写入状态文件。每次发单前还会持久化 attempt/token，避免重启后把已尝试的委托误当成未提交。QMT `passorder` 返回 `0` 时只表示调用没有返回订单号，模型等待异步回报；原生回报备注为空时按股票、价格和数量关联到计划。
-- 当天已有 reservation 时，模型核对其每笔旧委托。委托系统编号读取 `order_sysid`，并兼容 QMT 的复合策略名。仅当所有已提交委托均确认终态且零成交，才可释放；同一 CSV 会从保存的重试次数继续，CSV 已更改时允许新计划接续。仍在报、已有成交、订单查询不可用或委托无法唯一匹配时都会保留 reservation 并停止，防止重复买入。查询日志输出订单记录总数及各匹配路径的计数，便于区分空查询和字段不匹配。
-- 状态文件写入 `C:\光大证券金阳光QMT实盘\userdata\log\qmt_overnight_limit_up_buy_state.json`。这只写入本策略专用状态，不改 QMT 账户或交易配置。
-- 订单 CSV 默认路径为 `C:\光大证券金阳光QMT实盘\python\overnight_orders.csv`。把示例复制为该文件后编辑订单内容；模型不会覆盖 CSV。
+- 实盘启动先查询 `get_trade_detail_data(ACCOUNT_ID, ACCOUNT_TYPE, "order")`。查询不可用、记录缺少策略身份，或策略名等于本策略名及其 QMT 复合名时，模型在价格预检和下单前停止。当前实现扫描接口返回的全部记录，不按日期过滤；必须先在当前券商 QMT 版本确认查询只覆盖当日委托、`m_strStrategyName` 字段可用。若接口返回历史记录，同策略旧委托会阻止后续运行；若接口漏掉已提交委托，则内存模型无法识别先前运行并可能重复提交。
+- 计划、预约标记、attempt/token、订单映射及回调去重状态仅保存在当前模型进程的全局容器中。QMT `passorder` 返回 `0` 时只表示调用没有返回订单号，模型等待异步回报；原生回报备注为空时按股票、价格和数量关联到计划。
+- 模型重启后不恢复已提交批次或拒单重试次数。重复运行拦截依赖 QMT 委托查询覆盖完整且只包含目标交易日；不得把离线模拟或空查询结果当作这项保护已在实盘验证。
 
 ## 部署
 
 1. 在 QMT “模型研究”中创建独立的原生 Python 模型，不覆盖现有 `QMT_LARGE_ORDER_LIMIT_UP_BUY.py`。
 2. 将 `QMT_OVERNIGHT_LIMIT_UP_BUY.py` 作为独立文件部署到 QMT 的 Python 模型目录。
-3. 将 `data/overnight_orders.csv.example` 复制到上述 `overnight_orders.csv` 路径并填写当天订单。
-4. 先保持实盘开关关闭，在 QMT `[quote]` 模式检查 `INIT`/`PATHS`、`TRADING_DAY_CHECK_SKIPPED`、`PREFLIGHT_OK`、逐行 `PLAN` 和 `DRY_RUN` 日志。
-5. 实盘调用需切换到 QMT `[trade]` 模式，并验证 `UpStopPrice` 字段、账户可用资金字段、委托回报状态码和成交量。实盘开关默认开启，启动前核对 CSV、账户及 QMT 委托页。
+3. 每个交易日更新 `PLAN_TRADE_DATE` 和 `ORDER_PLAN`，核对代码、金额及日期后重新编译入口。
+4. 先保持实盘开关关闭，在 QMT `[quote]` 模式检查 `INIT`、`ORDER_PLAN_LOADED`、`PREFLIGHT_OK`、逐行 `PLAN` 和 `DRY_RUN` 日志。
+5. 实盘调用需切换到 QMT `[trade]` 模式，并验证 `UpStopPrice`、账户可用资金字段、订单查询返回字段和范围、委托回报状态码及成交量。实盘开关默认开启，启动前核对计划、账户及 QMT 委托页。
 
 ## 离线验证
 

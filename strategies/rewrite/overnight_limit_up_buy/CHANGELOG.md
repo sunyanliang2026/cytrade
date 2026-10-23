@@ -1,5 +1,12 @@
 # Change Log
 
+## 2026-10-23
+
+- Replaced CSV input with `PLAN_TRADE_DATE` and `ORDER_PLAN` constants in the native model; both default empty, so an unconfigured daily plan stops before scheduling.
+- Removed strategy state-file reads and writes. Attempt counts, callback mappings, and reservations now exist only for one model session; restart retry recovery is no longer supported.
+- Added a live-start check using native QMT order records. The model stops on query failure, missing strategy identity, or an order tagged with this strategy. The installed QMT build must be checked to confirm the query only returns current-day orders and exposes strategy names; the implementation scans every returned record without date filtering.
+- Updated the existing native-model fixtures and deployment notes. Synced only `QMT_OVERNIGHT_LIMIT_UP_BUY.py` to QMT `python/OVERNIGHT_LIMIT_UP_BUY.py`; both SHA-256 values are `f9365265f116cfc5b03bbc756f081e5fb2c09de60cf8104aad68b071b41d21a0`. Tests and QMT Python compilation were not run; the model must be recompiled/restarted, and live QMT query/order behavior remains unverified.
+
 ## 2026-10-20
 
 - Recognized QMT order status `57` as a junk order even when its rejection message is empty; scheduled at most two retries, 100 ms apart, without blocking the native event loop.
