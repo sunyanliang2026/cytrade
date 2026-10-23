@@ -25,7 +25,13 @@ TERMINAL_ORDER_STATUSES = (
     ORDER_STATUS_PART_SUCCEEDED, ORDER_STATUS_SUCCEEDED, ORDER_STATUS_JUNK,
 )
 
-# Update these two values before compiling the model for a trading day.
+# Example only: replace the date, codes, and amounts before enabling a daily plan.
+# PLAN_TRADE_DATE = "YYYYMMDD"
+# ORDER_PLAN = (
+#     ("603005", 26000),
+#     ("000530", 26000),
+# )
+# Update the active values below before compiling the model for a trading day.
 PLAN_TRADE_DATE = ""
 ORDER_PLAN = ()
 
