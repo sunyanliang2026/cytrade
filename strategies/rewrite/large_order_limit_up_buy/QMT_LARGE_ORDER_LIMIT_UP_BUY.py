@@ -52,16 +52,16 @@ ORDER_LOOKUP_MAX_ATTEMPTS = 10
 PERIODS = ("l2quote", "l2order")
 DEBUG_SUMMARY_INTERVAL_SECONDS = 60
 DEBUG_LATENCY_WARN_THRESHOLD_MS = 2000.0
-DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS = 1000.0
+DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS = 1200.0
 DEBUG_LATENCY_WARN_INTERVAL_SECONDS = 10.0
-MAX_SIGNAL_QUOTE_DELAY_MS = 1000.0
+MAX_SIGNAL_QUOTE_DELAY_MS = 2000.0
 FRESHNESS_MAX_DELAY_MS = {
-    "l2quote": 3000.0,
-    "l2order": 2000.0,
+    "l2quote": 2000.0,
+    "l2order": 1200.0,
 }
 FRESHNESS_FUTURE_TOLERANCE_MS = 1000.0
 SEEN_ORDER_KEY_MAX_COUNT = 1000
-L2ORDER_SUBSCRIBE_SECONDS = 9 * 60 * 60 + 30 * 60 + 20
+L2ORDER_SUBSCRIBE_SECONDS = 9 * 60 * 60 + 30 * 60 + 30
 L2ORDER_SUBSCRIBE_GAIN = 0.07
 L2ORDER_SUBSCRIBE_RETRY_SECONDS = 1.0
 L2ORDER_SUBSCRIBE_MAX_ATTEMPTS = 3
@@ -581,12 +581,12 @@ def _subscribe_l2order_now(C, pending=None):
 
 
 def _schedule_l2order_subscriptions(C):
-    """Before 09:30:20 keep only quotes; never fall back to early fan-out."""
+    """Before 09:30:30 keep only quotes; never fall back to early fan-out."""
     global _L2ORDER_SUBSCRIBE_TIMER
     now = _dt.datetime.now()
     now_seconds = now.hour * 3600 + now.minute * 60 + now.second
     close_seconds = 14 * 60 * 60 + 57 * 60
-    target = now.replace(hour=9, minute=30, second=20, microsecond=0)
+    target = now.replace(hour=9, minute=30, second=30, microsecond=0)
     if L2ORDER_SUBSCRIBE_SECONDS <= now_seconds < close_seconds:
         _subscribe_l2order_now(C)
         return
@@ -599,7 +599,7 @@ def _schedule_l2order_subscriptions(C):
         _log("[SUBSCRIBE] l2order eligible from %s, gain>7%%, retain after opening" %
              target.strftime("%Y-%m-%d %H:%M:%S"))
     except Exception as exc:
-        _log("[SUBSCRIBE] l2order opening timer failed %r; wait for fresh quotes after 09:30:20" % (exc,))
+        _log("[SUBSCRIBE] l2order opening timer failed %r; wait for fresh quotes after 09:30:30" % (exc,))
 
 
 def _auction_retry_timer(ContextInfo):
@@ -1839,7 +1839,7 @@ def init(C):
         _initial_quote_batch(C, list(_INSTANCES.values()))
         for inst in _INSTANCES.values():
             _subscribe(C, inst["code"], "l2quote")
-        _log("[运行] l2order_policy=start:09:30:20,gain>7%%,retain_after_opening; "
+        _log("[运行] l2order_policy=start:09:30:30,gain>7%%,retain_after_opening; "
              "retry_interval=%.1fs,max_attempts=%d" % (
                  L2ORDER_SUBSCRIBE_RETRY_SECONDS, L2ORDER_SUBSCRIBE_MAX_ATTEMPTS))
         _schedule_l2order_subscriptions(C)

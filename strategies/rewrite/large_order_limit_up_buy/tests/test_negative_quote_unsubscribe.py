@@ -131,7 +131,7 @@ class NegativeQuoteExitTests(unittest.TestCase):
         self.assertEqual(self.cancel_calls, [])
 
     def test_stale_negative_l2quote_does_not_permanently_exit(self):
-        with mock.patch.object(QMT, "_latency_ms", return_value=1500.0):
+        with mock.patch.object(QMT, "_latency_ms", return_value=2500.0):
             QMT._handle_quote(self.inst["code"], "l2quote", {
                 "stime": "100000", "time": "100000.500",
                 "lastPrice": 9.99, "lastClose": 10.0,

@@ -28,7 +28,7 @@ class FreshnessGateTests(unittest.TestCase):
 
     def test_stale_l2order_is_rejected_before_payload_copy_and_trigger(self):
         received_at = QMT._dt.datetime(2026, 10, 21, 9, 30, 3).timestamp()
-        event_at = received_at - 2.001
+        event_at = received_at - 1.201
         payload = {
             "time": str(int(event_at * 1000)),
             "stime": "20261021093001.000",
@@ -42,7 +42,7 @@ class FreshnessGateTests(unittest.TestCase):
             "000001.SZ", "l2order", payload, received_at)
 
         self.assertFalse(accepted)
-        self.assertAlmostEqual(delay_ms, 2001.0, places=3)
+        self.assertAlmostEqual(delay_ms, 1201.0, places=3)
         self.assertEqual(QMT._FRESHNESS_DROPS["l2order"]["count"], 1)
 
     def test_freshness_gate_rejects_out_of_order_absolute_event(self):
@@ -79,28 +79,36 @@ class FreshnessGateTests(unittest.TestCase):
                 self.assertEqual(
                     QMT._FRESHNESS_DROPS["l2quote"]["last_reason"], expected_reason)
 
-    def test_relaxed_freshness_limits_accept_recent_delayed_events(self):
+    def test_freshness_gate_accepts_events_within_period_limits(self):
         received_at = QMT._dt.datetime(2026, 10, 21, 9, 30, 3).timestamp()
         quote, _, quote_delay = QMT._freshness_gate(
             "000001.SZ", "l2quote",
-            {"time": str(int((received_at - 2.5) * 1000))}, received_at)
+            {"time": str(int((received_at - 1.9) * 1000))}, received_at)
         order, _, order_delay = QMT._freshness_gate(
             "000002.SZ", "l2order",
-            {"time": str(int((received_at - 1.5) * 1000))}, received_at)
+            {"time": str(int((received_at - 1.1) * 1000))}, received_at)
 
         self.assertTrue(quote)
         self.assertTrue(order)
-        self.assertAlmostEqual(quote_delay, 2500.0, places=3)
-        self.assertAlmostEqual(order_delay, 1500.0, places=3)
+        self.assertAlmostEqual(quote_delay, 1900.0, places=3)
+        self.assertAlmostEqual(order_delay, 1100.0, places=3)
 
-    def test_l2quote_event_beyond_relaxed_limit_is_rejected(self):
+    def test_filter_warning_and_quote_signal_limits_share_period_thresholds(self):
+        expected = {"l2quote": 2000.0, "l2order": 1200.0}
+        for period, limit_ms in expected.items():
+            with self.subTest(period=period):
+                self.assertEqual(QMT.FRESHNESS_MAX_DELAY_MS[period], limit_ms)
+                self.assertEqual(QMT._latency_warn_threshold(period), limit_ms)
+        self.assertEqual(QMT.MAX_SIGNAL_QUOTE_DELAY_MS, expected["l2quote"])
+
+    def test_l2quote_event_beyond_two_second_limit_is_rejected(self):
         received_at = QMT._dt.datetime(2026, 10, 21, 9, 30, 3).timestamp()
         accepted, _, delay_ms = QMT._freshness_gate(
             "000001.SZ", "l2quote",
-            {"time": str(int((received_at - 3.001) * 1000))}, received_at)
+            {"time": str(int((received_at - 2.001) * 1000))}, received_at)
 
         self.assertFalse(accepted)
-        self.assertAlmostEqual(delay_ms, 3001.0, places=3)
+        self.assertAlmostEqual(delay_ms, 2001.0, places=3)
         self.assertEqual(QMT._FRESHNESS_DROPS["l2quote"]["last_reason"], "stale_event")
 
     def test_freshness_gate_uses_fractional_epoch_seconds(self):
