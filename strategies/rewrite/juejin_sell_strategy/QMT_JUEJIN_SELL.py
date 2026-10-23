@@ -8,10 +8,7 @@ QMT account by default.
 """
 
 import copy
-import csv
 import datetime as _dt
-import io
-import os
 import time
 import uuid
 
@@ -29,8 +26,15 @@ POSITION_CACHE_MAX_AGE_SECONDS = 6.0
 POSITION_REFRESH_INTERVAL_SECONDS = 2.0
 PENDING_SIGNAL_MAX_AGE_SECONDS = 5.0
 
-QMT_HOME = u"C:/\u5149\u5927\u8bc1\u5238\u91d1\u9633\u5149QMT\u5b9e\u76d8"
-CSV_PATH = os.path.join(QMT_HOME, "python", "sell_10.csv")
+# This pool is the last QMT pool reviewed on 2026-10-23. Update both the
+# date and rows before running the model on another trading day.
+POOL_TRADE_DATE = "20261023"
+SELL_POOL = (
+    ("603138.SH", 0, 1200),
+    ("002520.SZ", 0, 2500),
+    ("000530.SZ", 0, 1600),
+    ("601091.SH", 0, 700),
+)
 
 LIMIT_UP_CONFIRM_AMOUNT = 120000000.0
 LIMIT_UP_WEAK_AMOUNT = 100000000.0
@@ -81,9 +85,6 @@ _INSTANCES = {}
 _SUBSCRIPTIONS = []
 _SUB_SUCCESS = 0
 _SUB_FAILED = 0
-_LOG = None
-_LOG_PATH = ""
-_CSV_USED = ""
 _LAST_SUMMARY = 0.0
 _POSITION_CACHE = {"updated_at": 0.0, "available": {}}
 _POSITION_REFRESH_TIMER = None
@@ -208,12 +209,6 @@ def _log(message):
         print(line)
     except Exception:
         pass
-    if _LOG:
-        try:
-            _LOG.write(line + "\n")
-            _LOG.flush()
-        except Exception:
-            pass
 
 
 def _owned_payload(code, payload):
@@ -274,7 +269,7 @@ def _quote_values(data):
 def _new_instance(plan):
     return {
         "code": plan["code"],
-        "nick": plan["nick"],
+        "nick": str(plan.get("nick") or plan["code"]),
         "exp": plan["exp"],
         "sell_quantity": plan["sell_quantity"],
         "flag": FLAG_NORMAL,
@@ -297,6 +292,9 @@ def _new_instance(plan):
         "last_l2_quote": {},
         "last_l2_event_time": "",
         "last_l2_at": 0.0,
+        "subscription_ids": {},
+        "subscription_tokens": {},
+        "disabled_subscription_periods": set(),
         "submitted_actions": set(),
         "orders": [],
         "pending_after_cancel": None,
@@ -412,18 +410,29 @@ def _refresh_positions():
         _log("[POSITION_CACHE] available=%s" % available_by_code)
     _POSITION_CACHE["available"] = available_by_code
     _POSITION_CACHE["updated_at"] = _now()
+    _sync_market_subscriptions(_C)
     return True
 
 
 def _available_for_sell(inst):
-    if not ENABLE_LIVE_ORDERS:
-        return inst["sell_quantity"]
-    if not _position_cache_valid():
+    available = _account_available_for_sell(inst)
+    if available is None:
         _log("[SELL_SKIP] code=%s reason=position_cache_unavailable" % inst["code"])
         return None
-    already_sold = sum(order["traded_quantity"] for order in inst["orders"])
-    remaining_target = max(0, inst["sell_quantity"] - already_sold)
-    return min(_POSITION_CACHE["available"].get(inst["code"], 0), remaining_target)
+    return min(available, _remaining_target(inst))
+
+
+def _remaining_target(inst):
+    already_sold = sum(order.get("traded_quantity", 0) for order in inst["orders"])
+    return max(0, inst["sell_quantity"] - already_sold)
+
+
+def _account_available_for_sell(inst):
+    if not ENABLE_LIVE_ORDERS:
+        return _remaining_target(inst)
+    if not _position_cache_valid():
+        return None
+    return max(0, _POSITION_CACHE["available"].get(inst["code"], 0))
 
 
 def _position_cache_valid():
@@ -665,19 +674,28 @@ def _resolve_order_id(code, token):
         ))
 
 
-def _submit_sell(inst, quantity, price, reason, action):
+def _submit_sell(inst, quantity, price, reason, action, available_override=None,
+                 allow_parallel=False):
     if _action_known(inst, action):
         return None
-    if ENABLE_LIVE_ORDERS and _has_active_orders(inst):
+    if ENABLE_LIVE_ORDERS and _has_active_orders(inst) and not allow_parallel:
         _log("[SELL_SKIP] code=%s action=%s reason=existing_order_unresolved" % (inst["code"], action))
         return None
-    available = _available_for_sell(inst)
+    available = (
+        _available_for_sell(inst)
+        if available_override is None
+        else max(0, int(available_override))
+    )
     if available is None:
         return None
     requested = available if quantity is None else max(0, int(quantity))
     sell_quantity = min(requested, available)
-    if sell_quantity <= 0 or price <= 0:
+    if sell_quantity <= 0:
+        inst["submitted_actions"].add(action)
         _log("[SELL_SKIP] code=%s action=%s reason=no_available_volume" % (inst["code"], action))
+        return None
+    if price <= 0:
+        _log("[SELL_SKIP] code=%s action=%s reason=invalid_price" % (inst["code"], action))
         return None
 
     token = "%s_%s_%s" % (inst["code"], action, uuid.uuid4().hex[:8])
@@ -855,9 +873,52 @@ def _drain_pending_after_cancel(inst):
         _log("[PENDING_SELL_ABORTED] code=%s reason=signal_no_longer_valid" % inst["code"])
         inst["pending_after_cancel"] = None
         return
+    if _remaining_target(inst) <= 0:
+        _log("[PENDING_SELL_ABORTED] code=%s reason=target_complete" % inst["code"])
+        inst["pending_after_cancel"] = None
+        return
     inst["pending_after_cancel"] = None
     accepted = False
     for request in pending["requests"]:
+        if request.get("split_account_available"):
+            account_available = _account_available_for_sell(inst)
+            if account_available is None:
+                inst["pending_after_cancel"] = pending
+                return
+            primary_quantity = min(_remaining_target(inst), account_available)
+            remainder_quantity = max(0, account_available - primary_quantity)
+            primary_order = _submit_sell(
+                inst,
+                primary_quantity,
+                _pending_price(inst, request) if delayed else request["price"],
+                request["reason"],
+                request["action"],
+                available_override=primary_quantity,
+            )
+            if primary_order is not None:
+                accepted = True
+            if remainder_quantity > 0:
+                remainder_order = _submit_sell(
+                    inst,
+                    remainder_quantity,
+                    request["remainder_price"],
+                    "weak_rebound_failure_remainder",
+                    "weak_rebound_remainder",
+                    available_override=remainder_quantity,
+                    allow_parallel=True,
+                )
+                if remainder_order is not None:
+                    accepted = True
+            else:
+                inst["submitted_actions"].add("weak_rebound_remainder")
+                _log("[WEAK_REBOUND_SPLIT] code=%s account_available=%d primary=%d remainder=0" % (
+                    inst["code"], account_available, primary_quantity
+                ))
+            if remainder_quantity > 0:
+                _log("[WEAK_REBOUND_SPLIT] code=%s account_available=%d primary=%d remainder=%d" % (
+                    inst["code"], account_available, primary_quantity, remainder_quantity
+                ))
+            continue
         order = _submit_sell(
             inst,
             request.get("quantity"),
@@ -919,10 +980,18 @@ def _handle_early_under_expectation(inst, quote, seconds):
 
 def _confirm_limit_up(inst, quote):
     at_limit_up = _price_equal(quote["bid"], inst["limit_up"])
-    if at_limit_up and inst["flag"] != FLAG_LIMIT_UP:
+    can_confirm = inst["flag"] not in (
+        FLAG_LIMIT_UP, FLAG_LIMIT_DOWN_CLEAR, FLAG_SELL_DONE
+    )
+    if at_limit_up and can_confirm:
         inst["limit_up_seen_at"] = _now()
     amount = _book_amount(quote["bid"], quote["bid_volume"])
-    if at_limit_up and amount > LIMIT_UP_CONFIRM_AMOUNT and inst["flag"] != FLAG_LIMIT_DOWN_CLEAR:
+    if (
+        at_limit_up
+        and amount > LIMIT_UP_CONFIRM_AMOUNT
+        and can_confirm
+        and _remaining_target(inst) > 0
+    ):
         _set_flag(inst, FLAG_LIMIT_UP, "limit_up_sealed_amount=%.0f" % amount)
         inst["open_flag"] = 0
         _log("[LIMIT_UP_CONFIRMED] code=%s bid=%.3f bid_volume=%d amount=%.0f" % (
@@ -932,7 +1001,7 @@ def _confirm_limit_up(inst, quote):
 
 def _mark_weak_state(inst, quote):
     if quote["bid"] < inst["pre_close"] * 0.975 and inst["flag"] not in (
-        FLAG_LIMIT_DOWN_CLEAR, FLAG_WEAK, 66
+        FLAG_LIMIT_DOWN_CLEAR, FLAG_WEAK, FLAG_SELL_DONE, 66
     ):
         _set_flag(inst, FLAG_WEAK, "bid_below_minus_2_5_percent")
 
@@ -948,24 +1017,15 @@ def _handle_weak_rebound_failure(inst, quote, seconds):
     ):
         return
     request = {
-        "quantity": inst["sell_quantity"],
+        "quantity": None,
         "price": round(quote["bid"] * 0.99, 2),
         "reason": "weak_rebound_failure_primary",
         "action": "weak_rebound_primary",
+        "split_account_available": True,
+        "remainder_price": round(inst["pre_close"] * 1.04, 2),
     }
-    remaining = max(0, inst["sell_quantity"] - inst["sell_quantity"])
-    if remaining > 0:
-        request2 = {
-            "quantity": remaining,
-            "price": round(inst["pre_close"] * 1.04, 2),
-            "reason": "weak_rebound_failure_remainder",
-            "action": "weak_rebound_remainder",
-        }
-        requests = [request, request2]
-    else:
-        requests = [request]
     _queue_after_cancel(
-        inst, requests, "weak_rebound_failure_cancel",
+        inst, [request], "weak_rebound_failure_cancel",
         next_flag=FLAG_NORMAL, next_reason="weak_rebound_failure",
     )
 
@@ -1170,6 +1230,9 @@ def _process_l2quote(inst, data, event_seconds):
         return
     first_sell_done_before_tick = inst["up_sell"] == LIMIT_UP_FIRST_SELL_DONE
     _drain_pending_after_cancel(inst)
+    if _remaining_target(inst) <= 0:
+        _finish_quote(inst, quote)
+        return
     _handle_auction(inst, quote, event_seconds)
     if not _in_regular_session(event_seconds):
         return
@@ -1188,10 +1251,15 @@ def _process_l2quote(inst, data, event_seconds):
     _finish_quote(inst, quote)
 
 
-def _handle_quote(code, period, payload):
+def _handle_quote(code, period, payload, subscription_token=None):
     with _LOCK:
         inst = _INSTANCES.get(code)
         if not inst:
+            return
+        if subscription_token is not None and (
+            inst["subscription_tokens"].get(period) is not subscription_token
+            or period in inst["disabled_subscription_periods"]
+        ):
             return
         data = _owned_payload(code, payload)
         event_seconds = _event_seconds(_field(data, "stime", "time", "timestamp"))
@@ -1204,40 +1272,82 @@ def _handle_quote(code, period, payload):
 
 def _subscribe(C, code, period):
     global _SUB_SUCCESS, _SUB_FAILED
-    callback = lambda data, c=code, p=period: _handle_quote(c, p, data)
+    inst = _INSTANCES.get(code)
+    if inst is None:
+        return
+    if period in inst["subscription_ids"]:
+        inst["disabled_subscription_periods"].discard(period)
+        return
+    token = object()
+    inst["subscription_tokens"][period] = token
+    inst["disabled_subscription_periods"].discard(period)
+    callback = lambda data, c=code, p=period, t=token: _handle_quote(c, p, data, t)
     try:
         sub_id = C.subscribe_quote(
             code, period=period, dividend_type="follow", result_type="dict", callback=callback
         )
         if sub_id and sub_id > 0:
             _SUB_SUCCESS += 1
+            inst["subscription_ids"][period] = sub_id
             _SUBSCRIPTIONS.append(sub_id)
             _log("[SUBSCRIBE] code=%s period=%s id=%s" % (code, period, sub_id))
         else:
+            if inst["subscription_tokens"].get(period) is token:
+                inst["subscription_tokens"].pop(period, None)
             _SUB_FAILED += 1
             _log("[SUBSCRIBE_FAILED] code=%s period=%s return=%r" % (code, period, sub_id))
     except Exception as exc:
+        if inst["subscription_tokens"].get(period) is token:
+            inst["subscription_tokens"].pop(period, None)
         _SUB_FAILED += 1
         _log("[SUBSCRIBE_FAILED] code=%s period=%s error=%r" % (code, period, exc))
 
 
-def _script_root():
-    path = globals().get("__file__")
-    return os.path.dirname(os.path.abspath(path)) if path else os.getcwd()
+def _unsubscribe_stock(C, inst, reason):
+    unsubscriber = getattr(C, "unsubscribe_quote", None)
+    for period, sub_id in list(inst["subscription_ids"].items()):
+        inst["disabled_subscription_periods"].add(period)
+        if not callable(unsubscriber):
+            _log("[UNSUBSCRIBE_FAILED] code=%s period=%s id=%s reason=api_unavailable" % (
+                inst["code"], period, sub_id
+            ))
+            continue
+        try:
+            result = unsubscriber(sub_id)
+        except Exception as exc:
+            _log("[UNSUBSCRIBE_FAILED] code=%s period=%s id=%s error=%r" % (
+                inst["code"], period, sub_id, exc
+            ))
+            continue
+        if result is False:
+            _log("[UNSUBSCRIBE_FAILED] code=%s period=%s id=%s return=%r" % (
+                inst["code"], period, sub_id, result
+            ))
+            continue
+        inst["subscription_ids"].pop(period, None)
+        inst["subscription_tokens"].pop(period, None)
+        try:
+            _SUBSCRIPTIONS.remove(sub_id)
+        except ValueError:
+            pass
+        _log("[UNSUBSCRIBE] code=%s period=%s id=%s reason=%s" % (
+            inst["code"], period, sub_id, reason
+        ))
 
 
-def _resolve_csv_path():
-    configured = str(os.environ.get("CYTRADE_JUEJIN_SELL_CSV_PATH", "") or "").strip()
-    candidates = [
-        configured,
-        os.path.join(_script_root(), "data", "sell_10.csv"),
-        CSV_PATH,
-        os.path.join(os.getcwd(), "data", "sell_10.csv"),
-    ]
-    for value in candidates:
-        if value and os.path.isfile(value):
-            return os.path.abspath(value)
-    return os.path.abspath(CSV_PATH)
+def _sync_market_subscriptions(C):
+    if not ENABLE_LIVE_ORDERS or C is None or not _position_cache_valid():
+        return
+    for inst in _INSTANCES.values():
+        available = max(0, _POSITION_CACHE["available"].get(inst["code"], 0))
+        no_sellable_quantity = available <= 0 or _remaining_target(inst) <= 0
+        if no_sellable_quantity:
+            if _has_active_orders(inst) or inst.get("pending_after_cancel"):
+                continue
+            _unsubscribe_stock(C, inst, "no_sellable_quantity")
+            continue
+        for period in PERIODS:
+            _subscribe(C, inst["code"], period)
 
 
 def _to_int(value):
@@ -1247,30 +1357,34 @@ def _to_int(value):
         return 0
 
 
-def _load_pool(path):
-    if not os.path.isfile(path):
-        raise ValueError("CSV not found: %s" % path)
+def _pool_plans(trade_date=None):
+    current_date = str(trade_date or _dt.datetime.now().strftime("%Y%m%d"))
+    if current_date != POOL_TRADE_DATE:
+        raise ValueError(
+            "pool_date_mismatch configured=%s current=%s" % (POOL_TRADE_DATE, current_date)
+        )
+    if not SELL_POOL:
+        raise ValueError("inline_pool_empty")
     result = []
     seen = set()
-    with io.open(path, "r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row_no, row in enumerate(reader, 2):
-            code = _stock_code(row.get("symbol") or row.get("\u80a1\u7968\u4ee3\u7801"))
-            quantity = max(0, _to_int(row.get("sellvol") or row.get("\u5356\u51fa\u6570\u91cf")))
-            if not code or quantity <= 0:
-                raise ValueError("invalid row %s" % row_no)
-            if code in seen:
-                raise ValueError("duplicate symbol row %s: %s" % (row_no, code))
-            seen.add(code)
-            result.append({
-                "row_no": row_no,
-                "code": code,
-                "exp": _to_int(row.get("exp")),
-                "sell_quantity": quantity,
-                "nick": str(row.get("nick") or code),
-            })
+    for row_no, row in enumerate(SELL_POOL, 1):
+        if not isinstance(row, (list, tuple)) or len(row) != 3:
+            raise ValueError("invalid inline pool row %s" % row_no)
+        code = _stock_code(row[0])
+        quantity = max(0, _to_int(row[2]))
+        if not code or quantity <= 0:
+            raise ValueError("invalid inline pool row %s" % row_no)
+        if code in seen:
+            raise ValueError("duplicate inline pool row %s: %s" % (row_no, code))
+        seen.add(code)
+        result.append({
+            "row_no": row_no,
+            "code": code,
+            "exp": _to_int(row[1]),
+            "sell_quantity": quantity,
+        })
     if not result:
-        raise ValueError("CSV contains no rows")
+        raise ValueError("inline_pool_empty")
     return result
 
 
@@ -1280,6 +1394,9 @@ def _initial_quote(C, inst):
         if callable(detail_getter):
             detail = detail_getter(inst["code"])
             _update_market(inst, detail, "")
+            instrument_name = _first_value(_field(detail, "InstrumentName"))
+            if instrument_name:
+                inst["nick"] = str(instrument_name).strip() or inst["code"]
             if inst["pre_close"] <= 0:
                 inst["pre_close"] = _safe_float(_field(
                     detail, "PreClose", "lastClose", "preClose", "pre_close"
@@ -1320,9 +1437,9 @@ def _summary():
         states[inst["flag"]] = states.get(inst["flag"], 0) + 1
         if _has_active_orders(inst):
             active += 1
-    _log("[SUMMARY] stocks=%d subscriptions=%d/%d active_orders=%d flags=%s csv=%s" % (
-        len(_INSTANCES), _SUB_SUCCESS, _SUB_SUCCESS + _SUB_FAILED, active,
-        ",".join("%s:%s" % item for item in sorted(states.items())), _CSV_USED
+    _log("[SUMMARY] stocks=%d subscriptions_active=%d requests=%d/%d active_orders=%d flags=%s pool_date=%s" % (
+        len(_INSTANCES), len(_SUBSCRIPTIONS), _SUB_SUCCESS, _SUB_SUCCESS + _SUB_FAILED, active,
+        ",".join("%s:%s" % item for item in sorted(states.items())), POOL_TRADE_DATE
     ))
 
 
@@ -1361,50 +1478,40 @@ def _schedule_position_refresh(C):
 
 
 def init(C):
-    global _C, _LOG, _LOG_PATH, _CSV_USED, _SUB_SUCCESS, _SUB_FAILED, _LAST_SUMMARY
+    global _C, _SUB_SUCCESS, _SUB_FAILED, _LAST_SUMMARY
     with _LOCK:
         _C = C
-        if ACCOUNT_ID:
-            setter = getattr(C, "set_account", None)
-            if callable(setter):
-                setter(ACCOUNT_ID, ACCOUNT_TYPE)
-        log_dir = os.path.join(_script_root(), "..", "userdata", "log")
-        if not os.path.isdir(log_dir):
-            log_dir = os.path.join(os.getcwd(), "userdata", "log")
-        try:
-            if not os.path.isdir(log_dir):
-                os.makedirs(log_dir)
-            day = _dt.datetime.now().strftime("%Y%m%d")
-            _LOG_PATH = os.path.abspath(os.path.join(log_dir, "juejin_sell_native_%s.log" % day))
-            _LOG = open(_LOG_PATH, "a")
-        except Exception:
-            _LOG = None
-            _LOG_PATH = ""
         _SUBSCRIPTIONS[:] = []
         _SUB_SUCCESS = 0
         _SUB_FAILED = 0
         _INSTANCES.clear()
+        _POSITION_CACHE["updated_at"] = 0.0
+        _POSITION_CACHE["available"] = {}
         try:
-            _CSV_USED = _resolve_csv_path()
-            plans = _load_pool(_CSV_USED)
+            plans = _pool_plans()
         except Exception as exc:
-            _log("[ABORT] csv_load_failed error=%r" % (exc,))
+            _log("[ABORT] inline_pool_invalid error=%r" % (exc,))
             return
+        if ACCOUNT_ID:
+            setter = getattr(C, "set_account", None)
+            if callable(setter):
+                setter(ACCOUNT_ID, ACCOUNT_TYPE)
         for plan in plans:
             inst = _new_instance(plan)
             _INSTANCES[inst["code"]] = inst
-            _log("[JUEJIN_STATUS] code=%s nick=%s status=0 reason=initial" % (inst["code"], inst["nick"]))
             _initial_quote(C, inst)
+            _log("[JUEJIN_STATUS] code=%s nick=%s status=0 reason=initial" % (inst["code"], inst["nick"]))
         _POSITION_CACHE["updated_at"] = 0.0
         _POSITION_CACHE["available"] = {}
-        _refresh_positions()
-        for inst in _INSTANCES.values():
-            for period in PERIODS:
-                _subscribe(C, inst["code"], period)
+        refreshed = _refresh_positions()
+        if not ENABLE_LIVE_ORDERS or not refreshed:
+            for inst in _INSTANCES.values():
+                for period in PERIODS:
+                    _subscribe(C, inst["code"], period)
         _schedule_position_refresh(C)
         _LAST_SUMMARY = _now()
-        _log("[INIT] csv=%s stocks=%d live=%s log=%s" % (
-            _CSV_USED, len(_INSTANCES), ENABLE_LIVE_ORDERS, _LOG_PATH or "<console>"
+        _log("[INIT] pool_date=%s stocks=%d live=%s log=console" % (
+            POOL_TRADE_DATE, len(_INSTANCES), ENABLE_LIVE_ORDERS
         ))
 
 
@@ -1470,6 +1577,8 @@ def stop(C):
             except Exception:
                 pass
             _POSITION_REFRESH_TIMER = None
+        for inst in _INSTANCES.values():
+            _unsubscribe_stock(C, inst, "stop")
         for sub_id in list(_SUBSCRIPTIONS):
             try:
                 C.unsubscribe_quote(sub_id)
@@ -1477,14 +1586,12 @@ def stop(C):
                 pass
         _SUBSCRIPTIONS[:] = []
         for inst in _INSTANCES.values():
+            inst["subscription_ids"].clear()
+            inst["subscription_tokens"].clear()
+            inst["disabled_subscription_periods"].clear()
             _log("[STOP] code=%s flag=%s active_orders=%s" % (
                 inst["code"], inst["flag"], _has_active_orders(inst)
             ))
-        if _LOG:
-            try:
-                _LOG.close()
-            except Exception:
-                pass
 
 
 __all__ = ["init", "handlebar", "stop", "order_callback", "deal_callback"]

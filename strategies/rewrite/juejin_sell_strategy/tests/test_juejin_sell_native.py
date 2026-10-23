@@ -1,6 +1,5 @@
 import importlib.util
 from pathlib import Path
-import tempfile
 import unittest
 
 
@@ -49,7 +48,6 @@ class NativeSellModelTests(unittest.TestCase):
         MODEL._INSTANCES.clear()
         MODEL._SUBSCRIPTIONS[:] = []
         MODEL._C = None
-        MODEL._LOG = None
         MODEL.ENABLE_LIVE_ORDERS = False
         MODEL.ACCOUNT_ID = ""
         MODEL._POSITION_CACHE["updated_at"] = 0.0
@@ -93,16 +91,20 @@ class NativeSellModelTests(unittest.TestCase):
     def _l2(self, at, bid, **kwargs):
         MODEL._process_l2quote(self.inst, self._quote(at, bid, **kwargs), MODEL._event_seconds(at))
 
-    def test_utf8_csv_loads_symbol_quantity_and_unicode_nick(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "sell_10.csv"
-            path.write_text("symbol,exp,sellvol,nick\n600088,0,1200,传媒\n", encoding="utf-8-sig")
+    def test_inline_pool_is_date_guarded(self):
+        plans = MODEL._pool_plans("20261023")
 
-            plans = MODEL._load_pool(str(path))
-
-        self.assertEqual(plans[0]["code"], "600088.SH")
-        self.assertEqual(plans[0]["sell_quantity"], 1200)
-        self.assertEqual(plans[0]["nick"], "传媒")
+        self.assertEqual(
+            [(plan["code"], plan["sell_quantity"]) for plan in plans],
+            [
+                ("603138.SH", 1200),
+                ("002520.SZ", 2500),
+                ("000530.SZ", 1600),
+                ("601091.SH", 700),
+            ],
+        )
+        with self.assertRaises(ValueError):
+            MODEL._pool_plans("20261026")
 
     def _reach_limit_up_and_open(self):
         self._l2("093500", 11.0, high=11.0, low=10.5)
