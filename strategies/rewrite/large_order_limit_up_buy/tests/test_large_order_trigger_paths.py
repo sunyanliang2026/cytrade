@@ -34,7 +34,6 @@ class LargeOrderTriggerPathTests(unittest.TestCase):
             True, QMT._field(payload, "time", "stime", "timestamp"), None)
         QMT.passorder = lambda *args: self.calls.append(args) or "501"
         QMT._INSTANCES.clear()
-        QMT._RAW_BUFFER.clear()
         QMT._COUNTERS.update({"orders": 0, "deals": 0, "cancels": 0})
         self.inst = self._instance()
 
@@ -47,7 +46,6 @@ class LargeOrderTriggerPathTests(unittest.TestCase):
         QMT._schedule_order_lookup = self.old_schedule_lookup
         QMT._freshness_gate = self.old_freshness_gate
         QMT._INSTANCES.clear()
-        QMT._RAW_BUFFER.clear()
         if self.had_passorder:
             QMT.passorder = self.old_passorder
         else:

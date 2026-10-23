@@ -5,12 +5,9 @@
 ENABLE_LIVE_ORDERS 默认为 True，使用配置的 QMT 资金账号运行。
 """
 
-import csv
 from collections import deque
 import datetime as _dt
-import json
 import math
-import os
 import time
 
 
@@ -21,6 +18,17 @@ ACCOUNT_TYPE = "stock"
 STRATEGY_NAME = "large_order_limit_up_buy"
 ORDER_TYPE_BUY = 1101
 PRICE_TYPE_LIMIT = 11
+
+POOL_TRADE_DATE = "20261023"
+POOL_ITEMS = (
+    ("600838", 25000.0),
+    ("603933", 21000.0),
+    ("603028", 21000.0),
+    ("603280", 21000.0),
+    ("002535", 21000.0),
+    ("603089", 21000.0),
+    ("001298", 21000.0),
+)
 
 FIRST_SEAL_MIN_AMOUNT = 60000000.0
 FIRST_LARGE_ORDER_MIN_AMOUNT = 2000000.0
@@ -52,9 +60,6 @@ FRESHNESS_MAX_DELAY_MS = {
     "l2order": 2000.0,
 }
 FRESHNESS_FUTURE_TOLERANCE_MS = 1000.0
-RAW_BUFFER_MAX_RECORDS = 20000
-RAW_FLUSH_INTERVAL_SECONDS = 0.5
-RAW_FLUSH_BATCH = 500
 SEEN_ORDER_KEY_MAX_COUNT = 1000
 L2ORDER_SUBSCRIBE_SECONDS = 9 * 60 * 60 + 30 * 60 + 20
 L2ORDER_SUBSCRIBE_GAIN = 0.07
@@ -85,10 +90,6 @@ _INSTANCES = {}
 _SUBSCRIPTIONS = []
 _SUB_SUCCESS = 0
 _SUB_FAILED = 0
-_LOG = None
-_RAW_LOG = None
-_LOG_PATH = ""
-_RAW_LOG_PATH = ""
 _DAY = ""
 _LAST_SUMMARY = 0.0
 _COUNTERS = {"orders": 0, "deals": 0, "cancels": 0, "l2": 0}
@@ -105,12 +106,8 @@ _STARTUP_EVENT_WATERMARK = {}
 _FRESHNESS_DROPS = {}
 _FRESHNESS_LAST_LOG = {}
 _ENTRY_DROPS = {}
-_RAW_BUFFER = deque()
-_RAW_FLUSH_TIMER = None
-_RAW_DROPPED = 0
 _AUCTION_RETRY_TIMER = None
 _L2ORDER_SUBSCRIBE_TIMER = None
-_POOL_PATH = ""
 
 
 def _now():
@@ -391,19 +388,12 @@ def _record_accepted_event(code, period, event_raw, received_at):
         _record_latest_event(code, period, event_epoch)
 
 
-def _persist_unverifiable_raw_event(code, period, payload, event_raw, received_at):
-    if (_event_seconds(event_raw) is None or
-            _event_has_absolute_milliseconds(event_raw)):
-        return
-    _write_raw(code, period, _owned_payload(code, payload), received_at)
-
-
 def _format_local_timestamp(timestamp):
     return _dt.datetime.fromtimestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
 
 
 def _format_event_timestamp(value=None):
-    """Format a QMT event timestamp as HH:MM:SS.mmm for raw records."""
+    """Format a QMT event timestamp as HH:MM:SS.mmm for diagnostics."""
     seconds = _event_seconds(value)
     if seconds is None:
         return ""
@@ -444,37 +434,20 @@ def _in_auction(event_time):
     return "091500" <= event_time < "093000"
 
 
-def _log(message, raw=False):
+def _log(message):
     line = "%s %s" % (_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], message)
     try:
         print(line)
     except Exception:
         pass
-    handle = _RAW_LOG if raw else _LOG
-    if handle:
-        try:
-            handle.write(line + "\n")
-            handle.flush()
-        except Exception:
-            pass
 
 
-def _json_default(value):
-    try:
-        return value.__dict__
-    except Exception:
-        return repr(value)
-
-
-def _write_raw(code, period, payload, received_at=None):
-    global _RAW_DROPPED
+def _record_l2_ingress(code, period, payload, received_at=None):
     received_at = time.time() if received_at is None else received_at
     received_time = _format_local_timestamp(received_at)
     event_value = _field(payload, "stime", "time")
     latency_value = _field(payload, "time", "stime")
     event_time = _event_time(event_value)
-    event_time_display = (_format_event_timestamp(latency_value) or
-                          _format_event_timestamp(event_value))
     latency_ms = _latency_ms(latency_value, received_at)
     _COUNTERS["l2"] += 1
     _PERIOD_COUNTS[period] = _PERIOD_COUNTS.get(period, 0) + 1
@@ -516,55 +489,7 @@ def _write_raw(code, period, payload, received_at=None):
         }
         _log("[回调首条] period=%s code=%s event_time=%s received_time=%s" %
              (period, code, event_time or "", received_time))
-    record = {
-        "received_time": received_time,
-        "event_time": event_time_display,
-        "latency_ms": latency_ms,
-        "code": code, "period": period, "data": payload,
-    }
-    try:
-        # Keep serialization and file I/O out of the high-frequency callback.
-        # The bounded timer below converts these records to JSON in small batches.
-        if len(_RAW_BUFFER) >= RAW_BUFFER_MAX_RECORDS:
-            _RAW_BUFFER.popleft()
-            _RAW_DROPPED += 1
-        _RAW_BUFFER.append(record)
-    except Exception:
-        pass
     return received_at
-
-
-def _flush_raw(max_records=1000):
-    if not _RAW_LOG or not _RAW_BUFFER:
-        return
-    records = []
-    for _ in range(min(max_records, len(_RAW_BUFFER))):
-        records.append(_RAW_BUFFER.popleft())
-    try:
-        lines = [json.dumps(record, ensure_ascii=True, default=_json_default) + "\n"
-                 for record in records]
-        _RAW_LOG.write("".join(lines))
-        _RAW_LOG.flush()
-    except Exception:
-        for record in reversed(records):
-            _RAW_BUFFER.appendleft(record)
-
-
-def _raw_flush_timer(ContextInfo):
-    _flush_raw(RAW_FLUSH_BATCH)
-
-
-def _schedule_raw_flush():
-    global _RAW_FLUSH_TIMER
-    if _C is None:
-        return
-    try:
-        _RAW_FLUSH_TIMER = _C.schedule_run(
-            _raw_flush_timer, _dt.datetime.now() + _dt.timedelta(seconds=1),
-            repeat_times=-1, interval=_dt.timedelta(seconds=RAW_FLUSH_INTERVAL_SECONDS),
-            name="qmt_raw_flush")
-    except Exception as exc:
-        _log("[日志] 原始数据定时落盘创建失败 %r" % (exc,))
 
 
 def _cache_l2order_quote(inst, source, event_raw, received_at):
@@ -706,55 +631,20 @@ def _schedule_auction_retry():
         _log("[竞价] 重试定时器创建失败 %r" % (exc,))
 
 
-def _script_root():
-    """Return the script directory when running as a file, else an empty path."""
-    script_file = globals().get("__file__")
-    if script_file:
-        try:
-            return os.path.dirname(os.path.abspath(script_file))
-        except Exception:
-            pass
-    return ""
-
-
-def _paths():
-    roots = []
-    script_root = _script_root()
-    if script_root:
-        roots.append(script_root)
-    roots.extend([os.getcwd(), os.path.dirname(os.getcwd()), r"C:\光大证券金阳光QMT实盘"])
-    seen = set()
-    for root in roots:
-        if not root or root in seen:
-            continue
-        seen.add(root)
-        yield os.path.join(root, "data", "manual_pool.csv")
-        yield os.path.join(root, "manual_pool.csv")
-
-
-def _load_pool():
-    global _POOL_PATH
-    candidates = list(_paths())
-    path = next((p for p in candidates if os.path.isfile(p)), None)
-    if not path:
-        _POOL_PATH = ""
-        _log("[股票池] 未找到 data/manual_pool.csv，已搜索=%s" % " | ".join(candidates))
+def _load_pool(day=None):
+    trade_date = str(day or _dt.datetime.now().strftime("%Y%m%d"))
+    if trade_date != POOL_TRADE_DATE:
+        _log("[股票池] 日期不匹配，当前日期=%s 配置日期=%s，股票池为空" %
+             (trade_date, POOL_TRADE_DATE))
         return []
-    _POOL_PATH = os.path.abspath(path)
     result = []
-    try:
-        with open(path, "r", encoding="utf-8-sig", newline="") as handle:
-            for row in csv.DictReader(handle):
-                code = _stock_code(row.get("code"))
-                amount = _safe_float(row.get("plan_amount"))
-                if code and amount and amount > 0:
-                    result.append({"code": code, "plan_amount": amount})
-                else:
-                    _log("[初始化] 忽略无效CSV记录 %r" % row)
-    except Exception as exc:
-        _log("[初始化] CSV读取失败 %r" % (exc,))
-    _log("[股票池] path=%s count=%d codes=%s" %
-         (_POOL_PATH, len(result), ",".join(x["code"] for x in result)))
+    for raw_code, raw_amount in POOL_ITEMS:
+        code = _stock_code(raw_code)
+        amount = _safe_float(raw_amount)
+        if code and amount:
+            result.append({"code": code, "plan_amount": amount})
+    _log("[股票池] date=%s count=%d codes=%s" %
+         (trade_date, len(result), ",".join(x["code"] for x in result)))
     return result
 
 
@@ -1518,8 +1408,6 @@ def _handle_quote(code, period, payload):
         fresh, event_raw, _ = _freshness_gate(
             code, period, source, received_at, record_latest=False)
         if not fresh:
-            _persist_unverifiable_raw_event(
-                code, period, payload, event_raw, received_at)
             return
         if period == "l2quote":
             _cache_l2order_quote(inst, source, event_raw, received_at)
@@ -1533,7 +1421,7 @@ def _handle_quote(code, period, payload):
         is_l2quote = period == "l2quote"
         if event_time:
             inst["last_event_time"] = event_time
-        received_at = _write_raw(code, period, data, received_at)
+        received_at = _record_l2_ingress(code, period, data, received_at)
         if is_l2quote:
             inst["last_signal_period"] = period
             inst["last_signal_event_raw"] = event_raw
@@ -1560,8 +1448,7 @@ def _handle_quote(code, period, payload):
         bid_at_limit = abs(bid - limit_up) < 1e-8
         seal_amount = _amount(bid, bid_vol)
         if is_l2quote:
-            # Keep only the latest scalar quote state; the detached full payload
-            # remains in the bounded raw queue until the scheduled flush.
+            # Keep only the latest scalar quote state needed by the strategy.
             inst["last_l2quote"] = {
                 "time": _field(data, "time"),
                 "stime": _field(data, "stime"),
@@ -1636,8 +1523,6 @@ def _handle_l2order(code, payload):
         fresh, event_raw, _ = _freshness_gate(
             code, "l2order", source, received_at, record_latest=False)
         if not fresh:
-            _persist_unverifiable_raw_event(
-                code, "l2order", payload, event_raw, received_at)
             return
         accepted, event_time, drop_reason, event_key = _l2order_entry_gate(
             inst, source, event_raw)
@@ -1646,7 +1531,7 @@ def _handle_l2order(code, payload):
             return
         _record_accepted_event(code, "l2order", event_raw, received_at)
         data = _owned_payload(code, payload)
-        received_at = _write_raw(code, "l2order", data, received_at)
+        received_at = _record_l2_ingress(code, "l2order", data, received_at)
         inst["last_signal_period"] = "l2order"
         inst["last_signal_event_raw"] = event_raw
         inst["last_signal_received_at"] = received_at
@@ -1886,12 +1771,12 @@ def _summary():
             "%.0fms" % gaps.get("max_ms") if gap_count else "n/a",
             len([key for key in _LAST_RECEIVED_AT if key[0] == period]))
     _log("[汇总] 监控=%d 下单=%d 成交=%d 撤单=%d L2=%d 订阅=%d成功/%d失败 "
-         "回调=%s 首条=%s 延时=%s 缓冲=%d 丢弃=%d freshness_drop=%s "
+         "回调=%s 首条=%s 延时=%s freshness_drop=%s "
          "entry_drop=%s 最近事件=%s 状态=%s" %
          (len(_INSTANCES), _COUNTERS["orders"], _COUNTERS["deals"], _COUNTERS["cancels"],
           _COUNTERS["l2"], _SUB_SUCCESS, _SUB_FAILED,
           period_counts, "%d/%d[%s]" % (len(_FIRST_CALLBACKS), len(PERIODS), first_callbacks),
-          ";".join(latency_parts), len(_RAW_BUFFER), _RAW_DROPPED, freshness_drops,
+          ";".join(latency_parts), freshness_drops,
           entry_drops,
           last_events,
           ";".join("%s:%s" % (k, ",".join(v)) for k, v in sorted(by_state.items()))))
@@ -1907,8 +1792,7 @@ def _summary():
 
 
 def init(C):
-    global _C, _LOG, _RAW_LOG, _LOG_PATH, _RAW_LOG_PATH, _DAY, _LAST_SUMMARY
-    global _RAW_FLUSH_TIMER, _RAW_DROPPED, _AUCTION_RETRY_TIMER
+    global _C, _DAY, _LAST_SUMMARY, _AUCTION_RETRY_TIMER
     global _L2ORDER_SUBSCRIBE_TIMER, _SUB_SUCCESS, _SUB_FAILED
     with _LOCK:
         _C = C
@@ -1918,29 +1802,7 @@ def init(C):
             except Exception as exc:
                 _log("[初始化] 交易账户注册失败 %r" % (exc,))
         _DAY = _dt.datetime.now().strftime("%Y%m%d")
-        script_root = _script_root()
-        script_file = globals().get("__file__")
-        log_dir = (os.path.join(script_root, "..", "userdata", "log")
-                   if script_root else "")
-        if not log_dir or not os.path.isdir(log_dir):
-            log_dir = os.path.join(os.getcwd(), "userdata", "log")
-        _LOG_PATH = ""
-        _RAW_LOG_PATH = ""
-        try:
-            if not os.path.isdir(log_dir):
-                os.makedirs(log_dir)
-            _LOG_PATH = os.path.abspath(os.path.join(log_dir, "qmt_strategy_%s.log" % _DAY))
-            _RAW_LOG_PATH = os.path.abspath(os.path.join(log_dir, "qmt_strategy_raw_%s.jsonl" % _DAY))
-            _LOG = open(_LOG_PATH, "a")
-            _RAW_LOG = open(_RAW_LOG_PATH, "a")
-        except Exception:
-            _LOG = None
-            _RAW_LOG = None
-        _log("[运行] script_root=%s" % (script_root or "<empty>"))
-        _log("[运行] cwd=%s" % os.getcwd())
-        _log("[运行] __file__=%s" % (os.path.abspath(script_file) if script_file else "absent"))
-        _log("[运行] log_path=%s" % (_LOG_PATH or "<unavailable>"))
-        _log("[运行] raw_log_path=%s" % (_RAW_LOG_PATH or "<unavailable>"))
+        _log("[运行] log=console_only raw_capture=disabled")
         _log("[运行] ENABLE_LIVE_ORDERS=%s PERIODS=%s" %
              (ENABLE_LIVE_ORDERS, ",".join(PERIODS)))
         _log("[运行] latency_warning_thresholds=l2quote:%.0fms,l2order:%.0fms "
@@ -1962,16 +1824,13 @@ def init(C):
         _FRESHNESS_DROPS.clear()
         _FRESHNESS_LAST_LOG.clear()
         _ENTRY_DROPS.clear()
-        _RAW_BUFFER.clear()
-        _RAW_FLUSH_TIMER = None
-        _RAW_DROPPED = 0
         _AUCTION_RETRY_TIMER = None
         _L2ORDER_SUBSCRIBE_TIMER = None
         _SUB_SUCCESS = 0
         _SUB_FAILED = 0
         _INSTANCES.clear()
         _SUBSCRIPTIONS[:] = []
-        for item in _load_pool():
+        for item in _load_pool(_DAY):
             _INSTANCES[item["code"]] = _new_instance(item["code"], item["plan_amount"])
         startup_received_at = time.time()
         for inst in _INSTANCES.values():
@@ -1998,7 +1857,6 @@ def init(C):
              "watching_l2order_candidates=%d skipped=%d" %
              (len(_SUBSCRIPTIONS), _SUB_SUCCESS, _SUB_FAILED,
               expected_subscriptions, pending_l2order, skipped_count))
-        _schedule_raw_flush()
         _schedule_auction_retry()
         _LAST_SUMMARY = _now()
         _log("[运行] 原生模型启动完成，股票池=%d，调试汇总间隔=%ss" %
@@ -2142,13 +2000,7 @@ def deal_callback(ContextInfo, dealInfo):
 
 def stop(C):
     with _LOCK:
-        global _RAW_FLUSH_TIMER, _AUCTION_RETRY_TIMER, _L2ORDER_SUBSCRIBE_TIMER
-        if _RAW_FLUSH_TIMER is not None:
-            try:
-                C.cancel_schedule_run(_RAW_FLUSH_TIMER)
-            except Exception:
-                pass
-            _RAW_FLUSH_TIMER = None
+        global _AUCTION_RETRY_TIMER, _L2ORDER_SUBSCRIBE_TIMER
         if _AUCTION_RETRY_TIMER is not None:
             try:
                 C.cancel_schedule_run("qmt_auction_retry")
@@ -2164,16 +2016,9 @@ def stop(C):
         for inst in _INSTANCES.values():
             _cancel_timer(inst)
             _cancel_order_lookup(inst)
-        _flush_raw(20000)
         for sub_id in list(_SUBSCRIPTIONS):
             try:
                 C.unsubscribe_quote(sub_id)
             except Exception:
                 pass
         _summary()
-        for handle in (_LOG, _RAW_LOG):
-            try:
-                if handle:
-                    handle.close()
-            except Exception:
-                pass

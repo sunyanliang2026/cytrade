@@ -60,13 +60,11 @@ class DynamicL2OrderSubscriptionTests(unittest.TestCase):
         QMT._FRESHNESS_LAST_LOG.clear()
         QMT._ENTRY_DROPS.clear()
         QMT._CALLBACK_COUNTS.clear()
-        QMT._RAW_BUFFER.clear()
         self.inst = self.instance()
 
     def cleanup(self):
         QMT._INSTANCES.clear()
         QMT._SUBSCRIPTIONS[:] = []
-        QMT._RAW_BUFFER.clear()
         for patch in reversed(self.patches):
             patch.stop()
 
@@ -120,11 +118,7 @@ class DynamicL2OrderSubscriptionTests(unittest.TestCase):
         with self.frozen_datetime(now), mock.patch.object(QMT.time, "time", return_value=now), \
                 mock.patch.object(QMT, "_load_pool", return_value=pool), \
                 mock.patch.object(QMT, "_initial_quote_batch"), \
-                mock.patch.object(QMT, "_schedule_raw_flush"), \
-                mock.patch.object(QMT, "_schedule_auction_retry"), \
-                mock.patch.object(QMT.os.path, "isdir", return_value=True), \
-                mock.patch("builtins.open", mock.mock_open()), \
-                mock.patch.object(QMT, "_LOG"), mock.patch.object(QMT, "_RAW_LOG"):
+                mock.patch.object(QMT, "_schedule_auction_retry"):
             QMT.init(self.context)
         self.assertEqual(len(self.context.subscribed), 1)
         self.assertEqual(self.context.subscribed[0][1]["period"], "l2quote")

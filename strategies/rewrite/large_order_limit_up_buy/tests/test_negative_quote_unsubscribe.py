@@ -45,7 +45,6 @@ class NegativeQuoteExitTests(unittest.TestCase):
         QMT.cancel = lambda *args: self.cancel_calls.append(args)
         QMT._INSTANCES.clear()
         QMT._SUBSCRIPTIONS[:] = []
-        QMT._RAW_BUFFER.clear()
         QMT._PERIOD_COUNTS.clear()
         QMT._FIRST_CALLBACKS.clear()
         QMT._LAST_EVENT_TIMES.clear()
@@ -100,7 +99,6 @@ class NegativeQuoteExitTests(unittest.TestCase):
         self.assertEqual(self.inst["validation_order_id"], "501")
         self.assertEqual(self.cancel_calls, [])
 
-        raw_count = len(QMT._RAW_BUFFER)
         QMT._handle_l2order(self.inst["code"], {
             "stime": "100001", "price": 11.0, "volume": 1000000,
             "direction": "B", "entrustNo": "new-market-order",
@@ -114,7 +112,6 @@ class NegativeQuoteExitTests(unittest.TestCase):
             "deal_id": "deal-1", "deal_volume": 1000,
         })
 
-        self.assertEqual(len(QMT._RAW_BUFFER), raw_count)
         self.assertEqual(self.inst["our_traded_qty"], 0)
         self.assertEqual(QMT._COUNTERS["deals"], 0)
         self.assertEqual(self.cancel_calls, [])

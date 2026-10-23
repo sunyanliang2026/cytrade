@@ -60,7 +60,7 @@ C.subscribe_quote(code, period="l2order", dividend_type="follow",
 - `[L2ORDER_REQUEST]`：代码、涨幅、报价事件时间及延时、申请次数、登记结果和接口调用耗时。
 - `[L2ORDER_FIRST_CALLBACK]`：每股首次逐笔到达距最近申请的时间、该事件延时；不作为下单前置条件。
 - `[L2ORDER_COVERAGE]`：全池数量、当前登记逐笔的股票数、曾收到首条逐笔的股票数，以及业务筛选前累计报价/逐笔入口数。
-- 原汇总：保留 `freshness_drop`、`entry_drop`、通过业务筛选后的延时统计和原始缓冲情况。
+- 原汇总：保留 `freshness_drop`、`entry_drop`、通过业务筛选后的延时统计；策略不再缓存或落盘原始行情。
 
 入口累计数用于比较实际回调负载，通过业务筛选后的延时均值不代表全量入口延时。首条到达间隔还包含自然无委托的时间，不能全部视为订阅接口耗时。
 

@@ -15,16 +15,15 @@ class FreshnessGateTests(unittest.TestCase):
         self.old_log = QMT._log
         self.logs = []
         QMT._log = self.logs.append
-        QMT._RAW_BUFFER.clear()
         QMT._LATEST_EVENT_EPOCH.clear()
         QMT._STARTUP_EVENT_WATERMARK.clear()
         QMT._FRESHNESS_DROPS.clear()
         QMT._FRESHNESS_LAST_LOG.clear()
         QMT._ENTRY_DROPS.clear()
+        QMT._COUNTERS["l2"] = 0
 
     def tearDown(self):
         QMT._log = self.old_log
-        QMT._RAW_BUFFER.clear()
         QMT._INSTANCES.clear()
 
     def test_stale_l2order_is_rejected_before_payload_copy_and_trigger(self):
@@ -44,7 +43,6 @@ class FreshnessGateTests(unittest.TestCase):
 
         self.assertFalse(accepted)
         self.assertAlmostEqual(delay_ms, 2001.0, places=3)
-        self.assertEqual(len(QMT._RAW_BUFFER), 0)
         self.assertEqual(QMT._FRESHNESS_DROPS["l2order"]["count"], 1)
 
     def test_freshness_gate_rejects_out_of_order_absolute_event(self):
@@ -158,7 +156,8 @@ class FreshnessGateTests(unittest.TestCase):
             )
             with mock.patch.object(
                     QMT, "_owned_payload", wraps=QMT._owned_payload) as owned_payload:
-                with mock.patch.object(QMT, "_write_raw", wraps=QMT._write_raw) as write_raw:
+                with mock.patch.object(
+                        QMT, "_record_l2_ingress", wraps=QMT._record_l2_ingress) as record_ingress:
                     for payload in invalid_orders:
                         QMT._handle_l2order(inst["code"], payload)
 
@@ -171,11 +170,11 @@ class FreshnessGateTests(unittest.TestCase):
                     QMT._handle_l2order(inst["code"], duplicate)
 
                     self.assertEqual(owned_payload.call_count, 1)
-                    self.assertEqual(write_raw.call_count, 1)
+                    self.assertEqual(record_ingress.call_count, 1)
         finally:
             QMT._freshness_gate = old_gate
 
-        self.assertEqual(len(QMT._RAW_BUFFER), 1)
+        self.assertEqual(QMT._COUNTERS["l2"], 1)
         self.assertEqual(len(inst["l2order_history"]), 1)
         self.assertEqual(inst["last_signal_event_raw"], "100003")
         self.assertEqual(inst["seen_order_ids"], {"valid-buy"})
@@ -193,12 +192,13 @@ class FreshnessGateTests(unittest.TestCase):
         try:
             with mock.patch.object(
                     QMT, "_owned_payload", wraps=QMT._owned_payload) as owned_payload:
-                with mock.patch.object(QMT, "_write_raw", wraps=QMT._write_raw) as write_raw:
+                with mock.patch.object(
+                        QMT, "_record_l2_ingress", wraps=QMT._record_l2_ingress) as record_ingress:
                     QMT._handle_quote(inst["code"], "l2quote", {
                         "stime": "100000", "upLimit": 11.0, "lastClose": 10.0,
                     })
                     self.assertEqual(owned_payload.call_count, 0)
-                    self.assertEqual(write_raw.call_count, 0)
+                    self.assertEqual(record_ingress.call_count, 0)
 
                     # The bid is absent, but these fresh fields seed the
                     # opening-low filter used by large-order decisions.
@@ -207,11 +207,11 @@ class FreshnessGateTests(unittest.TestCase):
                         "open": 10.0, "low": 9.8, "lastPrice": 10.2,
                     })
                     self.assertEqual(owned_payload.call_count, 1)
-                    self.assertEqual(write_raw.call_count, 1)
+                    self.assertEqual(record_ingress.call_count, 1)
         finally:
             QMT._freshness_gate = old_gate
 
-        self.assertEqual(len(QMT._RAW_BUFFER), 1)
+        self.assertEqual(QMT._COUNTERS["l2"], 1)
         self.assertEqual(inst["open_price"], 10.0)
         self.assertEqual(inst["day_low"], 9.8)
         self.assertEqual(inst["last_event_time"], "100001")
@@ -239,12 +239,12 @@ class FreshnessGateTests(unittest.TestCase):
                 "bidPrice": [11.0], "bidVol": [5000],
             })
 
-        self.assertEqual(len(QMT._RAW_BUFFER), 1)
+        self.assertEqual(QMT._COUNTERS["l2"], 1)
         self.assertAlmostEqual(
             QMT._LATEST_EVENT_EPOCH[("l2quote", inst["code"])], older_useful, places=3)
         self.assertEqual(QMT._ENTRY_DROPS["l2quote"]["reasons"]["missing_bid"], 1)
 
-    def test_unverifiable_l2order_is_persisted_without_order_decision(self):
+    def test_unverifiable_l2order_is_dropped_without_order_decision(self):
         inst = QMT._new_instance("000001.SZ", 10000)
         inst.update({"state": QMT.STATE_READY, "limit_up": 10.0,
                      "open_price": 10.0, "day_low": 9.8})
@@ -264,15 +264,14 @@ class FreshnessGateTests(unittest.TestCase):
                 QMT._handle_l2order(inst["code"], payload)
                 submit.assert_not_called()
 
-        self.assertEqual(len(QMT._RAW_BUFFER), 1)
-        self.assertEqual(QMT._RAW_BUFFER[0]["event_time"], "10:00:00.000")
-        self.assertIsNone(QMT._RAW_BUFFER[0]["latency_ms"])
+        self.assertEqual(QMT._FRESHNESS_DROPS["l2order"]["last_reason"],
+                         "unverifiable_event_time")
         self.assertEqual(inst["last_signal_period"], "")
         self.assertEqual(inst["l2order_history"], [])
         self.assertEqual(inst["seen_order_ids"], set())
         self.assertEqual(inst["state"], QMT.STATE_READY)
 
-    def test_unverifiable_l2quote_is_persisted_without_quote_state_change(self):
+    def test_unverifiable_l2quote_is_dropped_without_quote_state_change(self):
         inst = QMT._new_instance("000001.SZ", 10000)
         inst.update({"state": QMT.STATE_READY, "limit_up": 10.0,
                      "last_close": 9.0, "open_price": 9.5})
@@ -291,9 +290,8 @@ class FreshnessGateTests(unittest.TestCase):
             clock.monotonic.return_value = 10.0
             QMT._handle_quote(inst["code"], "l2quote", payload)
 
-        self.assertEqual(len(QMT._RAW_BUFFER), 1)
-        self.assertEqual(QMT._RAW_BUFFER[0]["event_time"], "10:00:00.250")
-        self.assertIsNone(QMT._RAW_BUFFER[0]["latency_ms"])
+        self.assertEqual(QMT._FRESHNESS_DROPS["l2quote"]["last_reason"],
+                         "unverifiable_event_time")
         self.assertEqual(inst["last_l2quote"], {})
         self.assertEqual(inst["last_signal_period"], "")
         self.assertEqual(inst["last_event_time"], "")
