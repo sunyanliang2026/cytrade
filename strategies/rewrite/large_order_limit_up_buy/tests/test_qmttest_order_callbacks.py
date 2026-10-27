@@ -309,13 +309,13 @@ class QMTOrderCallbackTests(unittest.TestCase):
 
         self.assertEqual(self.inst["validation_pre_count"], 2)
         self.assertEqual(self.inst["validation_pre_large_count"], 2)
-        self.assertEqual(self.inst["verify_count"], 2)
-        self.assertEqual(self.inst["verify_large_count"], 2)
+        self.assertEqual(self.inst["verify_count"], 0)
+        self.assertEqual(self.inst["verify_large_count"], 0)
         self.assertTrue(self.inst["validation_passed"])
         self.assertFalse(self.inst["validation_active"])
         self.assertTrue(any("FOLLOW_VERIFY_PREPASS" in line for line in self.logs))
 
-    def test_pre_submit_history_can_supply_one_large_order(self):
+    def test_single_pre_submit_large_does_not_count_as_post_observation(self):
         QMT.passorder = lambda *args: 0
 
         self._send_order("pre-large", event_time="100000", volume=150000)
@@ -325,10 +325,10 @@ class QMTOrderCallbackTests(unittest.TestCase):
         self.assertTrue(self.inst["validation_active"])
         self._send_order("post-large", event_time="100002", volume=150000)
 
-        self.assertEqual(self.inst["verify_count"], 2)
-        self.assertEqual(self.inst["verify_large_count"], 2)
-        self.assertTrue(self.inst["validation_passed"])
-        self.assertFalse(self.inst["validation_active"])
+        self.assertEqual(self.inst["verify_count"], 1)
+        self.assertEqual(self.inst["verify_large_count"], 1)
+        self.assertFalse(self.inst["validation_passed"])
+        self.assertTrue(self.inst["validation_active"])
 
     def test_pre_submit_history_is_bounded_and_old_records_are_ignored(self):
         now = QMT._now()

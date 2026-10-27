@@ -19,17 +19,17 @@ STRATEGY_NAME = "large_order_limit_up_buy"
 ORDER_TYPE_BUY = 1101
 PRICE_TYPE_LIMIT = 11
 
-POOL_TRADE_DATE = "20261023"
-POOL_ITEMS = (
-    ("600838", 25000.0),
-    ("603933", 21000.0),
-    ("603028", 21000.0),
-    ("603280", 21000.0),
-    ("002535", 21000.0),
-    ("603089", 21000.0),
-    ("001298", 21000.0),
-)
+POOL_TRADE_DATE = "20261027"
 
+POOL_ITEMS = (
+    ("002820", 25000.0),
+    ("002093", 25000.0),
+    ("001219", 25000.0),
+    ("600558", 25000.0),
+    ("603528", 25000.0),
+    ("603028", 25000.0),
+    ("603337", 25000.0),
+)
 FIRST_SEAL_MIN_AMOUNT = 60000000.0
 FIRST_LARGE_ORDER_MIN_AMOUNT = 2000000.0
 FIRST_LARGE_ORDER_TOTAL_AMOUNT = 10000000.0
@@ -53,6 +53,7 @@ CANCEL_MAX_ATTEMPTS = 3
 
 PERIODS = ("l2quote", "l2order", "l2transaction")
 DEBUG_SUMMARY_INTERVAL_SECONDS = 60
+EXTERNAL_CANCEL_WAIT_LOG_INTERVAL_SECONDS = 60.0
 DEBUG_LATENCY_WARN_THRESHOLD_MS = 2000.0
 DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS = 1200.0
 DEBUG_LATENCY_WARN_INTERVAL_SECONDS = 10.0
@@ -678,10 +679,13 @@ def _new_instance(code, amount):
         "cancel_requested": False, "cancel_attempts": 0,
         "cancel_terminal": False, "external_cancel_due": False,
         "external_cancel_volume": 0, "external_cancel_event_keys": set(),
+        "external_cancel_monitor_enabled": False,
+        "external_cancel_wait_count": 0, "external_cancel_wait_last_log": 0.0,
         "trigger_order_id": None, "trigger_order_key": None,
         "trigger_order_price": None, "trigger_order_volume": 0,
         "trigger_order_amount": 0.0, "trigger_order_direction": "",
-        "trigger_order_event_time": "", "pending_external_cancels": {},
+        "trigger_order_event_raw": None, "trigger_order_event_time": "",
+        "pending_external_cancels": {},
         "late_large_count": 0,
         "late_large_ids": set(), "follow_sent": False, "our_order_id": None,
         "our_order_qty": 0, "our_traded_qty": 0, "our_order_status": "",
@@ -976,12 +980,16 @@ def _pre_submit_validation_records(inst, cutoff_seconds, now, trigger_order_key=
     return records
 
 
-def _start_validation(inst, trigger_order_key=None):
+def _start_validation(inst, trigger_order_key=None, trigger_event_raw=None):
     if (inst.get("submit_reason") not in VALIDATED_SUBMIT_REASONS or
             inst["state"] in (STATE_DONE, STATE_SKIPPED)):
         return
     now = _now()
-    cutoff_seconds = _wall_seconds_since_midnight()
+    cutoff_seconds = (_event_seconds(trigger_event_raw)
+                      if trigger_event_raw is not None else None)
+    cutoff_source = "trigger_l2order" if cutoff_seconds is not None else "local_decision"
+    if cutoff_seconds is None:
+        cutoff_seconds = _wall_seconds_since_midnight()
     pre_records = _pre_submit_validation_records(
         inst, cutoff_seconds, now, trigger_order_key)
     pre_large_ids = set(record.get("large_key") for record in pre_records
@@ -994,9 +1002,10 @@ def _start_validation(inst, trigger_order_key=None):
     inst["validation_order_id"] = inst.get("our_order_id")
     inst["validation_pre_count"] = len(pre_records)
     inst["validation_pre_large_count"] = len(pre_large_ids)
-    inst["verify_count"] = len(pre_records)
-    inst["verify_large_count"] = len(pre_large_ids)
-    inst["verify_large_ids"] = pre_large_ids
+    # Pre-submit history is only a prepass check; observation counters start after submission.
+    inst["verify_count"] = 0
+    inst["verify_large_count"] = 0
+    inst["verify_large_ids"] = set()
     inst["cancel_started"] = None
     inst["cancel_confirmed"] = False
     inst["cancel_failed"] = False
@@ -1007,9 +1016,9 @@ def _start_validation(inst, trigger_order_key=None):
     inst["follow_sent"] = False
     inst["validation_passed"] = False
     _log("[FOLLOW_VERIFY_START] code=%s token=%s order_id=%s window=%.0fms "
-         "max_events=%d required_large=%d min_amount=%.0f pre_events=%d "
+         "max_post_events=%d required_large=%d min_amount=%.0f pre_events=%d "
          "pre_large=%d history_max=%d history_age=%.1fs signal_period=%s "
-         "signal_age_ms=%s" % (
+         "signal_age_ms=%s boundary=%s boundary_seconds=%.3f" % (
              inst["code"], inst.get("submit_token"),
              inst.get("validation_order_id") or "pending",
              RESEAL_VALIDATION_WINDOW_SECONDS * 1000.0,
@@ -1019,15 +1028,15 @@ def _start_validation(inst, trigger_order_key=None):
              RESEAL_PRE_SUBMIT_ORDER_MAX_COUNT,
              RESEAL_PRE_SUBMIT_ORDER_MAX_AGE_SECONDS,
              inst.get("last_signal_period") or "unknown",
-             "%.0f" % inst["last_latency_ms"] if inst.get("last_latency_ms") is not None else "n/a"))
+             "%.0f" % inst["last_latency_ms"] if inst.get("last_latency_ms") is not None else "n/a",
+             cutoff_source, cutoff_seconds))
     if inst["validation_pre_large_count"] >= RESEAL_VERIFY_LARGE_COUNT:
         inst["validation_active"] = False
         inst["validation_passed"] = True
-        _log("[FOLLOW_VERIFY_PREPASS] code=%s events=%d/%d large=%d/%d "
+        _log("[FOLLOW_VERIFY_PREPASS] code=%s pre_events=%d pre_large=%d/%d "
              "reason=pre_submit_history; order remains active" % (
                  inst["code"], inst["validation_pre_count"],
-                 RESEAL_VERIFY_ORDER_COUNT, inst["validation_pre_large_count"],
-                 RESEAL_VERIFY_LARGE_COUNT))
+                 inst["validation_pre_large_count"], RESEAL_VERIFY_LARGE_COUNT))
     else:
         _schedule_validation(inst)
 
@@ -1195,14 +1204,15 @@ def _set_trigger_order(inst, trigger_order_key, trigger_order=None):
     if not trigger_order_key or not trigger_order:
         return
     order_id = str(trigger_order.get("order_id") or "")
-    if not order_id:
+    if not order_id or order_id in ("-1", "0"):
         return
     inst["trigger_order_key"] = trigger_order_key
-    inst["trigger_order_id"] = order_id
+    inst["trigger_order_id"], inst["external_cancel_monitor_enabled"] = order_id, True
     inst["trigger_order_price"] = _safe_float(trigger_order.get("price"))
     inst["trigger_order_volume"] = _safe_float(trigger_order.get("volume")) or 0
     inst["trigger_order_amount"] = _safe_float(trigger_order.get("amount")) or 0.0
     inst["trigger_order_direction"] = str(trigger_order.get("direction") or "").upper()
+    inst["trigger_order_event_raw"] = trigger_order.get("event_raw")
     inst["trigger_order_event_time"] = str(trigger_order.get("event_time") or "")
     pending = inst.get("pending_external_cancels", {}).pop(order_id, [])
     for record in pending:
@@ -1247,9 +1257,23 @@ def _submit(inst, reason, trigger_order_key=None, trigger_order=None):
         inst["cancel_requested"] = False
         inst["cancel_attempts"] = 0
         inst["cancel_terminal"] = False
-        inst["external_cancel_due"] = False
+        inst["external_cancel_due"], inst["external_cancel_monitor_enabled"] = False, False
         inst["external_cancel_volume"] = 0
         inst["external_cancel_event_keys"].clear()
+        inst["trigger_order_key"] = None
+        inst["trigger_order_id"] = None
+        inst["trigger_order_price"] = None
+        inst["trigger_order_volume"] = 0
+        inst["trigger_order_amount"] = 0.0
+        inst["trigger_order_direction"] = ""
+        inst["trigger_order_event_raw"] = None
+        inst["trigger_order_event_time"] = ""
+        inst["pending_external_cancels"].clear()
+        inst["external_cancel_wait_count"] = 0
+        inst["external_cancel_wait_last_log"] = 0.0
+        trigger_event_raw = (trigger_order.get("event_raw")
+                             if trigger_order else None)
+        inst["trigger_order_event_raw"] = trigger_event_raw
         signal_received_at = inst.get("last_signal_received_at")
         signal_event_raw = inst.get("last_signal_event_raw")
         signal_age_ms = (_latency_ms(signal_event_raw, time.time())
@@ -1258,7 +1282,8 @@ def _submit(inst, reason, trigger_order_key=None, trigger_order=None):
             max(0.0, (time.time() - signal_received_at) * 1000.0)
             if signal_received_at is not None else None)
         if reason in VALIDATED_SUBMIT_REASONS:
-            _start_validation(inst, trigger_order_key)
+            _start_validation(
+                inst, trigger_order_key, trigger_event_raw)
         _set_trigger_order(inst, trigger_order_key, trigger_order)
         passorder_started = _now()
         try:
@@ -1345,7 +1370,7 @@ def _request_cancel(inst, reason="validation_failed", ContextInfo=None):
     if not order_id:
         inst["cancel_due"] = True
         inst["cancel_due_reason"] = reason
-        _log("[CANCEL_WAIT_ORDER_ID] code=%s token=%s reason=%s verify=%d large=%d "
+        _log("[CANCEL_WAIT_ORDER_ID] code=%s token=%s reason=%s post_events=%d post_large=%d "
              "attempts=%d" % (
                  inst["code"], inst.get("submit_token"), reason,
                  inst.get("verify_count", 0), inst.get("verify_large_count", 0),
@@ -1421,7 +1446,7 @@ def _check_validation(inst, ContextInfo=None):
             _cancel_timer(inst)
             if not inst.get("validation_passed"):
                 inst["validation_passed"] = True
-                _log("[FOLLOW_VERIFY_PASS] code=%s order_id=%s events=%d large=%d "
+                _log("[FOLLOW_VERIFY_PASS] code=%s order_id=%s post_events=%d post_large=%d "
                      "elapsed_ms=%.0f; order remains active" % (
                          inst["code"], inst.get("validation_order_id") or "pending",
                          inst["verify_count"], inst["verify_large_count"],
@@ -1434,8 +1459,8 @@ def _check_validation(inst, ContextInfo=None):
             reason = "event_limit" if reached_event_limit else "timeout"
             inst["validation_active"] = False
             _cancel_timer(inst)
-            _log("[FOLLOW_VERIFY_FAIL] code=%s order_id=%s reason=%s events=%d/%d "
-                 "large=%d/%d elapsed_ms=%.0f stale_events=%d; cancel required" % (
+            _log("[FOLLOW_VERIFY_FAIL] code=%s order_id=%s reason=%s post_events=%d/%d "
+                 "post_large=%d/%d elapsed_ms=%.0f stale_events=%d; cancel required" % (
                      inst["code"], inst.get("validation_order_id") or "pending", reason,
                      inst["verify_count"], RESEAL_VERIFY_ORDER_COUNT,
                      inst["verify_large_count"], RESEAL_VERIFY_LARGE_COUNT,
@@ -1478,6 +1503,16 @@ def _is_cancel_direction(value):
 
 def _is_buy_direction(value):
     return str(value or "").strip().upper() in ("B", "BUY", "1", "买", "买入")
+
+
+def _external_cancel_watch_active(inst):
+    """Only inspect external cancel events while our order can be affected."""
+    if inst.get("submission_pending") and inst.get("external_cancel_monitor_enabled"):
+        return True
+    return bool(inst.get("external_cancel_monitor_enabled") and
+        inst.get("our_order_id") and
+        inst.get("state") not in (STATE_DONE, STATE_SKIPPED)
+    )
 
 
 def _remember_cancel_event_key(inst, event_key):
@@ -1524,12 +1559,21 @@ def _remember_pending_external_cancel(inst, record):
 
 def _process_external_cancel(inst, record):
     order_id = str(record.get("order_id") or "")
-    if not order_id:
+    if not order_id or not inst.get("external_cancel_monitor_enabled"):
         return False
     if not inst.get("trigger_order_id"):
         _remember_pending_external_cancel(inst, record)
-        _log("[EXTERNAL_CANCEL_WAIT_TRIGGER] code=%s order_id=%s source=%s" % (
-            inst["code"], order_id, record.get("source") or "unknown"))
+        wait_count = int(inst.get("external_cancel_wait_count", 0) or 0) + 1
+        inst["external_cancel_wait_count"] = wait_count
+        now = _now()
+        last_log = float(inst.get("external_cancel_wait_last_log", 0.0) or 0.0)
+        if (wait_count == 1 or
+                now - last_log >= EXTERNAL_CANCEL_WAIT_LOG_INTERVAL_SECONDS):
+            inst["external_cancel_wait_last_log"] = now
+            _log("[EXTERNAL_CANCEL_WAIT_TRIGGER] code=%s pending_ids=%d count=%d "
+                 "last_order_id=%s source=%s" % (
+                     inst["code"], len(inst.get("pending_external_cancels", {})),
+                     wait_count, order_id, record.get("source") or "unknown"))
         return False
     if not _external_cancel_matches(inst, record):
         _log("[EXTERNAL_CANCEL_IGNORED] code=%s order_id=%s trigger=%s price=%s source=%s" % (
@@ -1614,6 +1658,11 @@ def _l2order_entry_gate(inst, source, event_raw):
     if _is_cancel_direction(direction):
         if not order_id:
             return False, event_time, "cancel_missing_order_id", None
+        if not _external_cancel_watch_active(inst):
+            return False, event_time, "cancel_not_needed", None
+        trigger_order_id = str(inst.get("trigger_order_id") or "")
+        if trigger_order_id and order_id != trigger_order_id:
+            return False, event_time, "cancel_not_trigger", None
         cancel_volume = volume or 0.0
         event_key = "cancel:%s:%s:%s" % (order_id, event_raw or event_time, cancel_volume)
         if event_key in inst.setdefault("seen_cancel_event_keys", set()):
@@ -1827,7 +1876,7 @@ def _handle_l2order(code, payload):
             inst, event_key, order_id, event_raw, event_time, price, direction,
             volume, amount, received_at, _now())
 
-        # Start validating from the accepted submit, excluding delayed market events.
+        # L2-triggered validation starts at the trigger event, not local submit time.
         if inst.get("validation_started") is not None and inst.get("submit_reason") in VALIDATED_SUBMIT_REASONS:
             if order_id and order_id in (
                     str(inst.get("validation_order_id") or ""),
@@ -1846,7 +1895,7 @@ def _handle_l2order(code, payload):
                 if event_seconds is not None and cutoff is not None and event_seconds <= cutoff:
                     inst["validation_stale_count"] += 1
                     if inst["validation_stale_count"] == 1:
-                        _log("[FOLLOW_VERIFY_STALE_EVENT] code=%s event=%s cutoff=%.3f" % (
+                        _log("[FOLLOW_VERIFY_BEFORE_BOUNDARY] code=%s event=%s cutoff=%.3f" % (
                             inst["code"], event_raw, cutoff))
                     _check_validation(inst)
                     return
@@ -1857,7 +1906,7 @@ def _handle_l2order(code, payload):
                     inst["verify_large_ids"].add(large_key)
                     inst["verify_large_count"] += 1
                 if (inst["verify_count"] == 1 or inst["verify_count"] % 25 == 0 or is_large):
-                    _log("[FOLLOW_VERIFY_PROGRESS] code=%s events=%d/%d large=%d/%d "
+                    _log("[FOLLOW_VERIFY_PROGRESS] code=%s post_events=%d/%d post_large=%d/%d "
                          "last_amount=%.0f event=%s" % (
                              inst["code"], inst["verify_count"], RESEAL_VERIFY_ORDER_COUNT,
                              inst["verify_large_count"], RESEAL_VERIFY_LARGE_COUNT,
@@ -1890,7 +1939,7 @@ def _handle_l2order(code, payload):
             if _submit(inst, trigger_reason, event_key, {
                     "order_id": order_id, "price": price, "volume": volume,
                     "amount": amount, "direction": direction,
-                    "event_time": event_time}):
+                    "event_time": event_time, "event_raw": event_raw}):
                 _log("[大单触发] %s 路径=%s 委托=%s 数量=%d股(%.2f手) 金额=%.2f" % (
                     inst["code"], trigger_reason, order_id or "无编号", int(volume),
                     volume / 100.0, amount))
@@ -1906,7 +1955,7 @@ def _handle_l2order(code, payload):
                 _submit(inst, "首封", event_key, {
                     "order_id": order_id, "price": price, "volume": volume,
                     "amount": amount, "direction": direction,
-                    "event_time": event_time})
+                    "event_time": event_time, "event_raw": event_raw})
 
 
 def _handle_l2transaction(code, payload):
@@ -1932,6 +1981,13 @@ def _handle_l2transaction(code, payload):
         order_id = str(_field(source, "buyNo", "buy_no") or "")
         if not order_id:
             _record_entry_drop("l2transaction", "cancel_missing_buy_no")
+            return
+        if not _external_cancel_watch_active(inst):
+            _record_entry_drop("l2transaction", "cancel_not_needed")
+            return
+        trigger_order_id = str(inst.get("trigger_order_id") or "")
+        if trigger_order_id and order_id != trigger_order_id:
+            _record_entry_drop("l2transaction", "cancel_not_trigger")
             return
         volume = _safe_float(_field(source, "volume", "tradeVolume", "trade_volume")) or 0
         price = _safe_float(_field(source, "price"))

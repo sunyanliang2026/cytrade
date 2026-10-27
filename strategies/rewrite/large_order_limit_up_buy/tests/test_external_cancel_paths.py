@@ -131,21 +131,57 @@ class ExternalCancelPathTests(unittest.TestCase):
 
     def test_external_cancel_seen_before_trigger_is_replayed_after_submission(self):
         inst = self.instance()
+        inst["submission_pending"] = True
+        inst["external_cancel_monitor_enabled"] = True
         QMT._handle_l2order(inst["code"], {
             "stime": "100000", "price": 10.0, "volume": 900001,
             "entrustDirection": 3, "entrustNo": "EARLY-TRIGGER",
         })
         self.assertFalse(inst["external_cancel_due"])
         self.assertIn("EARLY-TRIGGER", inst["pending_external_cancels"])
-        self.assertTrue(QMT._submit(
-            inst, "首封大单", "event:EARLY-TRIGGER",
+        inst["our_order_id"] = "OUR-1"
+        inst["our_order_qty"] = 1000
+        QMT._set_trigger_order(
+            inst, "event:EARLY-TRIGGER",
             {"order_id": "EARLY-TRIGGER", "price": 10.0,
              "volume": 900001, "amount": 9000010.0,
-             "direction": "B", "event_time": "100001"}))
+             "direction": "B", "event_time": "100001"})
         self.assertTrue(inst["external_cancel_due"])
         _, callback, _, _ = self.cancel_timer()
         callback(CallbackContext())
         self.assertEqual(len(self.cancel_calls), 1)
+
+    def test_external_cancel_before_our_submission_is_dropped_without_queue_or_log(self):
+        inst = self.instance()
+        QMT._handle_l2order(inst["code"], {
+            "stime": "100001", "price": 10.0, "volume": 900001,
+            "entrustDirection": 3, "entrustNo": "UNRELATED-1",
+        })
+
+        self.assertEqual(inst["pending_external_cancels"], {})
+        self.assertFalse(any("EXTERNAL_CANCEL_WAIT_TRIGGER" in line for line in self.logs))
+        self.assertEqual(
+            QMT._ENTRY_DROPS["l2order"]["reasons"]["cancel_not_needed"], 1)
+        QMT._handle_l2transaction(inst["code"], {
+            "stime": "100001", "price": 10.0, "volume": 900001,
+            "tradeFlag": 3, "buyNo": "UNRELATED-2",
+        })
+        self.assertEqual(
+            QMT._ENTRY_DROPS["l2transaction"]["reasons"]["cancel_not_needed"], 1)
+
+    def test_pending_trigger_log_is_rate_limited(self):
+        inst = self.instance()
+        inst["submission_pending"] = True
+        inst["external_cancel_monitor_enabled"] = True
+        for index in range(3):
+            QMT._process_external_cancel(inst, {
+                "order_id": "PENDING-%d" % index,
+                "source": "l2order",
+            })
+
+        self.assertEqual(inst["external_cancel_wait_count"], 3)
+        self.assertEqual(
+            sum("EXTERNAL_CANCEL_WAIT_TRIGGER" in line for line in self.logs), 1)
 
     def test_unrelated_external_cancel_does_not_cancel_our_order(self):
         inst = self.submit_with_trigger("TRIGGER-1")
@@ -155,6 +191,7 @@ class ExternalCancelPathTests(unittest.TestCase):
         })
         self.assertFalse(inst["external_cancel_due"])
         self.assertEqual(self.cancel_calls, [])
+        self.assertFalse(any("EXTERNAL_CANCEL_IGNORED" in line for line in self.logs))
         self.assertFalse(any("CANCEL_TIMER_FAILED" in line for line in self.logs))
 
     def test_fully_filled_order_skips_external_cancel(self):
