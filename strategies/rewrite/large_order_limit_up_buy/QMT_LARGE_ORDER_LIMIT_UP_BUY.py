@@ -8,6 +8,7 @@ ENABLE_LIVE_ORDERS 默认为 True，使用配置的 QMT 资金账号运行。
 from collections import deque
 import datetime as _dt
 import math
+import re
 import time
 
 
@@ -52,7 +53,7 @@ CANCEL_RETRY_INTERVAL_SECONDS = 0.1
 CANCEL_MAX_ATTEMPTS = 3
 
 PERIODS = ("l2quote", "l2order", "l2transaction")
-DEBUG_SUMMARY_INTERVAL_SECONDS = 60
+DEBUG_SUMMARY_INTERVAL_SECONDS = 600
 EXTERNAL_CANCEL_WAIT_LOG_INTERVAL_SECONDS = 60.0
 DEBUG_LATENCY_WARN_THRESHOLD_MS = 2000.0
 DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS = 1200.0
@@ -438,7 +439,27 @@ def _in_auction(event_time):
     return "091500" <= event_time < "093000"
 
 
+_STOCK_CODE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(\d{6}\.(?:SH|SZ))(?![A-Za-z0-9_])", re.IGNORECASE)
+
+
+def _stock_label(code, inst=None):
+    normalized_code = _stock_code(code)
+    if inst is None:
+        inst = _INSTANCES.get(normalized_code, {})
+    stock_name = str(inst.get("name") or "未命名").strip() or "未命名"
+    return "%s(%s)" % (normalized_code, stock_name)
+
+
 def _log(message):
+    message = str(message)
+    def add_stock_name(match):
+        code = match.group(1)
+        if message[match.end():].startswith("("):
+            return code
+        return _stock_label(code)
+
+    message = _STOCK_CODE_RE.sub(add_stock_name, message)
     line = "%s %s" % (_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], message)
     try:
         print(line)
@@ -653,8 +674,7 @@ def _load_pool(day=None):
         amount = _safe_float(raw_amount)
         if code and amount:
             result.append({"code": code, "plan_amount": amount})
-    _log("[股票池] date=%s count=%d codes=%s" %
-         (trade_date, len(result), ",".join(x["code"] for x in result)))
+    _log("[股票池] date=%s count=%d" % (trade_date, len(result)))
     return result
 
 
@@ -799,7 +819,8 @@ def _set_state(inst, state, reason=""):
     if inst["state"] != state:
         inst["state"] = state
         inst["last_log_reason"] = reason
-        _log("[状态] %s %s -> %s %s" % (inst["code"], inst.get("name", "未命名"), state, reason))
+        _log("[状态] %s -> %s %s" % (
+            _stock_label(inst["code"], inst), state, reason))
 
 
 def _unsubscribe_instance(inst):
@@ -2119,19 +2140,12 @@ def _summary():
         display_state = inst["state"]
         if inst.get("our_order_id") and display_state not in (STATE_DONE, STATE_SKIPPED):
             display_state = "已下单，等待成交"
-        by_state.setdefault(display_state, []).append(inst["code"])
+        by_state.setdefault(display_state, []).append(_stock_label(inst["code"], inst))
     period_counts = ",".join("%s:%d" % (period, _PERIOD_COUNTS.get(period, 0)) for period in PERIODS)
     first_callbacks = ",".join(sorted(_FIRST_CALLBACKS)) or "无"
     last_events = ",".join("%s:%s" % (period, _LAST_EVENT_TIMES.get(period, "")) for period in PERIODS)
     freshness_drops = ",".join(
         "%s:%d" % (period, _FRESHNESS_DROPS.get(period, {}).get("count", 0))
-        for period in PERIODS)
-    entry_drops = ",".join(
-        "%s:%d[%s]" % (
-            period,
-            _ENTRY_DROPS.get(period, {}).get("count", 0),
-            ",".join("%s=%d" % item for item in sorted(
-                _ENTRY_DROPS.get(period, {}).get("reasons", {}).items())) or "none")
         for period in PERIODS)
     latency_parts = []
     for period in PERIODS:
@@ -2155,16 +2169,24 @@ def _summary():
             "%.0fms" % gap_average if gap_average is not None else "n/a",
             "%.0fms" % gaps.get("max_ms") if gap_count else "n/a",
             len([key for key in _LAST_RECEIVED_AT if key[0] == period]))
-    _log("[汇总] 监控=%d 下单=%d 成交=%d 撤单=%d L2=%d 订阅=%d成功/%d失败 "
-         "回调=%s 首条=%s 延时=%s freshness_drop=%s "
-         "entry_drop=%s 最近事件=%s 状态=%s" %
+    _log("[汇总][概览] 监控=%d 下单=%d 成交=%d 撤单=%d L2=%d 订阅=%d成功/%d失败" %
          (len(_INSTANCES), _COUNTERS["orders"], _COUNTERS["deals"], _COUNTERS["cancels"],
-          _COUNTERS["l2"], _SUB_SUCCESS, _SUB_FAILED,
-          period_counts, "%d/%d[%s]" % (len(_FIRST_CALLBACKS), len(PERIODS), first_callbacks),
-          ";".join(latency_parts), freshness_drops,
-          entry_drops,
-          last_events,
-          ";".join("%s:%s" % (k, ",".join(v)) for k, v in sorted(by_state.items()))))
+          _COUNTERS["l2"], _SUB_SUCCESS, _SUB_FAILED))
+    _log("[汇总][回调] %s 首条=%d/%d[%s]" %
+         (period_counts, len(_FIRST_CALLBACKS), len(PERIODS), first_callbacks))
+    for latency_part in latency_parts:
+        _log("[汇总][延迟] %s" % latency_part)
+    _log("[汇总][新鲜度丢弃] %s" % freshness_drops)
+    for period in PERIODS:
+        drop_stats = _ENTRY_DROPS.get(period, {})
+        reasons = ",".join("%s=%d" % item for item in sorted(
+            drop_stats.get("reasons", {}).items())) or "none"
+        _log("[汇总][入口丢弃] %s:%d[%s]" % (
+            period, drop_stats.get("count", 0), reasons))
+    _log("[汇总][最近事件] %s" % last_events)
+    for display_state in sorted(by_state):
+        _log("[汇总][状态] %s: %s" % (
+            display_state, ",".join(by_state[display_state])))
 
     registered = sum(1 for inst in _INSTANCES.values()
                      if "l2order" in inst.get("sub_periods", {}).values())
@@ -2226,6 +2248,8 @@ def init(C):
             for period in PERIODS:
                 _STARTUP_EVENT_WATERMARK[(period, inst["code"])] = startup_received_at
         _initial_quote_batch(C, list(_INSTANCES.values()))
+        _log("[股票池] stocks=%s" % ",".join(
+            _stock_label(inst["code"], inst) for inst in _INSTANCES.values()))
         for inst in _INSTANCES.values():
             _subscribe(C, inst["code"], "l2quote")
         _log("[运行] l2order_policy=start:09:30:30,gain>7%%,retain_after_opening; "
