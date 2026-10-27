@@ -166,7 +166,7 @@ class NegativeQuoteExitTests(unittest.TestCase):
         QMT._initial_quote(self.context, self.inst, snapshot)
         QMT._subscribe(self.context, self.inst["code"], "l2quote")
 
-        self.assertEqual(QMT.PERIODS, ("l2quote", "l2order"))
+        self.assertEqual(QMT.PERIODS, ("l2quote", "l2order", "l2transaction"))
         self.assertEqual(self.inst["state"], QMT.STATE_SKIPPED)
         self.assertTrue(self.inst["subscriptions_stopped"])
         self.assertEqual(self.context.subscribed, [])

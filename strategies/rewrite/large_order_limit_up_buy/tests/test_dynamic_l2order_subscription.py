@@ -109,8 +109,11 @@ class DynamicL2OrderSubscriptionTests(unittest.TestCase):
         self.assertEqual(self.context.subscribed, [])
         with mock.patch.object(QMT.time, "time", return_value=self.epoch()):
             QMT._subscribe_l2order_now(self.context)
-        self.assertEqual(len(self.context.subscribed), 1)
-        self.assertEqual(self.context.subscribed[0][1]["period"], "l2order")
+        self.assertEqual(len(self.context.subscribed), 2)
+        self.assertEqual(
+            {item[1]["period"] for item in self.context.subscribed},
+            {"l2order", "l2transaction"},
+        )
 
     def test_native_init_logs_policy_and_subscribes_only_quotes_before_boundary(self):
         now = self.epoch(second=10)
@@ -126,14 +129,17 @@ class DynamicL2OrderSubscriptionTests(unittest.TestCase):
         self.assertTrue(any("gain>7%,retain_after_opening" in log for log in self.logs))
         self.inst = QMT._INSTANCES[self.inst["code"]]
         self.quote(now=self.epoch())
-        self.assertEqual(len(self.context.subscribed), 2)
-        self.assertEqual(self.context.subscribed[-1][1]["period"], "l2order")
+        self.assertEqual(len(self.context.subscribed), 3)
+        self.assertEqual(
+            {item[1]["period"] for item in self.context.subscribed[1:]},
+            {"l2order", "l2transaction"},
+        )
 
     def test_gain_is_strictly_above_seven_percent_before_business_filter(self):
         self.quote(last=10.70)
         self.assertEqual(self.context.subscribed, [])
         self.quote(last=10.71, now=self.epoch(millisecond=100))
-        self.assertEqual(len(self.context.subscribed), 1)
+        self.assertEqual(len(self.context.subscribed), 2)
         self.assertEqual(QMT._ENTRY_DROPS["l2quote"]["reasons"]["unchanged_quote"], 2)
         self.assertNotIn(("l2quote", self.inst["code"]), QMT._LATEST_EVENT_EPOCH)
         self.assertTrue(any("reason=gain_gt_7pct" in log for log in self.logs))
@@ -184,7 +190,7 @@ class DynamicL2OrderSubscriptionTests(unittest.TestCase):
         self.quote(last=10.3, now=self.epoch(second=31))
         self.quote(last=11.0, now=self.epoch(second=32), bidPrice=[11.0])
         self.quote(last=10.5, now=self.epoch(second=33))
-        self.assertEqual(len(self.context.subscribed), 1)
+        self.assertEqual(len(self.context.subscribed), 2)
         self.assertEqual(self.context.unsubscribed, [])
         self.assertEqual(self.inst["sub_ids"], subscription_ids)
 
@@ -213,12 +219,12 @@ class DynamicL2OrderSubscriptionTests(unittest.TestCase):
         now = self.epoch()
         self.quote(now=now)
         self.quote(now=now + 0.9)
-        self.assertEqual(len(self.context.subscribed), 1)
+        self.assertEqual(len(self.context.subscribed), 2)
         self.quote(now=now + 1.0)
         self.quote(now=now + 2.0)
         self.quote(now=now + 20.0)
-        self.assertEqual(len(self.context.subscribed), QMT.L2ORDER_SUBSCRIBE_MAX_ATTEMPTS)
-        self.assertEqual(QMT._SUB_FAILED, 3)
+        self.assertEqual(len(self.context.subscribed), QMT.L2ORDER_SUBSCRIBE_MAX_ATTEMPTS * 2)
+        self.assertEqual(QMT._SUB_FAILED, 6)
 
     def test_failed_subscription_recovery_uses_native_arguments_and_avoids_duplicates(self):
         self.context.reject = True
@@ -226,7 +232,7 @@ class DynamicL2OrderSubscriptionTests(unittest.TestCase):
         self.context.reject = False
         self.quote(now=self.epoch(second=31))
         self.quote(now=self.epoch(second=32))
-        self.assertEqual(len(self.context.subscribed), 2)
+        self.assertEqual(len(self.context.subscribed), 4)
         kwargs = self.context.subscribed[-1][1]
         self.assertEqual(set(kwargs), {"period", "dividend_type", "result_type", "callback"})
         self.assertEqual(kwargs["result_type"], "dict")
@@ -238,13 +244,13 @@ class DynamicL2OrderSubscriptionTests(unittest.TestCase):
             inst["l2order_candidate"] = (now - 0.1, 10.8, 10.0)
         with mock.patch.object(QMT.time, "time", return_value=now):
             QMT._subscribe_l2order_now(self.context)
-        self.assertEqual(len(self.context.subscribed), QMT.L2ORDER_SUBSCRIBE_BATCH)
+        self.assertEqual(len(self.context.subscribed), QMT.L2ORDER_SUBSCRIBE_BATCH * 2)
         self.assertEqual(len(self.context.scheduled), 1)
         remaining = QMT._INSTANCES["000012.SZ"]
         remaining["l2order_candidate"] = (now, 10.6, 10.0)
         with mock.patch.object(QMT.time, "time", return_value=now + 0.1):
             self.context.scheduled[0][0](self.context)
-        self.assertEqual(len(self.context.subscribed), QMT.L2ORDER_SUBSCRIBE_BATCH + 1)
+        self.assertEqual(len(self.context.subscribed), (QMT.L2ORDER_SUBSCRIBE_BATCH + 1) * 2)
 
     def test_timer_failure_cannot_bypass_opening_delay_and_quotes_still_activate(self):
         now = self.epoch(second=29)
@@ -254,7 +260,7 @@ class DynamicL2OrderSubscriptionTests(unittest.TestCase):
             QMT._schedule_l2order_subscriptions(self.context)
         self.assertEqual(self.context.subscribed, [])
         self.quote(now=self.epoch())
-        self.assertEqual(len(self.context.subscribed), 1)
+        self.assertEqual(len(self.context.subscribed), 2)
 
     def test_schedule_targets_opening_boundary_and_next_day_after_close(self):
         for now, target_day in ((self.epoch(second=10), 22), (self.epoch(hour=15), 23)):
@@ -274,7 +280,10 @@ class DynamicL2OrderSubscriptionTests(unittest.TestCase):
             below["l2order_candidate"] = (now, 10.6, 10.0)
             with self.frozen_datetime(now):
                 QMT._schedule_l2order_subscriptions(self.context)
-        self.assertEqual([code for code, _ in self.context.subscribed], [self.inst["code"]])
+        self.assertEqual(
+            [code for code, _ in self.context.subscribed],
+            [self.inst["code"], self.inst["code"]],
+        )
 
     def test_terminal_stopped_and_outside_session_instances_do_not_subscribe(self):
         now = self.epoch()
@@ -293,7 +302,10 @@ class DynamicL2OrderSubscriptionTests(unittest.TestCase):
 
     def test_first_callback_records_arrival_even_for_sell_and_stale_data(self):
         self.quote()
-        callback = self.context.subscribed[-1][1]["callback"]
+        callback = next(
+            item[1]["callback"] for item in self.context.subscribed
+            if item[1]["period"] == "l2order"
+        )
         now = self.epoch(second=34)
         with mock.patch.object(QMT.time, "time", return_value=now):
             callback({"time": str(int(self.epoch() * 1000)), "direction": "S"})

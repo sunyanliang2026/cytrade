@@ -48,8 +48,10 @@ RESEAL_PRE_SUBMIT_ORDER_MAX_COUNT = 200
 RESEAL_PRE_SUBMIT_ORDER_MAX_AGE_SECONDS = 2.0
 ORDER_LOOKUP_RETRY_INTERVAL_SECONDS = 0.1
 ORDER_LOOKUP_MAX_ATTEMPTS = 10
+CANCEL_RETRY_INTERVAL_SECONDS = 0.1
+CANCEL_MAX_ATTEMPTS = 3
 
-PERIODS = ("l2quote", "l2order")
+PERIODS = ("l2quote", "l2order", "l2transaction")
 DEBUG_SUMMARY_INTERVAL_SECONDS = 60
 DEBUG_LATENCY_WARN_THRESHOLD_MS = 2000.0
 DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS = 1200.0
@@ -58,6 +60,7 @@ MAX_SIGNAL_QUOTE_DELAY_MS = 2000.0
 FRESHNESS_MAX_DELAY_MS = {
     "l2quote": 2000.0,
     "l2order": 1200.0,
+    "l2transaction": 1200.0,
 }
 FRESHNESS_FUTURE_TOLERANCE_MS = 1000.0
 SEEN_ORDER_KEY_MAX_COUNT = 1000
@@ -421,7 +424,7 @@ def _latency_ms(event_value, received_at):
 
 
 def _latency_warn_threshold(period):
-    if period == "l2order":
+    if period in ("l2order", "l2transaction"):
         return DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS
     return DEBUG_LATENCY_WARN_THRESHOLD_MS
 
@@ -514,10 +517,11 @@ def _cache_l2order_quote(inst, source, event_raw, received_at):
 
 
 def _try_subscribe_l2order(C, inst, received_at=None):
-    """Request once above 7%, retain after opening, and bound failure retries."""
+    """Request order and transaction streams once above 7% and retain them."""
     if (C is None or inst.get("subscriptions_stopped") or
             inst["state"] in (STATE_DONE, STATE_SKIPPED) or
-            "l2order" in inst.get("sub_periods", {}).values()):
+            ("l2order" in inst.get("sub_periods", {}).values() and
+             "l2transaction" in inst.get("sub_periods", {}).values())):
         return False
     received_at = time.time() if received_at is None else received_at
     now = _dt.datetime.fromtimestamp(received_at)
@@ -546,14 +550,19 @@ def _try_subscribe_l2order(C, inst, received_at=None):
     inst["l2order_sub_attempts"] = attempts + 1
     inst["l2order_requested_at"] = received_at
     started = _now()
-    _subscribe(C, inst["code"], "l2order")
-    registered = "l2order" in inst.get("sub_periods", {}).values()
+    if "l2order" not in inst.get("sub_periods", {}).values():
+        _subscribe(C, inst["code"], "l2order")
+    if "l2transaction" not in inst.get("sub_periods", {}).values():
+        _subscribe(C, inst["code"], "l2transaction")
+    registered = ("l2order" in inst.get("sub_periods", {}).values() and
+                  "l2transaction" in inst.get("sub_periods", {}).values())
     _log("[L2ORDER_REQUEST] code=%s reason=gain_gt_7pct gain=%.2f%% "
          "event_time=%s quote_delay_ms=%.0f attempt=%d/%d "
-         "registered=%s call_ms=%.1f" % (
+         "registered=%s transaction_registered=%s call_ms=%.1f" % (
              inst["code"], (last / previous_close - 1.0) * 100.0,
              _format_local_timestamp(epoch), delay_ms, attempts + 1,
              L2ORDER_SUBSCRIBE_MAX_ATTEMPTS, registered,
+             "l2transaction" in inst.get("sub_periods", {}).values(),
              (_now() - started) * 1000.0))
     return True
 
@@ -656,6 +665,7 @@ def _new_instance(code, amount):
         "initial_sealed": False, "seal_started": None, "seal_peak": 0.0,
         "break_started": None, "reseal_ready": False, "first_large_total": 0.0,
         "first_large_ids": set(), "seen_order_ids": set(), "seen_order_queue": deque(),
+        "seen_cancel_event_keys": set(), "seen_cancel_event_queue": deque(),
         "l2order_history": [],
         "verify_count": 0,
         "verify_large_count": 0, "verify_large_ids": set(), "validation_started": None,
@@ -664,7 +674,15 @@ def _new_instance(code, amount):
         "validation_event_cutoff_seconds": None, "validation_stale_count": 0,
         "validation_timer": None, "validation_order_id": None, "cancel_started": None,
         "cancel_confirmed": False, "cancel_failed": False, "cancel_due": False,
-        "cancel_due_reason": "", "late_large_count": 0,
+        "cancel_due_reason": "", "cancel_request_timer": None,
+        "cancel_requested": False, "cancel_attempts": 0,
+        "cancel_terminal": False, "external_cancel_due": False,
+        "external_cancel_volume": 0, "external_cancel_event_keys": set(),
+        "trigger_order_id": None, "trigger_order_key": None,
+        "trigger_order_price": None, "trigger_order_volume": 0,
+        "trigger_order_amount": 0.0, "trigger_order_direction": "",
+        "trigger_order_event_time": "", "pending_external_cancels": {},
+        "late_large_count": 0,
         "late_large_ids": set(), "follow_sent": False, "our_order_id": None,
         "our_order_qty": 0, "our_traded_qty": 0, "our_order_status": "",
         "order_reported_traded_qty": 0, "deal_traded_qty": 0,
@@ -864,6 +882,45 @@ def _cancel_order_lookup(inst):
     inst["order_lookup_timer"] = None
 
 
+def _cancel_request_timer(inst):
+    key = inst.get("cancel_request_timer")
+    if key is not None and _C is not None:
+        try:
+            _C.cancel_schedule_run(key)
+        except Exception:
+            pass
+    inst["cancel_request_timer"] = None
+
+
+def _schedule_cancel_due(inst, delay=0.0):
+    if (_C is None or inst.get("cancel_request_timer") is not None or
+            not inst.get("cancel_due") or
+            inst["state"] in (STATE_DONE, STATE_SKIPPED)):
+        return False
+    try:
+        code = inst["code"]
+        token = inst.get("submit_token")
+        inst["cancel_request_timer"] = _C.schedule_run(
+            lambda ContextInfo, c=code, t=token: _cancel_due_timer(ContextInfo, c, t),
+            _dt.datetime.now() + _dt.timedelta(seconds=max(0.0, delay)),
+            repeat_times=0, name="qmt_cancel_due_%s" % code)
+        return True
+    except Exception as exc:
+        _log("[CANCEL_TIMER_FAILED] code=%s error=%r" % (inst["code"], exc))
+        return False
+
+
+def _cancel_due_timer(ContextInfo, code, token):
+    with _LOCK:
+        inst = _INSTANCES.get(code)
+        if (not inst or inst.get("submit_token") != token or
+                not inst.get("cancel_due") or
+                inst["state"] in (STATE_DONE, STATE_SKIPPED)):
+            return
+        inst["cancel_request_timer"] = None
+        _request_cancel(inst, inst.get("cancel_due_reason") or "cancel_due", ContextInfo)
+
+
 def _schedule_validation(inst):
     if _C is None or not inst.get("validation_active"):
         return
@@ -873,7 +930,7 @@ def _schedule_validation(inst):
         code = inst["code"]
         token = inst.get("submit_token")
         inst["validation_timer"] = _C.schedule_run(
-            lambda ContextInfo, c=code, t=token: _validation_timer(c, t),
+            lambda ContextInfo, c=code, t=token: _validation_timer(ContextInfo, c, t),
             when, repeat_times=0, name="order_validation_%s" % code)
     except Exception as exc:
         _log("[验证] %s 定时器创建失败 %r，将由handlebar兜底" % (inst["code"], exc))
@@ -1006,6 +1063,8 @@ def _bind_order_id(inst, order_id):
         _apply_order_update(inst, pending)
     for deal in inst.pop("pending_deal_infos", []):
         _apply_deal_update(inst, deal)
+    if inst.get("cancel_due") and inst["state"] not in (STATE_DONE, STATE_SKIPPED):
+        _request_cancel(inst, inst.get("cancel_due_reason") or "cancel_due")
     return True
 
 
@@ -1019,14 +1078,19 @@ def _schedule_order_lookup(inst, delay=None):
         token = inst["submit_token"]
         delay = ORDER_LOOKUP_RETRY_INTERVAL_SECONDS if delay is None else max(0.0, delay)
         inst["order_lookup_timer"] = _C.schedule_run(
-            lambda ContextInfo, c=code, t=token: _resolve_order_id(c, t),
+            lambda ContextInfo, c=code, t=token: _resolve_order_id(ContextInfo, c, t),
             _dt.datetime.now() + _dt.timedelta(seconds=delay),
             repeat_times=0, name="qmt_order_lookup_%s" % code)
     except Exception as exc:
         _log("[下单] %s 委托号查询定时器失败 %r" % (inst["code"], exc))
 
 
-def _resolve_order_id(code, token):
+def _resolve_order_id(ContextInfo, code=None, token=None):
+    # Keep the old two-argument form usable by offline tests and callers.
+    if token is None:
+        token = code
+        code = ContextInfo
+        ContextInfo = None
     with _LOCK:
         inst = _INSTANCES.get(code)
         if (not inst or inst["state"] in (STATE_DONE, STATE_SKIPPED) or
@@ -1053,7 +1117,7 @@ def _resolve_order_id(code, token):
                 _log("[ORDER_ID_RESOLVED] code=%s token=%s order_id=%s source=order_query "
                      "attempt=%d" % (code, token, order_id, inst["order_lookup_attempts"]))
                 if inst.get("cancel_due") and inst["state"] not in (STATE_DONE, STATE_SKIPPED):
-                    _request_cancel(inst)
+                    _request_cancel(inst, inst.get("cancel_due_reason") or "cancel_due", ContextInfo)
                 return
         elif len(unique) > 1:
             _log("[ORDER_ID_AMBIGUOUS] code=%s token=%s ids=%s attempt=%d" % (
@@ -1127,7 +1191,25 @@ def _query_order_records(inst):
     return list(data) if isinstance(data, (list, tuple)) else [data]
 
 
-def _submit(inst, reason, trigger_order_key=None):
+def _set_trigger_order(inst, trigger_order_key, trigger_order=None):
+    if not trigger_order_key or not trigger_order:
+        return
+    order_id = str(trigger_order.get("order_id") or "")
+    if not order_id:
+        return
+    inst["trigger_order_key"] = trigger_order_key
+    inst["trigger_order_id"] = order_id
+    inst["trigger_order_price"] = _safe_float(trigger_order.get("price"))
+    inst["trigger_order_volume"] = _safe_float(trigger_order.get("volume")) or 0
+    inst["trigger_order_amount"] = _safe_float(trigger_order.get("amount")) or 0.0
+    inst["trigger_order_direction"] = str(trigger_order.get("direction") or "").upper()
+    inst["trigger_order_event_time"] = str(trigger_order.get("event_time") or "")
+    pending = inst.get("pending_external_cancels", {}).pop(order_id, [])
+    for record in pending:
+        _process_external_cancel(inst, record)
+
+
+def _submit(inst, reason, trigger_order_key=None, trigger_order=None):
     is_follow = reason == "撤单后跟随"
     if inst["state"] in (STATE_DONE, STATE_SKIPPED) or inst.get("submission_pending") or (inst.get("our_order_id") and not is_follow):
         return False
@@ -1156,6 +1238,18 @@ def _submit(inst, reason, trigger_order_key=None):
         inst["deal_traded_qty"] = 0
         inst["seen_deal_ids"].clear()
         inst["pending_deal_infos"] = []
+        _cancel_request_timer(inst)
+        inst["cancel_started"] = None
+        inst["cancel_confirmed"] = False
+        inst["cancel_failed"] = False
+        inst["cancel_due"] = False
+        inst["cancel_due_reason"] = ""
+        inst["cancel_requested"] = False
+        inst["cancel_attempts"] = 0
+        inst["cancel_terminal"] = False
+        inst["external_cancel_due"] = False
+        inst["external_cancel_volume"] = 0
+        inst["external_cancel_event_keys"].clear()
         signal_received_at = inst.get("last_signal_received_at")
         signal_event_raw = inst.get("last_signal_event_raw")
         signal_age_ms = (_latency_ms(signal_event_raw, time.time())
@@ -1165,6 +1259,7 @@ def _submit(inst, reason, trigger_order_key=None):
             if signal_received_at is not None else None)
         if reason in VALIDATED_SUBMIT_REASONS:
             _start_validation(inst, trigger_order_key)
+        _set_trigger_order(inst, trigger_order_key, trigger_order)
         passorder_started = _now()
         try:
             order_result = passorder(23, ORDER_TYPE_BUY, ACCOUNT_ID, inst["code"], PRICE_TYPE_LIMIT,
@@ -1201,15 +1296,53 @@ def _submit(inst, reason, trigger_order_key=None):
         return False
 
 
-def _request_cancel(inst, reason="validation_failed"):
-    if inst["state"] in (STATE_DONE, STATE_SKIPPED) or inst.get("cancel_started") is not None:
-        return
+def _our_cancel_order_id(inst):
+    return str(inst.get("our_order_id") or inst.get("validation_order_id") or "")
+
+
+def _cancel_attempt_failed(inst, reason, error):
+    inst["cancel_requested"] = False
+    inst["cancel_failed"] = True
+    inst["cancel_due"] = True
+    inst["cancel_due_reason"] = reason
+    _log("[CANCEL_FAILED] code=%s order_id=%s attempt=%d/%d error=%r" % (
+        inst["code"], _our_cancel_order_id(inst), inst.get("cancel_attempts", 0),
+        CANCEL_MAX_ATTEMPTS, error))
+    if inst.get("cancel_attempts", 0) < CANCEL_MAX_ATTEMPTS:
+        _schedule_cancel_due(inst, CANCEL_RETRY_INTERVAL_SECONDS)
+
+
+def _confirm_cancel(inst, status=None):
+    inst["cancel_requested"] = False
+    inst["cancel_due"] = False
+    inst["cancel_failed"] = False
+    inst["cancel_confirmed"] = True
+    _cancel_request_timer(inst)
+    _log("[CANCEL_CONFIRMED] code=%s order_id=%s status=%s traded=%s/%s" % (
+        inst["code"], _our_cancel_order_id(inst), status,
+        inst.get("our_traded_qty", 0), inst.get("our_order_qty", 0)))
+    if inst.get("external_cancel_due") or inst.get("cancel_terminal"):
+        _set_state(inst, STATE_DONE, "external_trigger_cancelled")
+
+
+def _request_cancel(inst, reason="validation_failed", ContextInfo=None):
+    if inst["state"] in (STATE_DONE, STATE_SKIPPED):
+        return False
+    if inst.get("our_order_qty", 0) > 0 and inst.get("our_traded_qty", 0) >= inst["our_order_qty"]:
+        inst["cancel_due"] = False
+        inst["cancel_requested"] = False
+        _cancel_request_timer(inst)
+        _set_state(inst, STATE_DONE, "订单全部成交，跳过撤单")
+        return False
     if inst.get("cancel_confirmed"):
         inst["cancel_due"] = False
         _log("[CANCEL_SKIPPED] code=%s order_id=%s reason=%s already_cancelled=true" % (
-            inst["code"], inst.get("validation_order_id") or "unknown", reason))
-        return
-    if not inst.get("validation_order_id"):
+            inst["code"], _our_cancel_order_id(inst) or "unknown", reason))
+        return False
+    if inst.get("cancel_requested"):
+        return False
+    order_id = _our_cancel_order_id(inst)
+    if not order_id:
         inst["cancel_due"] = True
         inst["cancel_due_reason"] = reason
         _log("[CANCEL_WAIT_ORDER_ID] code=%s token=%s reason=%s verify=%d large=%d "
@@ -1218,25 +1351,57 @@ def _request_cancel(inst, reason="validation_failed"):
                  inst.get("verify_count", 0), inst.get("verify_large_count", 0),
                  inst.get("order_lookup_attempts", 0)))
         _schedule_order_lookup(inst)
-        return
+        return False
+    if inst.get("cancel_attempts", 0) >= CANCEL_MAX_ATTEMPTS:
+        inst["cancel_due"] = True
+        inst["cancel_due_reason"] = reason
+        _log("[CANCEL_RETRY_EXHAUSTED] code=%s order_id=%s reason=%s" % (
+            inst["code"], order_id, reason))
+        return False
+    if ContextInfo is None:
+        # A real QMT timer/callback always supplies ContextInfo.  The global
+        # context is only a compatibility fallback for offline fake contexts
+        # that cannot schedule a callback.
+        if _C is not None and callable(getattr(_C, "schedule_run", None)):
+            inst["cancel_due"] = True
+            inst["cancel_due_reason"] = reason
+            _schedule_cancel_due(inst, 0.0)
+            return False
+        ContextInfo = _C
+    if ContextInfo is None:
+        inst["cancel_due"] = True
+        inst["cancel_due_reason"] = reason
+        return False
+    _cancel_request_timer(inst)
     inst["cancel_due"] = False
-    inst["cancel_started"] = _now()
+    inst["cancel_due_reason"] = reason
+    if inst.get("cancel_started") is None:
+        inst["cancel_started"] = _now()
+    inst["cancel_attempts"] += 1
+    inst["cancel_requested"] = True
     _COUNTERS["cancels"] += 1
     if not ENABLE_LIVE_ORDERS:
-        inst["cancel_confirmed"] = True
-        _log("[撤单] %s 纸面模式，模拟完全撤单" % inst["code"])
-        return
+        _confirm_cancel(inst, "paper")
+        return True
     try:
-        result = cancel(inst["validation_order_id"], ACCOUNT_ID, ACCOUNT_TYPE, _C)
-        _log("[CANCEL_REQUESTED] code=%s order_id=%s reason=%s return=%r" % (
-            inst["code"], inst["validation_order_id"], reason, result))
+        result = cancel(order_id, ACCOUNT_ID, ACCOUNT_TYPE, ContextInfo)
+        if result is False or str(result) == "-1":
+            _cancel_attempt_failed(inst, reason, result)
+            return False
+        _log("[CANCEL_REQUESTED] code=%s order_id=%s reason=%s attempt=%d/%d return=%r context=%s" % (
+            inst["code"], order_id, reason, inst["cancel_attempts"],
+            CANCEL_MAX_ATTEMPTS, result, type(ContextInfo).__name__))
+        return True
     except Exception as exc:
-        inst["cancel_failed"] = True
-        _log("[撤单失败] %s %r" % (inst["code"], exc))
-        _set_state(inst, STATE_DONE, "撤单异常")
+        _cancel_attempt_failed(inst, reason, exc)
+        return False
 
 
-def _validation_timer(code, token):
+def _validation_timer(ContextInfo, code=None, token=None):
+    if token is None:
+        token = code
+        code = ContextInfo
+        ContextInfo = None
     with _LOCK:
         inst = _INSTANCES.get(code)
         if (not inst or inst.get("submit_token") != token or
@@ -1244,10 +1409,10 @@ def _validation_timer(code, token):
                 inst["state"] in (STATE_DONE, STATE_SKIPPED)):
             return
         inst["validation_timer"] = None
-        _check_validation(inst)
+        _check_validation(inst, ContextInfo)
 
 
-def _check_validation(inst):
+def _check_validation(inst, ContextInfo=None):
     if inst["state"] in (STATE_DONE, STATE_SKIPPED):
         return
     if inst.get("validation_active"):
@@ -1275,10 +1440,19 @@ def _check_validation(inst):
                      inst["verify_count"], RESEAL_VERIFY_ORDER_COUNT,
                      inst["verify_large_count"], RESEAL_VERIFY_LARGE_COUNT,
                      elapsed * 1000.0, inst.get("validation_stale_count", 0)))
-            _request_cancel(inst, reason)
+            _request_cancel(inst, reason, ContextInfo)
+    if (inst.get("external_cancel_due") and not inst.get("cancel_confirmed") and
+            not inst.get("cancel_requested")):
+        _request_cancel(inst, "external_trigger_cancel", ContextInfo)
     if (inst.get("cancel_started") and not inst["cancel_confirmed"] and
-            _now() - inst["cancel_started"] >= RESEAL_LATE_WINDOW_SECONDS):
-        _set_state(inst, STATE_DONE, "撤单状态未知或补充窗口结束")
+            inst.get("cancel_attempts", 0) >= CANCEL_MAX_ATTEMPTS and
+            not inst.get("cancel_requested")):
+        _log("[CANCEL_PENDING] code=%s order_id=%s retries_exhausted=true" % (
+            inst["code"], _our_cancel_order_id(inst)))
+        return
+    if inst.get("external_cancel_due") and inst.get("cancel_confirmed"):
+        _set_state(inst, STATE_DONE, "external_trigger_cancelled")
+        return
     if inst.get("cancel_confirmed") and inst["our_traded_qty"] > 0:
         _set_state(inst, STATE_DONE, "部分成交后余量撤单")
         return
@@ -1296,6 +1470,85 @@ def _quote_scalar(value):
     if isinstance(value, (list, tuple)):
         value = value[0] if value else None
     return _safe_float(value)
+
+
+def _is_cancel_direction(value):
+    return str(value or "").strip().upper() in ("3", "C", "CANCEL", "CANCELLED")
+
+
+def _is_buy_direction(value):
+    return str(value or "").strip().upper() in ("B", "BUY", "1", "买", "买入")
+
+
+def _remember_cancel_event_key(inst, event_key):
+    if not event_key:
+        return
+    keys = inst.setdefault("seen_cancel_event_keys", set())
+    queue = inst.setdefault("seen_cancel_event_queue", deque())
+    keys.add(event_key)
+    queue.append(event_key)
+    while len(queue) > SEEN_ORDER_KEY_MAX_COUNT:
+        keys.discard(queue.popleft())
+
+
+def _external_cancel_matches(inst, record):
+    trigger_id = str(inst.get("trigger_order_id") or "")
+    order_id = str(record.get("order_id") or "")
+    if not trigger_id or order_id != trigger_id:
+        return False
+    if inst.get("trigger_order_direction") and not _is_buy_direction(
+            inst.get("trigger_order_direction")):
+        return False
+    trigger_price = _safe_float(inst.get("trigger_order_price"))
+    cancel_price = _safe_float(record.get("price"))
+    return not (trigger_price and cancel_price and
+                abs(trigger_price - cancel_price) >= 1e-8)
+
+
+def _remember_pending_external_cancel(inst, record):
+    order_id = str(record.get("order_id") or "")
+    if not order_id:
+        return
+    pending = inst.setdefault("pending_external_cancels", {})
+    records = pending.setdefault(order_id, [])
+    records.append(record)
+    total = sum(len(items) for items in pending.values())
+    while total > 64:
+        first_key = next(iter(pending))
+        items = pending[first_key]
+        items.pop(0)
+        total -= 1
+        if not items:
+            pending.pop(first_key, None)
+
+
+def _process_external_cancel(inst, record):
+    order_id = str(record.get("order_id") or "")
+    if not order_id:
+        return False
+    if not inst.get("trigger_order_id"):
+        _remember_pending_external_cancel(inst, record)
+        _log("[EXTERNAL_CANCEL_WAIT_TRIGGER] code=%s order_id=%s source=%s" % (
+            inst["code"], order_id, record.get("source") or "unknown"))
+        return False
+    if not _external_cancel_matches(inst, record):
+        _log("[EXTERNAL_CANCEL_IGNORED] code=%s order_id=%s trigger=%s price=%s source=%s" % (
+            inst["code"], order_id, inst.get("trigger_order_id"),
+            record.get("price"), record.get("source") or "unknown"))
+        return False
+    event_key = str(record.get("event_key") or "")
+    if event_key and event_key in inst.setdefault("external_cancel_event_keys", set()):
+        return False
+    if event_key:
+        inst["external_cancel_event_keys"].add(event_key)
+    inst["external_cancel_volume"] += _safe_float(record.get("volume")) or 0
+    inst["external_cancel_due"] = True
+    inst["cancel_terminal"] = True
+    _log("[EXTERNAL_TRIGGER_CANCEL] code=%s trigger_order=%s volume=%s source=%s event=%s" % (
+        inst["code"], order_id, record.get("volume") or 0,
+        record.get("source") or "unknown", record.get("event_raw") or ""))
+    _request_cancel(inst, "external_trigger_cancel")
+    return True
 
 
 def _quote_entry_gate(inst, source):
@@ -1355,14 +1608,23 @@ def _l2order_entry_gate(inst, source, event_raw):
     if inst["state"] in (STATE_DONE, STATE_SKIPPED):
         return False, event_time, "terminal_state", None
 
+    volume = _safe_float(_field(source, "volume"))
+    direction = str(_field(source, "entrustDirection", "direction", "side") or "").upper()
+    order_id = str(_field(source, "entrustNo", "orderNo", "order_id") or "")
+    if _is_cancel_direction(direction):
+        if not order_id:
+            return False, event_time, "cancel_missing_order_id", None
+        cancel_volume = volume or 0.0
+        event_key = "cancel:%s:%s:%s" % (order_id, event_raw or event_time, cancel_volume)
+        if event_key in inst.setdefault("seen_cancel_event_keys", set()):
+            return False, event_time, "duplicate", event_key
+        return True, event_time, "cancel", event_key
     price = _safe_float(_field(source, "price"))
     if not price:
         return False, event_time, "invalid_price", None
-    volume = _safe_float(_field(source, "volume"))
     if not volume:
         return False, event_time, "invalid_volume", None
-    direction = str(_field(source, "entrustDirection", "direction", "side") or "").upper()
-    if direction not in ("B", "BUY", "1", "买", "买入"):
+    if not _is_buy_direction(direction):
         return False, event_time, "not_buy", None
 
     limit_up = _safe_float(inst.get("limit_up"))
@@ -1371,7 +1633,6 @@ def _l2order_entry_gate(inst, source, event_raw):
     if abs(price - limit_up) >= 1e-8:
         return False, event_time, "off_limit_up", None
 
-    order_id = str(_field(source, "entrustNo", "orderNo", "order_id") or "")
     event_key = order_id or "event:%s:%s:%s:%s" % (
         event_raw or event_time, price, volume, direction)
     if event_key in inst["seen_order_ids"]:
@@ -1544,6 +1805,18 @@ def _handle_l2order(code, payload):
         volume = _safe_float(_field(data, "volume"))
         direction = str(_field(data, "entrustDirection", "direction", "side") or "").upper()
         order_id = str(_field(data, "entrustNo", "orderNo", "order_id") or "")
+        if drop_reason == "cancel":
+            _remember_cancel_event_key(inst, event_key)
+            _process_external_cancel(inst, {
+                "event_key": event_key,
+                "event_raw": event_raw,
+                "event_time": event_time,
+                "order_id": order_id,
+                "price": price,
+                "volume": volume or 0,
+                "source": "l2order",
+            })
+            return
         inst["seen_order_ids"].add(event_key)
         seen_queue = inst.setdefault("seen_order_queue", deque())
         seen_queue.append(event_key)
@@ -1614,7 +1887,10 @@ def _handle_l2order(code, payload):
         ):
             trigger_reason = "回封大单"
         if trigger_reason:
-            if _submit(inst, trigger_reason, event_key):
+            if _submit(inst, trigger_reason, event_key, {
+                    "order_id": order_id, "price": price, "volume": volume,
+                    "amount": amount, "direction": direction,
+                    "event_time": event_time}):
                 _log("[大单触发] %s 路径=%s 委托=%s 数量=%d股(%.2f手) 金额=%.2f" % (
                     inst["code"], trigger_reason, order_id or "无编号", int(volume),
                     volume / 100.0, amount))
@@ -1627,7 +1903,55 @@ def _handle_l2order(code, payload):
                     inst["first_large_total"] += amount
             if (inst["first_large_total"] > FIRST_LARGE_ORDER_TOTAL_AMOUNT
                     and _opening_low_filter_met(inst)):
-                _submit(inst, "首封")
+                _submit(inst, "首封", event_key, {
+                    "order_id": order_id, "price": price, "volume": volume,
+                    "amount": amount, "direction": direction,
+                    "event_time": event_time})
+
+
+def _handle_l2transaction(code, payload):
+    with _LOCK:
+        inst = _INSTANCES.get(code)
+        if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+            return
+        received_at = time.time()
+        _CALLBACK_COUNTS["l2transaction"] = _CALLBACK_COUNTS.get("l2transaction", 0) + 1
+        source = _unwrap(code, payload)
+        fresh, event_raw, _ = _freshness_gate(
+            code, "l2transaction", source, received_at, record_latest=False)
+        if not fresh:
+            return
+        event_time = _event_time(_field(source, "stime", "time", "timestamp"))
+        if not event_time or not _in_continuous(event_time):
+            _record_entry_drop("l2transaction", "outside_continuous")
+            return
+        trade_flag = _field(source, "tradeFlag", "trade_flag", "flag")
+        if not _is_cancel_direction(trade_flag):
+            _record_entry_drop("l2transaction", "not_cancel")
+            return
+        order_id = str(_field(source, "buyNo", "buy_no") or "")
+        if not order_id:
+            _record_entry_drop("l2transaction", "cancel_missing_buy_no")
+            return
+        volume = _safe_float(_field(source, "volume", "tradeVolume", "trade_volume")) or 0
+        price = _safe_float(_field(source, "price"))
+        event_key = "cancel:%s:%s:%s" % (order_id, event_raw or event_time, volume)
+        if event_key in inst.setdefault("seen_cancel_event_keys", set()):
+            _record_entry_drop("l2transaction", "duplicate")
+            return
+        _remember_cancel_event_key(inst, event_key)
+        _record_accepted_event(code, "l2transaction", event_raw, received_at)
+        data = _owned_payload(code, payload)
+        received_at = _record_l2_ingress(code, "l2transaction", data, received_at)
+        _process_external_cancel(inst, {
+            "event_key": event_key,
+            "event_raw": event_raw,
+            "event_time": event_time,
+            "order_id": order_id,
+            "price": price,
+            "volume": volume,
+            "source": "l2transaction",
+        })
 
 
 def _subscribe(C, code, period):
@@ -1635,7 +1959,12 @@ def _subscribe(C, code, period):
     inst = _INSTANCES.get(code)
     if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
         return
-    callback = (lambda data, c=code: _handle_l2order(c, data)) if period == "l2order" else (lambda data, c=code, p=period: _handle_quote(c, p, data))
+    if period == "l2order":
+        callback = lambda data, c=code: _handle_l2order(c, data)
+    elif period == "l2transaction":
+        callback = lambda data, c=code: _handle_l2transaction(c, data)
+    else:
+        callback = lambda data, c=code, p=period: _handle_quote(c, p, data)
     try:
         sub_id = C.subscribe_quote(code, period=period, dividend_type="follow", result_type="dict", callback=callback)
         if sub_id and sub_id > 0:
@@ -1785,10 +2114,13 @@ def _summary():
                      if "l2order" in inst.get("sub_periods", {}).values())
     first_callback = sum(1 for inst in _INSTANCES.values()
                          if inst.get("l2order_first_callback_at") is not None)
-    _log("[L2ORDER_COVERAGE] pool=%d registered=%d first_callback=%d "
-         "ingress_quote=%d ingress_order=%d" % (
-             len(_INSTANCES), registered, first_callback,
-             _CALLBACK_COUNTS.get("l2quote", 0), _CALLBACK_COUNTS.get("l2order", 0)))
+    registered_transaction = sum(1 for inst in _INSTANCES.values()
+                                 if "l2transaction" in inst.get("sub_periods", {}).values())
+    _log("[L2ORDER_COVERAGE] pool=%d registered=%d transaction_registered=%d "
+         "first_callback=%d ingress_quote=%d ingress_order=%d ingress_transaction=%d" % (
+             len(_INSTANCES), registered, registered_transaction, first_callback,
+             _CALLBACK_COUNTS.get("l2quote", 0), _CALLBACK_COUNTS.get("l2order", 0),
+             _CALLBACK_COUNTS.get("l2transaction", 0)))
 
 
 def init(C):
@@ -1805,9 +2137,10 @@ def init(C):
         _log("[运行] log=console_only raw_capture=disabled")
         _log("[运行] ENABLE_LIVE_ORDERS=%s PERIODS=%s" %
              (ENABLE_LIVE_ORDERS, ",".join(PERIODS)))
-        _log("[运行] latency_warning_thresholds=l2quote:%.0fms,l2order:%.0fms "
+        _log("[运行] latency_warning_thresholds=l2quote:%.0fms,l2order:%.0fms,l2transaction:%.0fms "
              "warn_interval=%ss" %
              (DEBUG_LATENCY_WARN_THRESHOLD_MS,
+              DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS,
               DEBUG_L2ORDER_LATENCY_WARN_THRESHOLD_MS,
               DEBUG_LATENCY_WARN_INTERVAL_SECONDS))
         _COUNTERS.update({"orders": 0, "deals": 0, "cancels": 0, "l2": 0})
@@ -1844,13 +2177,14 @@ def init(C):
                  L2ORDER_SUBSCRIBE_RETRY_SECONDS, L2ORDER_SUBSCRIBE_MAX_ATTEMPTS))
         _schedule_l2order_subscriptions(C)
         expected_subscriptions = sum(
-            1 + int("l2order" in inst.get("sub_periods", {}).values())
+            sum(1 for period in PERIODS if period in inst.get("sub_periods", {}).values())
             for inst in _INSTANCES.values()
             if not inst.get("subscriptions_stopped"))
         pending_l2order = sum(
-            1 for inst in _INSTANCES.values()
+             1 for inst in _INSTANCES.values()
             if (not inst.get("subscriptions_stopped") and
-                "l2order" not in inst.get("sub_periods", {}).values()))
+                ("l2order" not in inst.get("sub_periods", {}).values() or
+                 "l2transaction" not in inst.get("sub_periods", {}).values())))
         skipped_count = sum(1 for inst in _INSTANCES.values()
                             if inst["state"] == STATE_SKIPPED)
         _log("[运行] subscriptions=%d success=%d failed=%d expected=%d "
@@ -1870,7 +2204,7 @@ def handlebar(C):
         return
     with _LOCK:
         for inst in _INSTANCES.values():
-            _check_validation(inst)
+            _check_validation(inst, C)
         if _now() - _LAST_SUMMARY >= DEBUG_SUMMARY_INTERVAL_SECONDS:
             _summary()
             _LAST_SUMMARY = _now()
@@ -1885,16 +2219,21 @@ def _apply_order_update(inst, item):
     status = str(item["status"]).lower()
     if inst["our_traded_qty"] >= inst["our_order_qty"] > 0 or status == "56":
         _cancel_timer(inst)
+        _cancel_request_timer(inst)
+        inst["cancel_due"] = False
+        inst["cancel_requested"] = False
         _set_state(inst, STATE_DONE, "订单全部成交")
     elif status in ("5", "6", "53", "54", "canceled", "cancelled", "撤单"):
-        if inst.get("validation_order_id") == item["id"]:
-            inst["cancel_confirmed"] = True
+        if _our_cancel_order_id(inst) == item["id"]:
+            _confirm_cancel(inst, status)
             if item["traded"] == 0:
                 _log("[撤单] %s 已完全撤单" % inst["code"])
         else:
             _set_state(inst, STATE_DONE, "订单结束")
     elif status in ("57", "rejected", "废单"):
         _cancel_timer(inst)
+        _cancel_request_timer(inst)
+        inst["cancel_requested"] = False
         _set_state(inst, STATE_DONE, "订单废单")
 
 
@@ -1915,6 +2254,9 @@ def _apply_deal_update(inst, item):
     _COUNTERS["deals"] += 1
     if inst["our_traded_qty"] >= inst["our_order_qty"] > 0:
         _cancel_timer(inst)
+        _cancel_request_timer(inst)
+        inst["cancel_due"] = False
+        inst["cancel_requested"] = False
         _set_state(inst, STATE_DONE, "订单全部成交")
     _log("[DEAL_CALLBACK] id=%s code=%s deal_id=%s volume=%s cum_volume=%s price=%s" % (
         item.get("id", ""), item.get("code", ""), deal_id, volume,
@@ -1942,6 +2284,10 @@ def order_callback(ContextInfo, orderInfo):
         for inst in _INSTANCES.values():
             if item["id"] and item["id"] == str(inst.get("our_order_id")):
                 _apply_order_update(inst, item)
+                if inst.get("cancel_due") and inst["state"] not in (STATE_DONE, STATE_SKIPPED):
+                    _request_cancel(inst, inst.get("cancel_due_reason") or "cancel_due", ContextInfo)
+                if inst.get("cancel_confirmed"):
+                    _check_validation(inst, ContextInfo)
                 _log("[ORDER_CALLBACK] id=%s code=%s token=%s status=%s total=%s traded=%s price=%s" % (
                     item["id"], item["code"], item["user_order_id"], item["status"],
                     item["total"], item["traded"], item["price"]))
@@ -1953,7 +2299,9 @@ def order_callback(ContextInfo, orderInfo):
             if item["id"] and _bind_order_id(inst, item["id"]):
                 _apply_order_update(inst, item)
                 if inst.get("cancel_due") and inst["state"] not in (STATE_DONE, STATE_SKIPPED):
-                    _request_cancel(inst, inst.get("cancel_due_reason") or "validation_failed")
+                    _request_cancel(inst, inst.get("cancel_due_reason") or "validation_failed", ContextInfo)
+                if inst.get("cancel_confirmed"):
+                    _check_validation(inst, ContextInfo)
                 event = "ORDER_CALLBACK_ASSOCIATED"
             else:
                 inst["pending_order_info"] = item
@@ -1977,6 +2325,8 @@ def deal_callback(ContextInfo, dealInfo):
         for inst in _INSTANCES.values():
             if item["id"] and item["id"] == str(inst.get("our_order_id")):
                 _apply_deal_update(inst, item)
+                if inst.get("cancel_due") and inst["state"] not in (STATE_DONE, STATE_SKIPPED):
+                    _request_cancel(inst, inst.get("cancel_due_reason") or "cancel_due", ContextInfo)
                 return
         candidates = [inst for inst in _INSTANCES.values()
                       if inst["state"] != STATE_SKIPPED and _pending_order_matches(inst, item)]
@@ -1986,7 +2336,7 @@ def deal_callback(ContextInfo, dealInfo):
             if item["id"]:
                 _bind_order_id(inst, item["id"])
                 if inst.get("cancel_due") and inst["state"] not in (STATE_DONE, STATE_SKIPPED):
-                    _request_cancel(inst, inst.get("cancel_due_reason") or "validation_failed")
+                    _request_cancel(inst, inst.get("cancel_due_reason") or "validation_failed", ContextInfo)
             event = "DEAL_CALLBACK_ASSOCIATED" if item["id"] else "DEAL_CALLBACK_PENDING"
             _log("[%s] id=%s code=%s token=%s deal_id=%s volume=%s" % (
                 event,
@@ -2016,6 +2366,7 @@ def stop(C):
         for inst in _INSTANCES.values():
             _cancel_timer(inst)
             _cancel_order_lookup(inst)
+            _cancel_request_timer(inst)
         for sub_id in list(_SUBSCRIPTIONS):
             try:
                 C.unsubscribe_quote(sub_id)
