@@ -81,12 +81,27 @@ class NativeModelTests(unittest.TestCase):
         self.assertEqual(self.default_account_id, "32011276")
 
     def _run_preflight(self, context, now):
+        prep_now = now
+        if (now.hour, now.minute) >= (self.model.SUBMIT_HOUR, self.model.SUBMIT_MINUTE):
+            prep_now = now.replace(hour=8, minute=20, second=0, microsecond=0)
         for unused in range(20):
             if self.model._SESSION.get("phase") != "PREFLIGHT":
                 break
-            self.model._drive(context, now=now)
+            self.model._drive(context, now=prep_now)
+        if self.model._SESSION.get("phase") == "PREFLIGHT":
+            self.model._drive(
+                context,
+                now=prep_now.replace(hour=8, minute=30, second=0, microsecond=0),
+            )
+        if self.model._SESSION.get("phase") == "WAITING_FOR_SUBMIT_TIME":
+            if (now.hour, now.minute) >= (self.model.SUBMIT_HOUR, self.model.SUBMIT_MINUTE):
+                self.model._drive(
+                    context,
+                    now=prep_now.replace(hour=8, minute=29, second=58, microsecond=0),
+                )
+                self.model._drive(context, now=now)
 
-    def test_late_start_runs_all_checks_then_dry_runs_without_passorder(self):
+    def test_prepared_start_runs_checks_then_dry_runs_without_passorder(self):
         context = self._context()
         self.model.passorder = lambda *args: self.fail("dry run called passorder")
         self.model.init(context)
@@ -102,6 +117,9 @@ class NativeModelTests(unittest.TestCase):
         self._run_preflight(context, before)
         self.model._drive(context, now=before)
         self.assertEqual(self.model._SESSION["phase"], "WAITING_FOR_SUBMIT_TIME")
+        self.assertEqual(self.model._SESSION["preflight_cursor"], 1)
+        self.model._drive(context, now=before.replace(minute=29, second=58))
+        self.assertTrue(self.model._SESSION["submission_prepared"])
         self.model._drive(context, now=before.replace(minute=30))
         self.assertEqual(self.model._SESSION["phase"], "COMPLETE")
         
@@ -124,15 +142,16 @@ class NativeModelTests(unittest.TestCase):
         self.assertEqual(self.model._SESSION["phase"], "COMPLETE")
         self.assertEqual(self.model._SESSION["preflight_cursor"], 1)
 
-    def test_previous_detail_day_does_not_block_clock_scheduled_submission(self):
+    def test_previous_detail_day_is_rejected_before_submission(self):
         previous_day = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y%m%d")
         context = self._context(details={
             "603005.SH": {"TradingDay": previous_day, "UpStopPrice": 13.0},
         })
         self.model.init(context)
         self._run_preflight(context, datetime.datetime.now().replace(hour=8, minute=31))
-        self.assertEqual(self.model._SESSION["phase"], "COMPLETE")
-        self.assertEqual(self.model._SESSION["plans"][0]["limit_up_price"], 13.0)
+        self.assertEqual(self.model._SESSION["phase"], "ABORTED")
+        self.assertEqual(self.model._SESSION["plans"], [])
+        self.assertEqual(self.model._SESSION["dispatch_cursor"], 0)
 
     def test_normalize_day_accepts_epoch_seconds(self):
         value = time.mktime(datetime.datetime(2026, 10, 15, 9, 0).timetuple())

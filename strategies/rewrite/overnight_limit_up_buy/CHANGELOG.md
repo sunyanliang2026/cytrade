@@ -1,5 +1,10 @@
 # Change Log
 
+## 2026-10-29
+
+- Moved limit-price, quantity, funding, reservation, and initial order-argument preparation ahead of 08:30. Missing or stale instrument-detail dates and unavailable prices retry every 500ms; a batch not ready by 08:29:58 aborts instead of submitting a previous-session price or catching up late. The first dispatch submits the prepared batch in one scheduler callback, up to 500 orders.
+- Require instrument-detail `TradingDay` to match the plan date. Updated the native-model expectations and deployment notes. The deployed QMT file was not replaced because it is not byte-identical to the readable source and its configuration cannot be inspected safely.
+
 ## 2026-10-23
 
 - Replaced CSV input with `PLAN_TRADE_DATE` and `ORDER_PLAN` constants in the native model; both default empty, so an unconfigured daily plan stops before scheduling.

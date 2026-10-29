@@ -25,6 +25,10 @@ TERMINAL_ORDER_STATUSES = (
     ORDER_STATUS_PART_SUCCEEDED, ORDER_STATUS_SUCCEEDED, ORDER_STATUS_JUNK,
 )
 
+
+class _PriceNotReady(ValueError):
+    pass
+
 # Example only: replace the date, codes, and amounts before enabling a daily plan.
 # PLAN_TRADE_DATE = "YYYYMMDD"
 # ORDER_PLAN = (
@@ -41,10 +45,12 @@ LATEST_SUBMIT_HOUR = 15
 LATEST_SUBMIT_MINUTE = 0
 MAX_REJECT_RETRIES = 2
 RETRY_DELAY_MS = 100
-PREFLIGHT_ROWS_PER_TURN = 5
-SUBMIT_ROWS_PER_TURN = 5
-SCHEDULER_INTERVAL_MS = 100
 MAX_ORDERS = 500
+PREFLIGHT_ROWS_PER_TURN = 5
+SUBMIT_ROWS_PER_TURN = MAX_ORDERS
+SCHEDULER_INTERVAL_MS = 100
+PRICE_RETRY_INTERVAL_MS = 500
+SUBMISSION_PREP_LEAD_MS = 2000
 SCHEDULE_NAME = "qmt_overnight_limit_up_buy_drive"
 UNMATCHED_CALLBACK_LOG_INTERVAL_SECONDS = 5
 
@@ -234,6 +240,8 @@ def _detail_for(C, stock_code):
     if not callable(getter):
         raise ValueError("ContextInfo.get_instrument_detail is unavailable")
     detail = getter(stock_code)
+    if detail is None:
+        raise _PriceNotReady("instrument detail is not ready for %s" % stock_code)
     if not isinstance(detail, dict):
         raise ValueError("instrument detail is not a dictionary for %s" % stock_code)
     return detail
@@ -243,12 +251,10 @@ def _limit_up_price(detail, trade_day, stock_code):
     detail_day = _normalize_day(_field(
         detail, "TradingDay", "tradingDay", "m_strTradingDay", "tradeDate"
     ))
-    # The native model is scheduled by clock time.  Some QMT builds expose
-    # the previous trading day in metadata around the pre-open transition;
-    # that metadata must not block the timed submission path.  UpStopPrice is
-    # still required and remains the only price value accepted for planning.
-    if detail_day and detail_day != trade_day:
-        _log("PRICE_DAY_INFO code=%s expected=%s got=%s; ignored for scheduling" % (
+    if not detail_day:
+        raise _PriceNotReady("instrument detail TradingDay is missing for %s" % stock_code)
+    if detail_day != trade_day:
+        raise _PriceNotReady("instrument detail day mismatch for %s: expected=%s got=%s" % (
             stock_code, trade_day, detail_day
         ))
     price = _float_value(_field(
@@ -256,7 +262,7 @@ def _limit_up_price(detail, trade_day, stock_code):
         "upperLimit", "limitUp", "upLimitPrice"
     ))
     if price <= 0:
-        raise ValueError("verified UpStopPrice missing for %s" % stock_code)
+        raise _PriceNotReady("UpStopPrice is not ready for %s" % stock_code)
     return price
 
 
@@ -335,7 +341,9 @@ def _format_plan():
         _log("FUNDS_CHECK_SKIPPED reason=live_orders_disabled")
 
 
-def _preflight_step(C):
+def _preflight_step(C, now=None):
+    step_started_mono = time.monotonic()
+    now = now or datetime.datetime.now()
     if not _SESSION.get("startup_order_check_done"):
         day = _SESSION["trade_day"]
         if ENABLE_LIVE_ORDERS:
@@ -357,9 +365,16 @@ def _preflight_step(C):
         _SESSION["startup_order_check_done"] = True
         _log("TRADING_DAY_CHECK_SKIPPED day=%s; clock schedule controls submission" % day)
 
+    retry_due = _SESSION.get("preflight_retry_due", 0.0)
+    if retry_due and time.monotonic() < retry_due:
+        return
+
     rows = _SESSION["orders"]
     start = _SESSION["preflight_cursor"]
     end = min(len(rows), start + PREFLIGHT_ROWS_PER_TURN)
+    prepared = []
+    waiting = []
+    failures = []
     for index in range(start, end):
         order = rows[index]
         code = order["stock_code"]
@@ -375,7 +390,7 @@ def _preflight_step(C):
                 raise ValueError("budget is below one board lot for %s" % code)
             amount = float(order["amount"])
             estimate = round(price * quantity, 2)
-            _SESSION["plans"].append({
+            prepared.append({
                 "row_no": order["row_no"],
                 "stock_code": code,
                 "amount": amount,
@@ -391,48 +406,55 @@ def _preflight_step(C):
                 "fill_uncertain": False,
                 "attempt_history": [],
             })
-            plan = _SESSION["plans"][-1]
-            _SESSION["plan_by_row"][order["row_no"]] = plan
-            _log("PLAN row=%s code=%s budget=%.2f limit_up=%.3f qty=%s estimate=%.2f" % (
-                plan["row_no"], plan["stock_code"], plan["amount"],
-                plan["limit_up_price"], plan["quantity"], plan["estimated_amount"]
-            ))
+        except _PriceNotReady as exc:
+            waiting.append((order["row_no"], code, str(exc)))
         except Exception as exc:
-            _SESSION["failures"].append(order["row_no"])
-            _log("PREFLIGHT_ROW_FAILED row=%s code=%s reason=%s" % (
-                order["row_no"], code, exc
-            ))
+            failures.append((order["row_no"], code, str(exc)))
+
+    for row_no, code, reason in failures:
+        _SESSION["failures"].append(row_no)
+        _log("PREFLIGHT_ROW_FAILED row=%s code=%s reason=%s" % (
+            row_no, code, reason
+        ))
+    if failures:
+        _abort("preflight failed rows=%s" % len(_SESSION["failures"]))
+        return
+
+    waiting_rows = [(row_no, code) for row_no, code, unused in waiting]
+    previous_waiting = _SESSION.get("price_waiting_rows", [])
+    if waiting:
+        for row_no, code, reason in waiting:
+            if (row_no, code) not in previous_waiting:
+                _log("PRICE_NOT_READY row=%s code=%s reason=%s retry_ms=%s" % (
+                    row_no, code, reason, PRICE_RETRY_INTERVAL_MS
+                ))
+        _SESSION["price_waiting_rows"] = waiting_rows
+        _SESSION["preflight_retry_due"] = (
+            time.monotonic() + max(1, PRICE_RETRY_INTERVAL_MS) / 1000.0
+        )
+        return
+
+    _SESSION["price_waiting_rows"] = []
+    _SESSION["preflight_retry_due"] = 0.0
+    for plan in prepared:
+        _SESSION["plans"].append(plan)
+        _SESSION["plan_by_row"][plan["row_no"]] = plan
+        _log("PLAN row=%s code=%s budget=%.2f limit_up=%.3f qty=%s estimate=%.2f" % (
+            plan["row_no"], plan["stock_code"], plan["amount"],
+            plan["limit_up_price"], plan["quantity"], plan["estimated_amount"]
+        ))
     _SESSION["preflight_cursor"] = end
 
     if end < len(rows):
         _log("PREFLIGHT_PROGRESS checked=%s total=%s" % (end, len(rows)))
         return
-    if _SESSION["failures"]:
-        _abort("preflight failed rows=%s" % len(_SESSION["failures"]))
+    preparation_deadline = now.replace(
+        hour=SUBMIT_HOUR, minute=SUBMIT_MINUTE, second=0, microsecond=0
+    ) - datetime.timedelta(milliseconds=SUBMISSION_PREP_LEAD_MS)
+    elapsed = max(0.0, time.monotonic() - step_started_mono)
+    if now + datetime.timedelta(seconds=elapsed) >= preparation_deadline:
+        _abort("price preflight missed the 08:29:58 preparation deadline")
         return
-
-    now_mono = time.monotonic()
-    for plan in _SESSION["plans"]:
-        if plan.get("status") == "retry_wait":
-            _SESSION["retry_due"][plan["row_no"]] = (
-                now_mono + max(0, RETRY_DELAY_MS) / 1000.0
-            )
-
-    required = sum(item["estimated_amount"] for item in _SESSION["plans"])
-    if ENABLE_LIVE_ORDERS:
-        try:
-            available = _available_cash(C)
-        except Exception as exc:
-            _abort("funding preflight failed: %r" % (exc,))
-            return
-        _SESSION["available_cash"] = available
-        if available + 0.0001 < required:
-            _abort("insufficient available cash: available=%.2f required=%.2f" % (
-                available, required
-            ))
-            return
-
-    _format_plan()
     _SESSION["phase"] = "WAITING_FOR_SUBMIT_TIME"
 
 
@@ -453,6 +475,75 @@ def _reserve_batch():
     return True
 
 
+def _prepare_initial_attempts(C):
+    sender = globals().get("passorder")
+    if ENABLE_LIVE_ORDERS and not callable(sender):
+        _abort("passorder is unavailable before submission")
+        return False
+    for plan in _SESSION["plans"]:
+        if not ENABLE_LIVE_ORDERS:
+            continue
+        attempt_no = plan["attempts"] + 1
+        token = "%s_%s_%s_%s" % (
+            _SESSION["trade_day"], plan["row_no"], attempt_no,
+            uuid.uuid4().hex[:8]
+        )
+        attempt = {
+            "attempt": attempt_no,
+            "token": token,
+            "order_id": "",
+            "status": "prepared",
+            "order_status": None,
+            "traded_volume": 0,
+            "fill_uncertain": False,
+        }
+        plan["prepared_attempt"] = attempt
+        plan["prepared_sender"] = sender
+        plan["prepared_args"] = (
+            23, ORDER_TYPE_BUY, ACCOUNT_ID, plan["stock_code"], PRICE_TYPE_LIMIT,
+            plan["limit_up_price"], plan["quantity"], STRATEGY_NAME,
+            QUICK_TRADE, token, C
+        )
+        _SESSION["token_to_plan"][token] = plan
+        _SESSION["token_to_attempt"][token] = attempt
+    return True
+
+
+def _prepare_submission(C, now):
+    started_mono = time.monotonic()
+    required = sum(item["estimated_amount"] for item in _SESSION["plans"])
+    if ENABLE_LIVE_ORDERS:
+        try:
+            available = _available_cash(C)
+        except Exception as exc:
+            _abort("funding preflight failed: %r" % (exc,))
+            return False
+        _SESSION["available_cash"] = available
+        if available + 0.0001 < required:
+            _abort("insufficient available cash: available=%.2f required=%.2f" % (
+                available, required
+            ))
+            return False
+    if not _reserve_batch():
+        return False
+    if not _prepare_initial_attempts(C):
+        return False
+    elapsed = max(0.0, time.monotonic() - started_mono)
+    finished = now + datetime.timedelta(seconds=elapsed)
+    submit_at = now.replace(
+        hour=SUBMIT_HOUR, minute=SUBMIT_MINUTE, second=0, microsecond=0
+    )
+    if finished >= submit_at:
+        _abort("submission preparation crossed the 08:30 cutoff")
+        return False
+    _SESSION["submission_prepared"] = True
+    _format_plan()
+    _log("SUBMISSION_ARMED time=%02d:%02d rows=%s" % (
+        SUBMIT_HOUR, SUBMIT_MINUTE, len(_SESSION["plans"])
+    ))
+    return True
+
+
 def _is_preopen_rejection(message):
     text = str(message or "").lower()
     markers = (
@@ -463,29 +554,38 @@ def _is_preopen_rejection(message):
 
 
 def _submit_plan(C, plan):
-    plan["attempts"] += 1
-    token = "%s_%s_%s_%s" % (
-        _SESSION["trade_day"], plan["row_no"], plan["attempts"], uuid.uuid4().hex[:8]
-    )
-    attempt = {
-        "attempt": plan["attempts"],
-        "token": token,
-        "order_id": "",
-        "status": "sending",
-        "order_status": None,
-        "traded_volume": 0,
-        "fill_uncertain": False,
-    }
-    plan.setdefault("attempt_history", []).append(attempt)
+    attempt = plan.pop("prepared_attempt", None)
+    prepared_args = plan.pop("prepared_args", None)
+    sender = plan.pop("prepared_sender", None)
+    if attempt is None:
+        plan["attempts"] += 1
+        token = "%s_%s_%s_%s" % (
+            _SESSION["trade_day"], plan["row_no"], plan["attempts"], uuid.uuid4().hex[:8]
+        )
+        attempt = {
+            "attempt": plan["attempts"],
+            "token": token,
+            "order_id": "",
+            "status": "sending",
+            "order_status": None,
+            "traded_volume": 0,
+            "fill_uncertain": False,
+        }
+        plan.setdefault("attempt_history", []).append(attempt)
+        sender = globals().get("passorder")
+    else:
+        token = attempt["token"]
+        plan["attempts"] = attempt["attempt"]
+        plan.setdefault("attempt_history", []).append(attempt)
     plan["last_token"] = token
     plan["order_id"] = ""
     plan["order_status"] = None
     plan["traded_volume"] = 0
     plan["fill_uncertain"] = False
     plan["status"] = "sending"
+    attempt["status"] = "sending"
     _SESSION["token_to_plan"][token] = plan
     _SESSION["token_to_attempt"][token] = attempt
-    sender = globals().get("passorder")
     if not callable(sender):
         plan["status"] = "unknown"
         attempt["status"] = "unknown"
@@ -494,11 +594,13 @@ def _submit_plan(C, plan):
              plan["row_no"])
         return False
     try:
-        result = sender(
-            23, ORDER_TYPE_BUY, ACCOUNT_ID, plan["stock_code"], PRICE_TYPE_LIMIT,
-            plan["limit_up_price"], plan["quantity"], STRATEGY_NAME, QUICK_TRADE,
-            token, C
-        )
+        if prepared_args is None:
+            prepared_args = (
+                23, ORDER_TYPE_BUY, ACCOUNT_ID, plan["stock_code"], PRICE_TYPE_LIMIT,
+                plan["limit_up_price"], plan["quantity"], STRATEGY_NAME,
+                QUICK_TRADE, token, C
+            )
+        result = sender(*prepared_args)
     except Exception as exc:
         plan["status"] = "unknown"
         attempt["status"] = "unknown"
@@ -598,15 +700,27 @@ def _drive(C, now=None):
     if not _SESSION or _SESSION.get("phase") in (
             "ABORTED", "PARTIAL_STOP", "COMPLETE", "STOPPED"):
         return
+    clock_is_injected = now is not None
     now = now or datetime.datetime.now()
     phase = _SESSION.get("phase")
     if phase == "PREFLIGHT":
-        _preflight_step(C)
+        submit_at = now.replace(
+            hour=SUBMIT_HOUR, minute=SUBMIT_MINUTE, second=0, microsecond=0
+        )
+        preparation_deadline = submit_at - datetime.timedelta(
+            milliseconds=SUBMISSION_PREP_LEAD_MS
+        )
+        if now >= preparation_deadline:
+            waiting = _SESSION.get("price_waiting_rows", [])
+            _abort("price preflight missed the 08:29:58 preparation deadline; "
+                   "waiting_rows=%s" % waiting)
+            return
+        _preflight_step(C, now=now)
         if _SESSION.get("phase") in ("ABORTED", "PARTIAL_STOP", "COMPLETE"):
             _cancel_scheduler(C)
             return
-        # If the final preflight slice completed at or after 08:30, continue
-        # through the submit phase in this same scheduler callback.
+        if not clock_is_injected:
+            now = datetime.datetime.now()
         phase = _SESSION.get("phase")
         if phase == "PREFLIGHT":
             return
@@ -626,12 +740,17 @@ def _drive(C, now=None):
             _abort("latest submission time 15:00 has passed")
             return
         if (now.hour, now.minute) < (SUBMIT_HOUR, SUBMIT_MINUTE):
+            arm_time = now.replace(
+                hour=SUBMIT_HOUR, minute=SUBMIT_MINUTE, second=0, microsecond=0
+            ) - datetime.timedelta(milliseconds=SUBMISSION_PREP_LEAD_MS)
+            if (not _SESSION.get("submission_prepared") and now >= arm_time
+                    and not _prepare_submission(C, now)):
+                _cancel_scheduler(C)
             return
-        if not _reserve_batch():
+        if not _SESSION.get("submission_prepared"):
+            _abort("submission preparation did not finish before 08:30")
             return
         _SESSION["phase"] = "DISPATCHING"
-        _log("SUBMIT_WINDOW_OPEN now=%s; dispatch starts after completed preflight" %
-             now.strftime("%Y-%m-%d %H:%M:%S"))
         phase = "DISPATCHING"
     if phase == "DISPATCHING":
         if (now.hour, now.minute) >= (LATEST_SUBMIT_HOUR, LATEST_SUBMIT_MINUTE):
@@ -665,6 +784,8 @@ def init(C):
         "plans": [],
         "plan_by_row": {},
         "preflight_cursor": 0,
+        "price_waiting_rows": [],
+        "preflight_retry_due": 0.0,
         "dispatch_cursor": 0,
         "price_cache": {},
         "failures": [],
@@ -680,6 +801,7 @@ def init(C):
         "unmatched_callback_count": 0,
         "unmatched_callback_last_log": 0.0,
         "reserved": False,
+        "submission_prepared": False,
         "task_id": None,
     }
     script_file = globals().get("__file__", "<absent>")
