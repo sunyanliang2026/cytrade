@@ -9,6 +9,7 @@ QMT account by default.
 
 import copy
 import datetime as _dt
+import re
 import time
 import uuid
 
@@ -28,12 +29,13 @@ PENDING_SIGNAL_MAX_AGE_SECONDS = 5.0
 
 # This pool is the last QMT pool reviewed on 2026-10-23. Update both the
 # date and rows before running the model on another trading day.
-POOL_TRADE_DATE = "20261023"
+POOL_TRADE_DATE = "20261028"
 SELL_POOL = (
-    ("603138.SH", 0, 1200),
-    ("002520.SZ", 0, 2500),
-    ("000530.SZ", 0, 1600),
-    ("601091.SH", 0, 700),
+    ("000810", 0, 2800),
+    ("600715", 0, 13300),
+    ("600826", 0, 2700),
+    ("000678", 0, 1500),
+    ("603390", 0, 2200),
 )
 
 LIMIT_UP_CONFIRM_AMOUNT = 120000000.0
@@ -45,7 +47,7 @@ LIMIT_DOWN_CLEAR_AMOUNT = 50000000.0
 LIMIT_OPEN_GRACE_SECONDS = 60.0
 LIMIT_OPEN_RECOVERY_SECONDS = 300.0
 CANCEL_WAIT_SECONDS = 2.0
-SUMMARY_INTERVAL_SECONDS = 60.0
+SUMMARY_INTERVAL_SECONDS = 300.0
 
 FLAG_NORMAL = 0
 FLAG_AUCTION_UNDER_EXPECTATION = 1
@@ -66,6 +68,41 @@ ORDER_FILLED = "FILLED"
 ORDER_REJECTED = "REJECTED"
 ORDER_UNKNOWN = "UNKNOWN"
 ORDER_SIMULATED = "SIMULATED"
+
+_FLAG_LABELS = {
+    FLAG_NORMAL: "\u6b63\u5e38",
+    FLAG_AUCTION_UNDER_EXPECTATION: "\u7ade\u4ef7\u4e0d\u53ca\u9884\u671f",
+    FLAG_WEAK: "\u5f31\u52bf",
+    FLAG_REBOUND: "\u53cd\u5f39",
+    FLAG_STRONG: "\u5f3a\u52bf",
+    FLAG_LIMIT_UP: "\u6da8\u505c",
+    FLAG_LIMIT_DOWN_CLEAR: "\u8dcc\u505c\u6253\u5f00",
+    FLAG_SELL_DONE: "\u5df2\u5356\u51fa",
+}
+
+_ORDER_STATUS_LABELS = {
+    ORDER_SUBMITTING: "\u63d0\u4ea4\u4e2d",
+    ORDER_ACTIVE: "\u6d3b\u52a8",
+    ORDER_PARTIAL: "\u90e8\u5206\u6210\u4ea4",
+    ORDER_CANCEL_REQUESTED: "\u64a4\u5355\u4e2d",
+    ORDER_CANCELED: "\u5df2\u64a4\u5355",
+    ORDER_FILLED: "\u5df2\u6210\u4ea4",
+    ORDER_REJECTED: "\u5df2\u62d2\u7edd",
+    ORDER_UNKNOWN: "\u672a\u77e5",
+    ORDER_SIMULATED: "\u6a21\u62df",
+}
+
+_ACTION_LABELS = {
+    "auction_under_expectation_primary": "\u7ade\u4ef7\u4e0d\u53ca\u9884\u671f",
+    "early_under_expectation": "\u65e9\u76d8\u4e0d\u53ca\u9884\u671f",
+    "weak_rebound_primary": "\u5f31\u52bf\u53cd\u5f39\u5931\u8d25",
+    "limit_down_clear": "\u8dcc\u505c\u6253\u5f00",
+    "flag7_break7_after_high": "\u5f3a\u52bf\u9ad8\u4f4d\u8dcc\u78347%",
+    "flag7_high_pullback_25": "\u5f3a\u52bf\u9ad8\u70b9\u56de\u64a25%",
+    "flag7_morning_take_profit": "\u5f3a\u52bf\u65e9\u76d8\u6b62\u76c8",
+    "limit_open_first_sell": "\u6da8\u505c\u5f00\u677f\u9996\u6b21\u5356\u51fa",
+    "limit_open_second_sell": "\u6da8\u505c\u5f00\u677f\u4e8c\u6b21\u5356\u51fa",
+}
 
 PERIODS = ("tick", "l2quote")
 
@@ -203,7 +240,31 @@ def _in_regular_session(seconds):
     return seconds is not None and 9 * 3600 + 26 * 60 <= seconds <= 14 * 3600 + 57 * 60
 
 
+_STOCK_CODE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(\d{6}\.(?:SH|SZ|BJ))(?![A-Za-z0-9_])", re.IGNORECASE
+)
+
+
+def _stock_label(code, inst=None):
+    normalized_code = _stock_code(code)
+    if inst is None:
+        inst = _INSTANCES.get(normalized_code, {})
+    nick = str(inst.get("nick") or "").strip()
+    if not nick or nick == normalized_code:
+        nick = "\u672a\u77e5"
+    return "%s(%s)" % (normalized_code, nick)
+
+
 def _log(message):
+    message = str(message)
+
+    def add_stock_name(match):
+        code = match.group(1)
+        if message[match.end():].startswith("("):
+            return code
+        return _stock_label(code)
+
+    message = _STOCK_CODE_RE.sub(add_stock_name, message)
     line = "%s %s" % (_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], message)
     try:
         print(line)
@@ -1430,17 +1491,84 @@ def _initial_quote(C, inst):
         _log("[INITIAL_QUOTE_FAILED] code=%s error=%r" % (inst["code"], exc))
 
 
+def _summary_price(value):
+    value = _safe_float(value)
+    return "%.3f" % value if value > 0 else "-"
+
+
+def _summary_stock_label(inst):
+    return _stock_label(inst.get("code"), inst)
+
+
 def _summary():
     states = {}
-    active = 0
+    active_stocks = 0
+    active_orders = 0
     for inst in _INSTANCES.values():
-        states[inst["flag"]] = states.get(inst["flag"], 0) + 1
+        flag = inst.get("flag", FLAG_NORMAL)
+        states[flag] = states.get(flag, 0) + 1
         if _has_active_orders(inst):
-            active += 1
-    _log("[SUMMARY] stocks=%d subscriptions_active=%d requests=%d/%d active_orders=%d flags=%s pool_date=%s" % (
-        len(_INSTANCES), len(_SUBSCRIPTIONS), _SUB_SUCCESS, _SUB_SUCCESS + _SUB_FAILED, active,
-        ",".join("%s:%s" % item for item in sorted(states.items())), POOL_TRADE_DATE
+            active_stocks += 1
+        active_orders += sum(1 for order in inst.get("orders", []) if _is_order_active(order))
+    state_text = ",".join(
+        "%s=%d" % (_FLAG_LABELS.get(flag, str(flag)), count)
+        for flag, count in sorted(states.items())
+    ) or "-"
+    _log("[SUMMARY][\u6982\u89c8] \u65e5\u671f=%s \u80a1\u7968=%d \u8ba2\u9605=%d \u6210\u529f=%d \u5931\u8d25=%d \u6d3b\u8dc3\u80a1\u7968=%d \u6d3b\u8dc3\u59d4\u6258=%d \u72b6\u6001=%s" % (
+        POOL_TRADE_DATE, len(_INSTANCES), len(_SUBSCRIPTIONS), _SUB_SUCCESS,
+        _SUB_FAILED, active_stocks, active_orders, state_text
     ))
+
+    for inst in sorted(_INSTANCES.values(), key=lambda item: item.get("code", "")):
+        label = _summary_stock_label(inst)
+        flag = inst.get("flag", FLAG_NORMAL)
+        flag_label = _FLAG_LABELS.get(flag, "\u672a\u77e5")
+        target = max(0, _to_int(inst.get("sell_quantity", 0)))
+        traded = sum(max(0, _to_int(order.get("traded_quantity", 0))) for order in inst.get("orders", []))
+        remaining = max(0, target - traded)
+        if ENABLE_LIVE_ORDERS:
+            available = _POSITION_CACHE["available"].get(inst.get("code"))
+            available_text = str(max(0, _to_int(available))) if (
+                available is not None and _position_cache_valid()
+            ) else "-"
+        else:
+            available_text = str(remaining)
+        _log("[SUMMARY][\u80a1\u7968] %s" % label)
+        _log("[SUMMARY][\u72b6\u6001] %s flag=%s(%s) \u53ef\u5356=%s \u76ee\u6807=%d \u5df2\u6210\u4ea4=%d \u5269\u4f59=%d" % (
+            label, flag, flag_label, available_text, target, traded, remaining
+        ))
+
+        quote = inst.get("last_l2_quote") or inst.get("last_quote") or {}
+        event_time = inst.get("last_l2_event_time") or inst.get("last_event_time") or "-"
+        _log("[SUMMARY][\u884c\u60c5] %s \u4e70\u4e00=%s \u6700\u65b0=%s \u5f00\u76d8=%s \u6700\u9ad8=%s \u6700\u4f4e=%s \u6628\u6536=%s \u6da8\u505c=%s \u8dcc\u505c=%s \u4e8b\u4ef6=%s" % (
+            label,
+            _summary_price(quote.get("bid")),
+            _summary_price(quote.get("last")),
+            _summary_price(inst.get("open_price")),
+            _summary_price(inst.get("day_high")),
+            _summary_price(inst.get("day_low")),
+            _summary_price(inst.get("pre_close")),
+            _summary_price(inst.get("limit_up")),
+            _summary_price(inst.get("limit_down")),
+            event_time,
+        ))
+
+        orders = inst.get("orders", [])
+        if not orders:
+            _log("[SUMMARY][\u59d4\u6258] %s \u65e0\u59d4\u6258" % label)
+            continue
+        for order in orders:
+            action = str(order.get("action") or "-")
+            action_label = _ACTION_LABELS.get(action, action)
+            status = str(order.get("status") or "-")
+            status_label = _ORDER_STATUS_LABELS.get(status, status)
+            quantity = max(0, _to_int(order.get("quantity", 0)))
+            traded_quantity = max(0, _to_int(order.get("traded_quantity", 0)))
+            order_id = str(order.get("order_id") or "-")
+            _log("[SUMMARY][\u59d4\u6258] %s \u52a8\u4f5c=%s(%s) \u72b6\u6001=%s(%s) \u59d4\u6258\u53f7=%s \u4ef7\u683c=%s \u6570\u91cf=%d \u6210\u4ea4=%d/%d" % (
+                label, action, action_label, status, status_label, order_id,
+                _summary_price(order.get("price")), quantity, traded_quantity, quantity
+            ))
 
 
 def _drain_all_pending():
