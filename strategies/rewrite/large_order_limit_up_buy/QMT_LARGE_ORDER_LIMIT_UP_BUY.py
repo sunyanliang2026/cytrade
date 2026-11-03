@@ -1729,16 +1729,20 @@ def _snapshot_entry_gate(inst, source):
 
 
 def _handle_quote(code, period, payload):
+    # Reject delayed callbacks before taking the strategy lock or copying data.
+    received_at = time.time()
+    inst = _INSTANCES.get(code)
+    if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+        return
+    _CALLBACK_COUNTS[period] = _CALLBACK_COUNTS.get(period, 0) + 1
+    source = _unwrap(code, payload)
+    fresh, event_raw, _ = _freshness_gate(
+        code, period, source, received_at, record_latest=False)
+    if not fresh:
+        return
     with _LOCK:
         inst = _INSTANCES.get(code)
         if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
-            return
-        received_at = time.time()
-        _CALLBACK_COUNTS[period] = _CALLBACK_COUNTS.get(period, 0) + 1
-        source = _unwrap(code, payload)
-        fresh, event_raw, _ = _freshness_gate(
-            code, period, source, received_at, record_latest=False)
-        if not fresh:
             return
         if period == "l2quote":
             _cache_l2order_quote(inst, source, event_raw, received_at)
@@ -1836,13 +1840,21 @@ def _handle_quote(code, period, payload):
 
 
 def _handle_l2order(code, payload):
+    # Reject delayed callbacks before taking the strategy lock or copying data.
+    received_at = time.time()
+    inst = _INSTANCES.get(code)
+    if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+        return
+    _CALLBACK_COUNTS["l2order"] = _CALLBACK_COUNTS.get("l2order", 0) + 1
+    source = _unwrap(code, payload)
+    fresh, event_raw, _ = _freshness_gate(
+        code, "l2order", source, received_at, record_latest=False)
+    if not fresh:
+        return
     with _LOCK:
         inst = _INSTANCES.get(code)
         if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
             return
-        received_at = time.time()
-        _CALLBACK_COUNTS["l2order"] = _CALLBACK_COUNTS.get("l2order", 0) + 1
-        source = _unwrap(code, payload)
         requested_at = inst.get("l2order_requested_at")
         if requested_at is not None and inst.get("l2order_first_callback_at") is None:
             inst["l2order_first_callback_at"] = received_at
@@ -1851,10 +1863,6 @@ def _handle_l2order(code, payload):
                  "event_delay_ms=%s" % (
                      code, (received_at - requested_at) * 1000.0,
                      "%.0f" % delay_ms if delay_ms is not None else "n/a"))
-        fresh, event_raw, _ = _freshness_gate(
-            code, "l2order", source, received_at, record_latest=False)
-        if not fresh:
-            return
         accepted, event_time, drop_reason, event_key = _l2order_entry_gate(
             inst, source, event_raw)
         if not accepted:
@@ -1980,16 +1988,20 @@ def _handle_l2order(code, payload):
 
 
 def _handle_l2transaction(code, payload):
+    # Reject delayed callbacks before taking the strategy lock or copying data.
+    received_at = time.time()
+    inst = _INSTANCES.get(code)
+    if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+        return
+    _CALLBACK_COUNTS["l2transaction"] = _CALLBACK_COUNTS.get("l2transaction", 0) + 1
+    source = _unwrap(code, payload)
+    fresh, event_raw, _ = _freshness_gate(
+        code, "l2transaction", source, received_at, record_latest=False)
+    if not fresh:
+        return
     with _LOCK:
         inst = _INSTANCES.get(code)
         if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
-            return
-        received_at = time.time()
-        _CALLBACK_COUNTS["l2transaction"] = _CALLBACK_COUNTS.get("l2transaction", 0) + 1
-        source = _unwrap(code, payload)
-        fresh, event_raw, _ = _freshness_gate(
-            code, "l2transaction", source, received_at, record_latest=False)
-        if not fresh:
             return
         event_time = _event_time(_field(source, "stime", "time", "timestamp"))
         if not event_time or not _in_continuous(event_time):
