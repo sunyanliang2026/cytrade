@@ -1061,10 +1061,10 @@ def _confirm_limit_up(inst, quote):
 
 
 def _mark_weak_state(inst, quote):
-    if quote["bid"] < inst["pre_close"] * 0.975 and inst["flag"] not in (
+    if quote["bid"] < inst["pre_close"] * 0.9815 and inst["flag"] not in (
         FLAG_LIMIT_DOWN_CLEAR, FLAG_WEAK, FLAG_SELL_DONE, 66
     ):
-        _set_flag(inst, FLAG_WEAK, "bid_below_minus_2_5_percent")
+        _set_flag(inst, FLAG_WEAK, "bid_below_minus_1_85_percent")
 
 
 def _handle_weak_rebound_failure(inst, quote, seconds):
