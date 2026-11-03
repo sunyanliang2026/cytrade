@@ -1,5 +1,10 @@
 # Change Log
 
+## 2026-11-03
+
+- Added a pre-open fallback for stale QMT instrument details: use a current-day explicit limit price when available; otherwise match the previous close to its session and calculate the standard board limit before sizing the order. IPO-age, missing rule data, and mismatched history remain fail-closed; the 08:30 submit path still uses only the prepared order parameters.
+- Added price-source and reference-price details to the per-stock preflight log. Updated the design notes; the installed QMT file was not changed because it does not match this readable source.
+
 ## 2026-10-29
 
 - Moved limit-price, quantity, funding, reservation, and initial order-argument preparation ahead of 08:30. Missing or stale instrument-detail dates and unavailable prices retry every 500ms; a batch not ready by 08:29:58 aborts instead of submitting a previous-session price or catching up late. The first dispatch submits the prepared batch in one scheduler callback, up to 500 orders.

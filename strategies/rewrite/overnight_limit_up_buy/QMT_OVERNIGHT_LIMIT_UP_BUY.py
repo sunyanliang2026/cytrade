@@ -51,6 +51,7 @@ SUBMIT_ROWS_PER_TURN = MAX_ORDERS
 SCHEDULER_INTERVAL_MS = 100
 PRICE_RETRY_INTERVAL_MS = 500
 SUBMISSION_PREP_LEAD_MS = 2000
+LIMIT_PRICE_LISTING_GUARD_DAYS = 30
 SCHEDULE_NAME = "qmt_overnight_limit_up_buy_drive"
 UNMATCHED_CALLBACK_LOG_INTERVAL_SECONDS = 5
 
@@ -238,13 +239,235 @@ def _abort(reason):
 def _detail_for(C, stock_code):
     getter = getattr(C, "get_instrument_detail", None)
     if not callable(getter):
-        raise ValueError("ContextInfo.get_instrument_detail is unavailable")
-    detail = getter(stock_code)
+        return {}
+    try:
+        detail = getter(stock_code)
+    except Exception as exc:
+        raise _PriceNotReady("instrument detail query failed for %s: %r" % (
+            stock_code, exc
+        ))
     if detail is None:
-        raise _PriceNotReady("instrument detail is not ready for %s" % stock_code)
+        return {}
     if not isinstance(detail, dict):
-        raise ValueError("instrument detail is not a dictionary for %s" % stock_code)
+        raise _PriceNotReady("instrument detail is not a dictionary for %s" % stock_code)
     return detail
+
+
+def _last_value(value):
+    if isinstance(value, (list, tuple)):
+        return value[-1] if value else None
+    try:
+        return value.iloc[-1]
+    except Exception:
+        pass
+    try:
+        values = value.tolist()
+        if isinstance(values, list):
+            return values[-1] if values else None
+    except Exception:
+        pass
+    return value
+
+
+def _instrument_name(C, detail, stock_code):
+    name = _field(detail, "InstrumentName", "instrumentName", "stockName", "name")
+    if name:
+        return str(name).strip()
+    getter = getattr(C, "get_stock_name", None)
+    if callable(getter):
+        try:
+            name = getter(stock_code)
+        except Exception:
+            name = None
+    return str(name or "unknown").strip()
+
+
+def _explicit_limit_price(source):
+    return _float_value(_last_value(_field(
+        source, "UpStopPrice", "upStopPrice", "upLimit", "up_limit",
+        "upperLimit", "upper_limit", "limitUp", "upLimitPrice",
+        "upperLimitPrice"
+    )))
+
+
+def _quote_day(payload):
+    raw_time = _last_value(_field(
+        payload, "time", "timetag", "timestamp", "dataTime", "TradingDay",
+        "tradingDay"
+    ))
+    return _normalize_day(raw_time)
+
+
+def _full_tick_for(C, stock_code):
+    getter = getattr(C, "get_full_tick", None)
+    if not callable(getter):
+        return {}
+    try:
+        result = getter([stock_code])
+    except Exception:
+        return {}
+    if not isinstance(result, dict):
+        return {}
+    for key in (stock_code, stock_code.upper(), stock_code.split(".", 1)[0]):
+        payload = result.get(key)
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _market_previous_close(C, stock_code, trade_day, expected_day=""):
+    getter = getattr(C, "get_market_data_ex", None)
+    if not callable(getter):
+        raise _PriceNotReady("ContextInfo.get_market_data_ex is unavailable")
+    try:
+        result = getter(
+            fields=["close"], stock_code=[stock_code], period="1d",
+            start_time="", end_time=trade_day, count=10,
+            dividend_type="none", fill_data=False, subscribe=False
+        )
+    except Exception as exc:
+        raise _PriceNotReady("daily close query failed for %s: %r" % (
+            stock_code, exc
+        ))
+    if not isinstance(result, dict):
+        raise _PriceNotReady("daily close data is unavailable for %s" % stock_code)
+    frame = result.get(stock_code)
+    if frame is None:
+        frame = result.get(stock_code.split(".", 1)[0])
+    if frame is None:
+        raise _PriceNotReady("daily close data is missing for %s" % stock_code)
+
+    rows = []
+    try:
+        series = frame["close"]
+        items = series.items()
+    except Exception:
+        items = []
+        if isinstance(frame, dict):
+            closes = frame.get("close")
+            times = frame.get("time")
+            if times is None:
+                times = frame.get("stime")
+            if isinstance(closes, (list, tuple)) and isinstance(times, (list, tuple)):
+                items = zip(times, closes)
+    for raw_day, raw_close in items:
+        observed_day = _normalize_day(raw_day)
+        close = _float_value(_last_value(raw_close))
+        if observed_day and observed_day < trade_day and close > 0:
+            rows.append((observed_day, close))
+    if not rows:
+        raise _PriceNotReady("no completed daily close before %s for %s" % (
+            trade_day, stock_code
+        ))
+    observed_day, close = max(rows, key=lambda row: row[0])
+    if expected_day and expected_day < trade_day and observed_day != expected_day:
+        raise _PriceNotReady("daily close session mismatch for %s: detail=%s history=%s" % (
+            stock_code, expected_day, observed_day
+        ))
+    return observed_day, close
+
+
+def _limit_rate(detail, stock_code, trade_day):
+    code = stock_code.split(".", 1)[0]
+    name = str(_field(
+        detail, "InstrumentName", "instrumentName", "stockName", "name"
+    ) or "").strip()
+    if not name:
+        raise _PriceNotReady("instrument name is unavailable for %s" % stock_code)
+
+    open_day = _normalize_day(_field(
+        detail, "OpenDate", "openDate"
+    ))
+    if not open_day:
+        raise _PriceNotReady("listing date is unavailable for %s" % stock_code)
+    trade_date = datetime.datetime.strptime(trade_day, "%Y%m%d").date()
+    open_date = datetime.datetime.strptime(open_day, "%Y%m%d").date()
+    if open_date >= trade_date:
+        raise _PriceNotReady("listing date is not before trade day for %s" % stock_code)
+    if (trade_date - open_date).days < LIMIT_PRICE_LISTING_GUARD_DAYS:
+        raise _PriceNotReady(
+            "recent listing requires an explicit current-day limit price for %s" % stock_code
+        )
+
+    if code.startswith(("300", "301", "688", "689")):
+        rate = decimal.Decimal("0.20")
+    elif code.startswith(("4", "8", "92")):
+        rate = decimal.Decimal("0.30")
+    elif code.startswith(("000", "001", "002", "003", "600", "601", "603", "605")):
+        normalized_name = name.replace(" ", "").upper()
+        rate = (
+            decimal.Decimal("0.05")
+            if "ST" in normalized_name else decimal.Decimal("0.10")
+        )
+    else:
+        raise _PriceNotReady("unsupported security board for calculated price: %s" % stock_code)
+    return rate, name
+
+
+def _resolve_limit_up_price(C, detail, trade_day, stock_code):
+    detail_day = _normalize_day(_field(
+        detail, "TradingDay", "tradingDay", "m_strTradingDay", "tradeDate"
+    ))
+    detail_price = _explicit_limit_price(detail)
+    name = _instrument_name(C, detail, stock_code)
+    if detail_day == trade_day and detail_price > 0:
+        return detail_price, {
+            "source": "instrument_detail", "instrument_name": name,
+            "reference_day": "", "previous_close": 0.0, "limit_rate": "",
+        }
+
+    tick = _full_tick_for(C, stock_code)
+    tick_day = _quote_day(tick)
+    tick_price = _explicit_limit_price(tick)
+    if tick_day == trade_day and tick_price > 0:
+        return tick_price, {
+            "source": "full_tick", "instrument_name": name,
+            "reference_day": "", "previous_close": 0.0, "limit_rate": "",
+        }
+
+    reference_day = ""
+    reference_source = ""
+    previous_close = 0.0
+    if detail_day == trade_day:
+        previous_close = _float_value(_last_value(_field(
+            detail, "PreClose", "preClose", "lastClose", "LastClose"
+        )))
+        if previous_close > 0:
+            reference_source = "instrument_preclose"
+    if previous_close <= 0 and tick_day == trade_day:
+        previous_close = _float_value(_last_value(_field(
+            tick, "PreClose", "preClose", "lastClose", "LastClose"
+        )))
+        if previous_close > 0:
+            reference_source = "full_tick_preclose"
+    if (previous_close <= 0 and detail_day and detail_day < trade_day
+            and tick_day == detail_day):
+        previous_close = _float_value(_last_value(_field(
+            tick, "lastPrice", "LastPrice", "price", "Price"
+        )))
+        if previous_close > 0:
+            reference_day = tick_day
+            reference_source = "previous_session_tick"
+    if previous_close <= 0:
+        reference_day, previous_close = _market_previous_close(
+            C, stock_code, trade_day,
+            expected_day=detail_day if detail_day and detail_day < trade_day else ""
+        )
+        reference_source = "daily_close"
+
+    rate, rule_name = _limit_rate(detail, stock_code, trade_day)
+    limit_price = (
+        decimal.Decimal(str(previous_close)) *
+        (decimal.Decimal("1") + rate)
+    ).quantize(decimal.Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
+    if limit_price <= 0:
+        raise _PriceNotReady("calculated limit-up price is invalid for %s" % stock_code)
+    return float(limit_price), {
+        "source": "calculated_%s" % reference_source,
+        "instrument_name": rule_name or name,
+        "reference_day": reference_day, "previous_close": previous_close,
+        "limit_rate": str(rate),
+    }
 
 
 def _limit_up_price(detail, trade_day, stock_code):
@@ -378,13 +601,20 @@ def _preflight_step(C, now=None):
     for index in range(start, end):
         order = rows[index]
         code = order["stock_code"]
+        detail = {}
+        name = _instrument_name(C, detail, code)
         try:
             if code not in _SESSION["price_cache"]:
                 detail = _detail_for(C, code)
-                _SESSION["price_cache"][code] = _limit_up_price(
-                    detail, _SESSION["trade_day"], code
+                name = _instrument_name(C, detail, code)
+                price, metadata = _resolve_limit_up_price(
+                    C, detail, _SESSION["trade_day"], code
                 )
+                _SESSION["price_cache"][code] = price
+                _SESSION["price_meta"][code] = metadata
             price = _SESSION["price_cache"][code]
+            metadata = _SESSION["price_meta"][code]
+            name = metadata["instrument_name"]
             quantity = _quantity_for(order["amount"], price)
             if quantity < 100:
                 raise ValueError("budget is below one board lot for %s" % code)
@@ -393,8 +623,13 @@ def _preflight_step(C, now=None):
             prepared.append({
                 "row_no": order["row_no"],
                 "stock_code": code,
+                "instrument_name": name,
                 "amount": amount,
                 "limit_up_price": price,
+                "price_source": metadata["source"],
+                "reference_day": metadata["reference_day"],
+                "previous_close": metadata["previous_close"],
+                "limit_rate": metadata["limit_rate"],
                 "quantity": quantity,
                 "estimated_amount": estimate,
                 "attempts": 0,
@@ -407,26 +642,26 @@ def _preflight_step(C, now=None):
                 "attempt_history": [],
             })
         except _PriceNotReady as exc:
-            waiting.append((order["row_no"], code, str(exc)))
+            waiting.append((order["row_no"], code, name, str(exc)))
         except Exception as exc:
-            failures.append((order["row_no"], code, str(exc)))
+            failures.append((order["row_no"], code, name, str(exc)))
 
-    for row_no, code, reason in failures:
+    for row_no, code, name, reason in failures:
         _SESSION["failures"].append(row_no)
-        _log("PREFLIGHT_ROW_FAILED row=%s code=%s reason=%s" % (
-            row_no, code, reason
+        _log("PREFLIGHT_ROW_FAILED row=%s code=%s name=%s reason=%s" % (
+            row_no, code, name, reason
         ))
     if failures:
         _abort("preflight failed rows=%s" % len(_SESSION["failures"]))
         return
 
-    waiting_rows = [(row_no, code) for row_no, code, unused in waiting]
+    waiting_rows = [(row_no, code) for row_no, code, name, reason in waiting]
     previous_waiting = _SESSION.get("price_waiting_rows", [])
     if waiting:
-        for row_no, code, reason in waiting:
+        for row_no, code, name, reason in waiting:
             if (row_no, code) not in previous_waiting:
-                _log("PRICE_NOT_READY row=%s code=%s reason=%s retry_ms=%s" % (
-                    row_no, code, reason, PRICE_RETRY_INTERVAL_MS
+                _log("PRICE_NOT_READY row=%s code=%s name=%s reason=%s retry_ms=%s" % (
+                    row_no, code, name, reason, PRICE_RETRY_INTERVAL_MS
                 ))
         _SESSION["price_waiting_rows"] = waiting_rows
         _SESSION["preflight_retry_due"] = (
@@ -439,8 +674,14 @@ def _preflight_step(C, now=None):
     for plan in prepared:
         _SESSION["plans"].append(plan)
         _SESSION["plan_by_row"][plan["row_no"]] = plan
-        _log("PLAN row=%s code=%s budget=%.2f limit_up=%.3f qty=%s estimate=%.2f" % (
-            plan["row_no"], plan["stock_code"], plan["amount"],
+        _log("PRICE_READY row=%s code=%s name=%s source=%s reference_day=%s "
+             "reference_price=%.3f rate=%s limit_up=%.3f" % (
+            plan["row_no"], plan["stock_code"], plan["instrument_name"],
+            plan["price_source"], plan["reference_day"],
+            plan["previous_close"], plan["limit_rate"], plan["limit_up_price"]
+        ))
+        _log("PLAN row=%s code=%s name=%s budget=%.2f limit_up=%.3f qty=%s estimate=%.2f" % (
+            plan["row_no"], plan["stock_code"], plan["instrument_name"], plan["amount"],
             plan["limit_up_price"], plan["quantity"], plan["estimated_amount"]
         ))
     _SESSION["preflight_cursor"] = end
@@ -622,10 +863,10 @@ def _submit_plan(C, plan):
     if result == 0:
         plan["status"] = "accepted_no_id"
         attempt["status"] = "accepted_no_id"
-        _log("ORDER_ACCEPTED_NO_ID row=%s code=%s price=%.3f qty=%s attempt=%s token=%s; "
+        _log("ORDER_ACCEPTED_NO_ID row=%s code=%s name=%s price=%.3f qty=%s attempt=%s token=%s; "
              "waiting for broker callback" % (
-                 plan["row_no"], plan["stock_code"], plan["limit_up_price"],
-                 plan["quantity"], plan["attempts"], token
+                 plan["row_no"], plan["stock_code"], plan["instrument_name"],
+                 plan["limit_up_price"], plan["quantity"], plan["attempts"], token
              ))
         return True
 
@@ -636,9 +877,9 @@ def _submit_plan(C, plan):
         attempt["order_id"] = str(result)
         _SESSION["order_id_to_plan"][str(result)] = plan
         _SESSION["order_id_to_attempt"][str(result)] = attempt
-    _log("ORDER_SENT row=%s code=%s price=%.3f qty=%s attempt=%s token=%s return=%r" % (
-        plan["row_no"], plan["stock_code"], plan["limit_up_price"],
-        plan["quantity"], plan["attempts"], token, result
+    _log("ORDER_SENT row=%s code=%s name=%s price=%.3f qty=%s attempt=%s token=%s return=%r" % (
+        plan["row_no"], plan["stock_code"], plan["instrument_name"],
+        plan["limit_up_price"], plan["quantity"], plan["attempts"], token, result
     ))
     return True
 
@@ -676,9 +917,9 @@ def _dispatch_step(C, now):
                 return
         else:
             plan["status"] = "dry_run"
-            _log("DRY_RUN row=%s code=%s price=%.3f qty=%s estimate=%.2f" % (
-                plan["row_no"], plan["stock_code"], plan["limit_up_price"],
-                plan["quantity"], plan["estimated_amount"]
+            _log("DRY_RUN row=%s code=%s name=%s price=%.3f qty=%s estimate=%.2f" % (
+                plan["row_no"], plan["stock_code"], plan["instrument_name"],
+                plan["limit_up_price"], plan["quantity"], plan["estimated_amount"]
             ))
         sent_this_turn += 1
 
@@ -788,6 +1029,7 @@ def init(C):
         "preflight_retry_due": 0.0,
         "dispatch_cursor": 0,
         "price_cache": {},
+        "price_meta": {},
         "failures": [],
         "startup_order_check_done": False,
         "available_cash": 0.0,
@@ -936,8 +1178,8 @@ def order_callback(ContextInfo, orderInfo):
         ))
         return
     if fallback:
-        _log("ORDER_CALLBACK_ASSOCIATED_BY_FIELDS id=%s code=%s" % (
-            order_id, plan["stock_code"]
+        _log("ORDER_CALLBACK_ASSOCIATED_BY_FIELDS id=%s code=%s name=%s" % (
+            order_id, plan["stock_code"], plan["instrument_name"]
         ))
     message = _field(
         orderInfo, "m_strStatusMsg", "m_strErrorMsg", "m_strOrderStatusMsg",
@@ -1033,8 +1275,8 @@ def deal_callback(ContextInfo, dealInfo):
         _log("DEAL_CALLBACK_UNMATCHED id=%s token=%s" % (order_id, token))
         return
     if fallback:
-        _log("DEAL_CALLBACK_ASSOCIATED_BY_FIELDS id=%s code=%s" % (
-            order_id, plan["stock_code"]
+        _log("DEAL_CALLBACK_ASSOCIATED_BY_FIELDS id=%s code=%s name=%s" % (
+            order_id, plan["stock_code"], plan["instrument_name"]
         ))
     deal_id = str(_field(
         dealInfo, "m_strTradeID", "m_strDealID", "tradeID", "dealID",
