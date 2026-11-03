@@ -539,11 +539,10 @@ def _cache_l2order_quote(inst, source, event_raw, received_at):
 
 
 def _try_subscribe_l2order(C, inst, received_at=None):
-    """Request order and transaction streams once above 7% and retain them."""
+    """Request the order stream once above 7%; transaction follows accepted orders."""
     if (C is None or inst.get("subscriptions_stopped") or
             inst["state"] in (STATE_DONE, STATE_SKIPPED) or
-            ("l2order" in inst.get("sub_periods", {}).values() and
-             "l2transaction" in inst.get("sub_periods", {}).values())):
+            "l2order" in inst.get("sub_periods", {}).values()):
         return False
     received_at = time.time() if received_at is None else received_at
     now = _dt.datetime.fromtimestamp(received_at)
@@ -574,10 +573,7 @@ def _try_subscribe_l2order(C, inst, received_at=None):
     started = _now()
     if "l2order" not in inst.get("sub_periods", {}).values():
         _subscribe(C, inst["code"], "l2order")
-    if "l2transaction" not in inst.get("sub_periods", {}).values():
-        _subscribe(C, inst["code"], "l2transaction")
-    registered = ("l2order" in inst.get("sub_periods", {}).values() and
-                  "l2transaction" in inst.get("sub_periods", {}).values())
+    registered = "l2order" in inst.get("sub_periods", {}).values()
     _log("[L2ORDER_REQUEST] code=%s reason=gain_gt_7pct gain=%.2f%% "
          "event_time=%s quote_delay_ms=%.0f attempt=%d/%d "
          "registered=%s transaction_registered=%s call_ms=%.1f" % (
@@ -586,6 +582,40 @@ def _try_subscribe_l2order(C, inst, received_at=None):
              L2ORDER_SUBSCRIBE_MAX_ATTEMPTS, registered,
              "l2transaction" in inst.get("sub_periods", {}).values(),
              (_now() - started) * 1000.0))
+    return True
+
+
+def _subscribe_l2transaction_after_order(C, inst, passorder_returned_at,
+                                         passorder_result=None):
+    """Subscribe to transaction callbacks immediately after passorder returns."""
+    if (C is None or inst.get("subscriptions_stopped") or
+            inst["state"] in (STATE_DONE, STATE_SKIPPED) or
+            "l2transaction" in inst.get("sub_periods", {}).values()):
+        return False
+    requested_at = time.time()
+    inst["l2transaction_requested_at"] = requested_at
+    inst["l2transaction_first_callback_at"] = None
+    call_started = _now()
+    sub_id = _subscribe(C, inst["code"], "l2transaction")
+    call_finished = _now()
+    subscribe_gap_ms = (call_started - passorder_returned_at) * 1000.0
+    subscribe_call_ms = (call_finished - call_started) * 1000.0
+    inst["l2transaction_passorder_to_subscribe_ms"] = subscribe_gap_ms
+    inst["l2transaction_subscribe_call_ms"] = subscribe_call_ms
+    if not sub_id:
+        inst["l2transaction_requested_at"] = None
+        inst["l2transaction_subscribed_at"] = None
+        _log("[L2TRANSACTION_SUBSCRIBE_AFTER_PASSORDER_FAIL] code=%s "
+             "passorder_result=%r passorder_to_subscribe_ms=%.1f call_ms=%.1f" % (
+                 inst["code"], passorder_result, subscribe_gap_ms, subscribe_call_ms))
+        return False
+    inst["l2transaction_subscribed_at"] = requested_at
+    _log("[L2TRANSACTION_SUBSCRIBE_AFTER_PASSORDER] code=%s "
+         "passorder_result=%r order_id=%s sub_id=%s "
+         "passorder_to_subscribe_ms=%.1f call_ms=%.1f registered=true" % (
+             inst["code"], passorder_result,
+             inst.get("our_order_id") or "pending", sub_id,
+             subscribe_gap_ms, subscribe_call_ms))
     return True
 
 
@@ -718,6 +748,10 @@ def _new_instance(code, amount):
         "sub_ids": [], "sub_periods": {}, "subscriptions_stopped": False,
         "l2order_candidate": None, "l2order_sub_attempts": 0,
         "l2order_requested_at": None, "l2order_first_callback_at": None,
+        "l2transaction_requested_at": None, "l2transaction_first_callback_at": None,
+        "l2transaction_subscribed_at": None,
+        "l2transaction_passorder_to_subscribe_ms": None,
+        "l2transaction_subscribe_call_ms": None,
         "stale_negative_warned": False,
         "last_signal_period": "", "last_signal_event_raw": None,
         "last_signal_received_at": None,
@@ -821,6 +855,8 @@ def _set_state(inst, state, reason=""):
         inst["last_log_reason"] = reason
         _log("[×´Ì¬] %s -> %s %s" % (
             _stock_label(inst["code"], inst), state, reason))
+        if state == STATE_DONE:
+            _unsubscribe_l2transaction(inst, reason)
 
 
 def _unsubscribe_instance(inst):
@@ -852,6 +888,39 @@ def _unsubscribe_instance(inst):
         inst.get("sub_periods", {}).pop(sub_id, None)
         _log("[UNSUBSCRIBE] code=%s period=%s sub_id=%s result=%r" %
              (inst["code"], period, sub_id, result))
+    inst["sub_ids"][:] = remaining
+    return unsubscribed, failed
+
+
+def _unsubscribe_l2transaction(inst, reason="terminal"):
+    """Stop the transaction stream once the strategy order is terminal."""
+    if _C is None:
+        return 0, 0
+    unsubscribed = 0
+    failed = 0
+    remaining = []
+    for sub_id in list(inst.get("sub_ids", [])):
+        if inst.get("sub_periods", {}).get(sub_id) != "l2transaction":
+            remaining.append(sub_id)
+            continue
+        try:
+            result = _C.unsubscribe_quote(sub_id)
+        except Exception as exc:
+            failed += 1
+            remaining.append(sub_id)
+            _log("[L2TRANSACTION_UNSUBSCRIBE_FAIL] code=%s sub_id=%s reason=%s error=%r" %
+                 (inst["code"], sub_id, reason or "terminal", exc))
+            continue
+        unsubscribed += 1
+        _SUBSCRIPTIONS[:] = [active_id for active_id in _SUBSCRIPTIONS
+                             if active_id != sub_id]
+        inst.get("sub_periods", {}).pop(sub_id, None)
+        active_ms = "n/a"
+        subscribed_at = inst.get("l2transaction_subscribed_at")
+        if subscribed_at:
+            active_ms = "%.1f" % ((time.time() - subscribed_at) * 1000.0)
+        _log("[L2TRANSACTION_UNSUBSCRIBE] code=%s sub_id=%s reason=%s result=%r active_ms=%s" %
+             (inst["code"], sub_id, reason or "terminal", result, active_ms))
     inst["sub_ids"][:] = remaining
     return unsubscribed, failed
 
@@ -1314,6 +1383,9 @@ def _submit(inst, reason, trigger_order_key=None, trigger_order=None):
             if reason in VALIDATED_SUBMIT_REASONS:
                 _stop_validation(inst, "passorder_exception")
             raise
+        passorder_returned_at = _now()
+        passorder_ms = (passorder_returned_at - passorder_started) * 1000.0
+        _subscribe_l2transaction_after_order(_C, inst, passorder_returned_at, order_result)
         if order_result is False or str(order_result) == "-1":
             inst["submission_pending"] = False
             if reason in VALIDATED_SUBMIT_REASONS:
@@ -1332,7 +1404,7 @@ def _submit(inst, reason, trigger_order_key=None, trigger_order=None):
                  inst.get("last_signal_period") or "unknown",
                  "%.0f" % signal_age_ms if signal_age_ms is not None else "n/a",
                  "%.1f" % receive_to_submit_ms if receive_to_submit_ms is not None else "n/a",
-                 (_now() - passorder_started) * 1000.0,
+                 passorder_ms,
                  inst.get("our_order_id") or "pending"))
         return True
     except Exception as exc:
@@ -1991,30 +2063,36 @@ def _handle_l2transaction(code, payload):
     # Reject delayed callbacks before taking the strategy lock or copying data.
     received_at = time.time()
     inst = _INSTANCES.get(code)
-    if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+    if (not inst or inst.get("subscriptions_stopped") or
+            inst["state"] in (STATE_DONE, STATE_SKIPPED)):
         return
     _CALLBACK_COUNTS["l2transaction"] = _CALLBACK_COUNTS.get("l2transaction", 0) + 1
     source = _unwrap(code, payload)
-    fresh, event_raw, _ = _freshness_gate(
-        code, "l2transaction", source, received_at, record_latest=False)
-    if not fresh:
+    trade_flag = _field(source, "tradeFlag", "trade_flag", "flag")
+    order_id = str(_field(source, "buyNo", "buy_no") or "")
+    if str(trade_flag or "").strip() != "3":
+        _record_entry_drop("l2transaction", "not_cancel")
         return
+    if not order_id:
+        _record_entry_drop("l2transaction", "cancel_missing_buy_no")
+        return
+    event_raw = _field(source, "time", "stime", "timestamp")
+    event_time = _event_time(_field(source, "stime", "time", "timestamp"))
     with _LOCK:
         inst = _INSTANCES.get(code)
-        if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+        if (not inst or inst.get("subscriptions_stopped") or
+                inst["state"] in (STATE_DONE, STATE_SKIPPED)):
             return
-        event_time = _event_time(_field(source, "stime", "time", "timestamp"))
-        if not event_time or not _in_continuous(event_time):
-            _record_entry_drop("l2transaction", "outside_continuous")
-            return
-        trade_flag = _field(source, "tradeFlag", "trade_flag", "flag")
-        if not _is_cancel_direction(trade_flag):
-            _record_entry_drop("l2transaction", "not_cancel")
-            return
-        order_id = str(_field(source, "buyNo", "buy_no") or "")
-        if not order_id:
-            _record_entry_drop("l2transaction", "cancel_missing_buy_no")
-            return
+        requested_at = inst.get("l2transaction_requested_at")
+        if requested_at is not None and inst.get("l2transaction_first_callback_at") is None:
+            inst["l2transaction_first_callback_at"] = received_at
+            callback_delay_ms = (received_at - requested_at) * 1000.0
+            event_delay_ms = _latency_ms(
+                _field(source, "time", "stime", "timestamp"), received_at)
+            _log("[L2TRANSACTION_FIRST_CALLBACK] code=%s subscribe_to_callback_ms=%.1f "
+                 "event_delay_ms=%s" % (
+                     code, callback_delay_ms,
+                     "%.1f" % event_delay_ms if event_delay_ms is not None else "n/a"))
         if not _external_cancel_watch_active(inst):
             _record_entry_drop("l2transaction", "cancel_not_needed")
             return
@@ -2062,12 +2140,14 @@ def _subscribe(C, code, period):
             inst["sub_ids"].append(sub_id)
             inst["sub_periods"][sub_id] = period
             _log("[¶©ÔÄ] code=%s period=%s sub_id=%s" % (code, period, sub_id))
+            return sub_id
         else:
             _SUB_FAILED += 1
             _log("[¶©ÔÄÊ§°Ü] %s %s ·µ»Ø=%r" % (code, period, sub_id))
     except Exception as exc:
         _SUB_FAILED += 1
         _log("[¶©ÔÄÊ§°Ü] %s %s %r" % (code, period, exc))
+        return None
 
 
 def _initial_quote(C, inst, full_ticks=None):
