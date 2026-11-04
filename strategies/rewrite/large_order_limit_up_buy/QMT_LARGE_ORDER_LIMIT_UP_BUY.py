@@ -20,17 +20,26 @@ STRATEGY_NAME = "large_order_limit_up_buy"
 ORDER_TYPE_BUY = 1101
 PRICE_TYPE_LIMIT = 11
 
-POOL_TRADE_DATE = "20261027"
+POOL_TRADE_DATE = "20261104"
 
 POOL_ITEMS = (
-    ("002820", 25000.0),
-    ("002093", 25000.0),
-    ("001219", 25000.0),
-    ("600558", 25000.0),
-    ("603528", 25000.0),
-    ("603028", 25000.0),
-    ("603337", 25000.0),
+    ("600892", 18000.0),
+    ("601599", 18000.0),
+    ("002029", 18000.0),
+    ("600715", 18000.0),
+    ("000599", 18000.0),
+    ("002292", 18000.0),
+    ("603258", 18000.0),
+    ("605577", 18000.0),
+    ("601566", 18000.0),
+    ("002300", 18000.0),
+    ("600802", 18000.0),
+    ("002088", 18000.0),
+    ("600558", 18000.0),
+    ("603381", 18000.0),
+    ("600358", 18000.0),
 )
+
 FIRST_SEAL_MIN_AMOUNT = 60000000.0
 FIRST_LARGE_ORDER_MIN_AMOUNT = 2000000.0
 FIRST_LARGE_ORDER_TOTAL_AMOUNT = 10000000.0
@@ -66,11 +75,13 @@ FRESHNESS_MAX_DELAY_MS = {
 }
 FRESHNESS_FUTURE_TOLERANCE_MS = 1000.0
 SEEN_ORDER_KEY_MAX_COUNT = 1000
-L2ORDER_SUBSCRIBE_SECONDS = 9 * 60 * 60 + 30 * 60 + 30
+L2ORDER_SUBSCRIBE_SECONDS = 9 * 60 * 60 + 30 * 60 + 15
 L2ORDER_SUBSCRIBE_GAIN = 0.07
 L2ORDER_SUBSCRIBE_RETRY_SECONDS = 1.0
 L2ORDER_SUBSCRIBE_MAX_ATTEMPTS = 3
-L2ORDER_SUBSCRIBE_BATCH = 10
+L2ORDER_SUBSCRIBE_BATCH = 5
+L2ORDER_SUBSCRIBE_BATCH_DELAY_SECONDS = 1.0
+L2ORDER_DRAIN_WINDOW_SECONDS = 5.0
 L2_PERIODS = set(PERIODS)
 VALIDATED_SUBMIT_REASONS = frozenset(("首封", "首封大单", "回封", "回封大单"))
 STATE_WAIT_INITIAL = "WAIT_INITIAL_QUOTE"
@@ -538,7 +549,7 @@ def _cache_l2order_quote(inst, source, event_raw, received_at):
     inst["l2order_candidate"] = (epoch, last, previous_close)
 
 
-def _try_subscribe_l2order(C, inst, received_at=None):
+def _try_subscribe_l2order(C, inst, received_at=None, force=False):
     """Request the order stream once above 7%; transaction follows accepted orders."""
     if (C is None or inst.get("subscriptions_stopped") or
             inst["state"] in (STATE_DONE, STATE_SKIPPED) or
@@ -570,6 +581,8 @@ def _try_subscribe_l2order(C, inst, received_at=None):
         return False
     inst["l2order_sub_attempts"] = attempts + 1
     inst["l2order_requested_at"] = received_at
+    inst["l2order_drain_until"] = received_at + L2ORDER_DRAIN_WINDOW_SECONDS
+    inst["l2order_stream_ready"] = False
     started = _now()
     if "l2order" not in inst.get("sub_periods", {}).values():
         _subscribe(C, inst["code"], "l2order")
@@ -627,6 +640,9 @@ def _subscribe_l2order_now(C, pending=None):
     requested = 0
     for index, code in enumerate(codes):
         inst = _INSTANCES.get(code)
+        if inst:
+            now = time.time()
+            inst["l2order_candidate"] = (now, 1.1, 1.0)
         if inst and _try_subscribe_l2order(C, inst):
             requested += 1
         if requested >= L2ORDER_SUBSCRIBE_BATCH and index + 1 < len(codes):
@@ -634,7 +650,7 @@ def _subscribe_l2order_now(C, pending=None):
             try:
                 _L2ORDER_SUBSCRIBE_TIMER = C.schedule_run(
                     lambda ContextInfo, rest=remaining: _subscribe_l2order_now(ContextInfo, rest),
-                    _dt.datetime.now() + _dt.timedelta(milliseconds=100),
+                    _dt.datetime.now() + _dt.timedelta(seconds=L2ORDER_SUBSCRIBE_BATCH_DELAY_SECONDS),
                     repeat_times=0, name="qmt_l2order_subscribe")
             except Exception as exc:
                 _log("[SUBSCRIBE] l2order batch timer failed %r; wait for fresh quotes" % (exc,))
@@ -642,12 +658,12 @@ def _subscribe_l2order_now(C, pending=None):
 
 
 def _schedule_l2order_subscriptions(C):
-    """Before 09:30:30 keep only quotes; never fall back to early fan-out."""
+    """Subscribe in five-stock batches beginning at 09:30:15."""
     global _L2ORDER_SUBSCRIBE_TIMER
     now = _dt.datetime.now()
     now_seconds = now.hour * 3600 + now.minute * 60 + now.second
     close_seconds = 14 * 60 * 60 + 57 * 60
-    target = now.replace(hour=9, minute=30, second=30, microsecond=0)
+    target = now.replace(hour=9, minute=30, second=15, microsecond=0)
     if L2ORDER_SUBSCRIBE_SECONDS <= now_seconds < close_seconds:
         _subscribe_l2order_now(C)
         return
@@ -657,10 +673,11 @@ def _schedule_l2order_subscriptions(C):
         _L2ORDER_SUBSCRIBE_TIMER = C.schedule_run(
             lambda ContextInfo: _subscribe_l2order_now(ContextInfo), target,
             repeat_times=0, name="qmt_l2order_subscribe")
-        _log("[SUBSCRIBE] l2order eligible from %s, gain>7%%, retain after opening" %
-             target.strftime("%Y-%m-%d %H:%M:%S"))
+        _log("[SUBSCRIBE] l2order opening batches from %s, batch=%d delay=%.1fs drain=%.1fs" %
+             (target.strftime("%Y-%m-%d %H:%M:%S"), L2ORDER_SUBSCRIBE_BATCH,
+              L2ORDER_SUBSCRIBE_BATCH_DELAY_SECONDS, L2ORDER_DRAIN_WINDOW_SECONDS))
     except Exception as exc:
-        _log("[SUBSCRIBE] l2order opening timer failed %r; wait for fresh quotes after 09:30:30" % (exc,))
+        _log("[SUBSCRIBE] l2order opening timer failed %r" % (exc,))
 
 
 def _auction_retry_timer(ContextInfo):
@@ -748,6 +765,8 @@ def _new_instance(code, amount):
         "sub_ids": [], "sub_periods": {}, "subscriptions_stopped": False,
         "l2order_candidate": None, "l2order_sub_attempts": 0,
         "l2order_requested_at": None, "l2order_first_callback_at": None,
+        "l2order_raw_first_callback_at": None, "l2order_drain_until": None,
+        "l2order_stream_ready": False,
         "l2transaction_requested_at": None, "l2transaction_first_callback_at": None,
         "l2transaction_subscribed_at": None,
         "l2transaction_passorder_to_subscribe_ms": None,
@@ -1919,10 +1938,24 @@ def _handle_l2order(code, payload):
         return
     _CALLBACK_COUNTS["l2order"] = _CALLBACK_COUNTS.get("l2order", 0) + 1
     source = _unwrap(code, payload)
+    if inst.get("l2order_raw_first_callback_at") is None:
+        inst["l2order_raw_first_callback_at"] = received_at
+        _log("[L2ORDER_RAW_FIRST_CALLBACK] code=%s request_to_callback_ms=%.0f" %
+             (code, (received_at - (inst.get("l2order_requested_at") or received_at)) * 1000.0))
+    drain_until = inst.get("l2order_drain_until")
+    if drain_until is not None and received_at < drain_until:
+        return
     fresh, event_raw, _ = _freshness_gate(
         code, "l2order", source, received_at, record_latest=False)
     if not fresh:
+        inst["l2order_drain_until"] = received_at + L2ORDER_DRAIN_WINDOW_SECONDS
+        _log("[L2ORDER_DRAIN] code=%s reason=stale_event retry_until=%s" %
+             (code, _format_local_timestamp(inst["l2order_drain_until"])))
         return
+    if not inst.get("l2order_stream_ready"):
+        inst["l2order_stream_ready"] = True
+        inst["l2order_drain_until"] = None
+        _log("[L2ORDER_STREAM_READY] code=%s" % code)
     with _LOCK:
         inst = _INSTANCES.get(code)
         if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
