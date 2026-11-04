@@ -77,6 +77,7 @@ FRESHNESS_FUTURE_TOLERANCE_MS = 1000.0
 SEEN_ORDER_KEY_MAX_COUNT = 1000
 L2ORDER_SUBSCRIBE_SECONDS = 9 * 60 * 60 + 30 * 60 + 15
 L2ORDER_SUBSCRIBE_GAIN = 0.07
+L2TRANSACTION_SUBSCRIBE_GAIN = 0.08
 L2ORDER_SUBSCRIBE_RETRY_SECONDS = 1.0
 L2ORDER_SUBSCRIBE_MAX_ATTEMPTS = 3
 L2ORDER_SUBSCRIBE_BATCH = 5
@@ -602,6 +603,7 @@ def _subscribe_l2transaction_after_order(C, inst, passorder_returned_at,
                                          passorder_result=None):
     """Subscribe to transaction callbacks immediately after passorder returns."""
     if (C is None or inst.get("subscriptions_stopped") or
+            not str(inst.get("code") or "").upper().endswith(".SZ") or
             inst["state"] in (STATE_DONE, STATE_SKIPPED) or
             "l2transaction" in inst.get("sub_periods", {}).values()):
         return False
@@ -630,6 +632,34 @@ def _subscribe_l2transaction_after_order(C, inst, passorder_returned_at,
              inst.get("our_order_id") or "pending", sub_id,
              subscribe_gap_ms, subscribe_call_ms))
     return True
+
+
+def _try_subscribe_l2transaction_pretrigger(C, inst, last, previous_close):
+    """Pre-subscribe Shenzhen transaction stream once gain reaches 8%.
+
+    The callback remains in drain-only mode until an l2order trigger arms
+    external cancel monitoring.
+    """
+    if (C is None or not str(inst.get("code") or "").upper().endswith(".SZ") or
+            inst.get("subscriptions_stopped") or
+            inst["state"] in (STATE_DONE, STATE_SKIPPED) or
+            "l2transaction" in inst.get("sub_periods", {}).values() or
+            inst.get("l2transaction_monitor_active")):
+        return False
+    if not last or not previous_close or last <= previous_close * (1.0 + L2TRANSACTION_SUBSCRIBE_GAIN):
+        return False
+    started = _now()
+    requested_at = time.time()
+    inst["l2transaction_requested_at"] = requested_at
+    inst["l2transaction_first_callback_at"] = None
+    sub_id = _subscribe(C, inst["code"], "l2transaction")
+    if sub_id:
+        inst["l2transaction_subscribed_at"] = requested_at
+        _log("[L2TRANSACTION_PRE_SUBSCRIBE] code=%s gain=%.2f%% sub_id=%s call_ms=%.1f" % (
+            inst["code"], (last / previous_close - 1.0) * 100.0, sub_id,
+            (_now() - started) * 1000.0))
+        return True
+    return False
 
 
 def _subscribe_l2order_now(C, pending=None):
@@ -768,6 +798,7 @@ def _new_instance(code, amount):
         "l2order_raw_first_callback_at": None, "l2order_drain_until": None,
         "l2order_stream_ready": False,
         "l2transaction_requested_at": None, "l2transaction_first_callback_at": None,
+        "l2transaction_monitor_active": False,
         "l2transaction_subscribed_at": None,
         "l2transaction_passorder_to_subscribe_ms": None,
         "l2transaction_subscribe_call_ms": None,
@@ -1317,6 +1348,7 @@ def _set_trigger_order(inst, trigger_order_key, trigger_order=None):
         return
     inst["trigger_order_key"] = trigger_order_key
     inst["trigger_order_id"], inst["external_cancel_monitor_enabled"] = order_id, True
+    inst["l2transaction_monitor_active"] = True
     inst["trigger_order_price"] = _safe_float(trigger_order.get("price"))
     inst["trigger_order_volume"] = _safe_float(trigger_order.get("volume")) or 0
     inst["trigger_order_amount"] = _safe_float(trigger_order.get("amount")) or 0.0
@@ -1367,6 +1399,7 @@ def _submit(inst, reason, trigger_order_key=None, trigger_order=None):
         inst["cancel_attempts"] = 0
         inst["cancel_terminal"] = False
         inst["external_cancel_due"], inst["external_cancel_monitor_enabled"] = False, False
+        inst["l2transaction_monitor_active"] = False
         inst["external_cancel_volume"] = 0
         inst["external_cancel_event_keys"].clear()
         inst["trigger_order_key"] = None
@@ -1404,7 +1437,6 @@ def _submit(inst, reason, trigger_order_key=None, trigger_order=None):
             raise
         passorder_returned_at = _now()
         passorder_ms = (passorder_returned_at - passorder_started) * 1000.0
-        _subscribe_l2transaction_after_order(_C, inst, passorder_returned_at, order_result)
         if order_result is False or str(order_result) == "-1":
             inst["submission_pending"] = False
             if reason in VALIDATED_SUBMIT_REASONS:
@@ -1858,6 +1890,9 @@ def _handle_quote(code, period, payload):
         bid, bid_vol, ask, last, low = _quote_values(inst, data, track_day=is_continuous)
         if inst["last_close"] is None:
             inst["last_close"] = _safe_float(_field(data, "lastClose", "preClose", "pre_close"))
+        if is_l2quote and is_continuous:
+            _try_subscribe_l2transaction_pretrigger(
+                _C, inst, last, inst.get("last_close"))
         if not is_continuous:
             if is_l2quote:
                 _check_validation(inst)
@@ -2099,16 +2134,19 @@ def _handle_l2transaction(code, payload):
     if (not inst or inst.get("subscriptions_stopped") or
             inst["state"] in (STATE_DONE, STATE_SKIPPED)):
         return
-    _CALLBACK_COUNTS["l2transaction"] = _CALLBACK_COUNTS.get("l2transaction", 0) + 1
+    if not inst.get("l2transaction_monitor_active"):
+        return
     source = _unwrap(code, payload)
     trade_flag = _field(source, "tradeFlag", "trade_flag", "flag")
     order_id = str(_field(source, "buyNo", "buy_no") or "")
     if str(trade_flag or "").strip() != "3":
-        _record_entry_drop("l2transaction", "not_cancel")
         return
     if not order_id:
-        _record_entry_drop("l2transaction", "cancel_missing_buy_no")
         return
+    trigger_order_id = str(inst.get("trigger_order_id") or "")
+    if not trigger_order_id or order_id != trigger_order_id:
+        return
+    _CALLBACK_COUNTS["l2transaction"] = _CALLBACK_COUNTS.get("l2transaction", 0) + 1
     event_raw = _field(source, "time", "stime", "timestamp")
     event_time = _event_time(_field(source, "stime", "time", "timestamp"))
     with _LOCK:
@@ -2128,10 +2166,6 @@ def _handle_l2transaction(code, payload):
                      "%.1f" % event_delay_ms if event_delay_ms is not None else "n/a"))
         if not _external_cancel_watch_active(inst):
             _record_entry_drop("l2transaction", "cancel_not_needed")
-            return
-        trigger_order_id = str(inst.get("trigger_order_id") or "")
-        if trigger_order_id and order_id != trigger_order_id:
-            _record_entry_drop("l2transaction", "cancel_not_trigger")
             return
         volume = _safe_float(_field(source, "volume", "tradeVolume", "trade_volume")) or 0
         price = _safe_float(_field(source, "price"))
