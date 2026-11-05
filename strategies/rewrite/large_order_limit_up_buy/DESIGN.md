@@ -76,7 +76,7 @@ WAIT_RESEAL
 
 ## 深圳 transaction 监控边界
 
-深市股票涨幅达到 8% 后预订阅 `l2transaction`，沪市股票不订阅。收到符合条件的 `l2order` 触发下单事件前，transaction 回调只快速消费并直接返回，不读取撤单字段、不复制 payload、不加锁，也不进入策略逻辑。触发事件后，回调在无锁状态下依次判断 `tradeFlag=3`、存在 `buyNo`、且 `buyNo` 等于本次触发大单的委托号；三个条件全部满足后，才复制 payload、加锁并进入现有外部撤单处理。transaction 不做新鲜度过滤，匹配委托号的延迟撤单事件仍然有效。
+深市股票涨幅大于 6% 后预订阅 `l2transaction`，沪市股票不订阅。收到符合条件的 `l2order` 触发下单事件前，transaction 回调只快速消费并直接返回，不读取撤单字段、不复制 payload、不加锁，也不进入策略逻辑。先调用 `passorder()`；返回后立即确保 transaction 已订阅，再启用监控。触发事件后，回调在无锁状态下依次判断 `tradeFlag=3`、存在 `buyNo`、且 `buyNo` 等于本次触发大单的委托号；三个条件全部满足后，才复制 payload、加锁并进入现有外部撤单处理。transaction 不做新鲜度过滤，匹配委托号的延迟撤单事件仍然有效。
 
 `RESEAL_VALIDATION_CONTINUE_ON_FAILURE` 默认为 `False`。验证委托撤单确认且没有成交后，策略结束该股票的当日流程，不提交撤单后的跟随单。设置为 `True` 才启用原有的补单条件；首封/回封的首次委托和验证撤单流程不受此开关影响。
 

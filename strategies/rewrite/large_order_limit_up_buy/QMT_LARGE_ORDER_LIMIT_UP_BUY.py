@@ -20,25 +20,21 @@ STRATEGY_NAME = "large_order_limit_up_buy"
 ORDER_TYPE_BUY = 1101
 PRICE_TYPE_LIMIT = 11
 
-POOL_TRADE_DATE = "20261104"
+POOL_TRADE_DATE = "20261105"
 
 POOL_ITEMS = (
-    ("600892", 18000.0),
-    ("601599", 18000.0),
-    ("002029", 18000.0),
-    ("600715", 18000.0),
-    ("000599", 18000.0),
-    ("002292", 18000.0),
-    ("603258", 18000.0),
-    ("605577", 18000.0),
-    ("601566", 18000.0),
-    ("002300", 18000.0),
-    ("600802", 18000.0),
-    ("002088", 18000.0),
-    ("600558", 18000.0),
-    ("603381", 18000.0),
-    ("600358", 18000.0),
+    ("603212", 18000.0),
+    ("002506", 18000.0),
+    ("688429", 18000.0),
+    ("600481", 18000.0),
+    ("001269", 18000.0),
+    ("002135", 18000.0),
+    ("603098", 18000.0),
+    ("002865", 18000.0),
+    ("603185", 18000.0),
+    ("002922", 18000.0),
 )
+
 
 FIRST_SEAL_MIN_AMOUNT = 60000000.0
 FIRST_LARGE_ORDER_MIN_AMOUNT = 2000000.0
@@ -77,7 +73,7 @@ FRESHNESS_FUTURE_TOLERANCE_MS = 1000.0
 SEEN_ORDER_KEY_MAX_COUNT = 1000
 L2ORDER_SUBSCRIBE_SECONDS = 9 * 60 * 60 + 30 * 60 + 15
 L2ORDER_SUBSCRIBE_GAIN = 0.07
-L2TRANSACTION_SUBSCRIBE_GAIN = 0.08
+L2TRANSACTION_SUBSCRIBE_GAIN = 0.06
 L2ORDER_SUBSCRIBE_RETRY_SECONDS = 1.0
 L2ORDER_SUBSCRIBE_MAX_ATTEMPTS = 3
 L2ORDER_SUBSCRIBE_BATCH = 5
@@ -635,7 +631,7 @@ def _subscribe_l2transaction_after_order(C, inst, passorder_returned_at,
 
 
 def _try_subscribe_l2transaction_pretrigger(C, inst, last, previous_close):
-    """Pre-subscribe Shenzhen transaction stream once gain reaches 8%.
+    """Pre-subscribe Shenzhen transaction stream once gain exceeds 6%.
 
     The callback remains in drain-only mode until an l2order trigger arms
     external cancel monitoring.
@@ -1348,7 +1344,8 @@ def _set_trigger_order(inst, trigger_order_key, trigger_order=None):
         return
     inst["trigger_order_key"] = trigger_order_key
     inst["trigger_order_id"], inst["external_cancel_monitor_enabled"] = order_id, True
-    inst["l2transaction_monitor_active"] = True
+    # Arm transaction matching only after passorder returns and the stream is ready.
+    inst["l2transaction_monitor_active"] = False
     inst["trigger_order_price"] = _safe_float(trigger_order.get("price"))
     inst["trigger_order_volume"] = _safe_float(trigger_order.get("volume")) or 0
     inst["trigger_order_amount"] = _safe_float(trigger_order.get("amount")) or 0.0
@@ -1444,6 +1441,19 @@ def _submit(inst, reason, trigger_order_key=None, trigger_order=None):
             _log("[下单失败] %s 接口返回=%r" % (inst["code"], order_result))
             _set_state(inst, STATE_DONE, "下单接口拒绝")
             return False
+        if str(inst.get("code") or "").upper().endswith(".SZ"):
+            transaction_registered = (
+                "l2transaction" in inst.get("sub_periods", {}).values())
+            if not transaction_registered:
+                transaction_registered = _subscribe_l2transaction_after_order(
+                    _C, inst, passorder_returned_at, order_result)
+            if transaction_registered:
+                inst["l2transaction_monitor_active"] = True
+                _log("[L2TRANSACTION_MONITOR_ARMED] code=%s trigger_order=%s "
+                     "pre_subscribed=%s" % (
+                         inst["code"], inst.get("trigger_order_id") or "pending",
+                         "true" if transaction_registered and
+                         inst.get("l2transaction_subscribed_at") else "false"))
         if isinstance(order_result, (str, int)) and not isinstance(order_result, bool) and str(order_result).strip() not in ("", "0", "-1"):
             _bind_order_id(inst, order_result)
         if inst["submission_pending"]:

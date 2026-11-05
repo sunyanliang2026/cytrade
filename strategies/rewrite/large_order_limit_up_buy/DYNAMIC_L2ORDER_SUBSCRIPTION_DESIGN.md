@@ -2,7 +2,7 @@
 
 ## transaction 撤单监控边界
 
-深市股票涨幅达到 8% 后预订阅 `l2transaction`，沪市不订阅。收到符合条件的 `l2order` 触发事件前，transaction 回调只快速消费并返回；触发后才在锁外依次判断 `tradeFlag=3`、存在 `buyNo`、且 `buyNo` 等于触发大单委托号。三个条件全部满足后才复制 payload、加锁并进入外部撤单处理。transaction 不使用新鲜度过滤。
+深市股票涨幅大于 6% 后预订阅 `l2transaction`，沪市不订阅。收到符合条件的 `l2order` 触发事件前，transaction 回调只快速消费并返回。先调用 `passorder()`；返回后立即确保 transaction 已订阅，再启用监控。触发后才在锁外依次判断 `tradeFlag=3`、存在 `buyNo`、且 `buyNo` 等于触发大单委托号。三个条件全部满足后才复制 payload、加锁并进入外部撤单处理。transaction 不使用新鲜度过滤。
 
 日期：2026-10-23。按用户确认的“前 30 秒不订阅、涨幅大于 7% 提前订阅、开板保留”实施。
 
