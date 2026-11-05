@@ -126,6 +126,8 @@ _AUCTION_RETRY_TIMER = None
 _L2ORDER_SUBSCRIBE_TIMER = None
 _L2ORDER_ENABLE_TIMER = None
 _L2ORDER_STRATEGY_ENABLED = False
+_SESSION_CLOSE_TIMER = None
+_SESSION_STRATEGY_STOPPED = False
 
 
 def _now():
@@ -772,6 +774,49 @@ def _schedule_l2order_subscriptions(C):
     except Exception as exc:
         _log("[SUBSCRIBE] l2order opening timer failed %r" % (exc,))
 
+
+def _stop_strategy_for_close(C):
+    """Stop market-data strategy processing when continuous trading ends."""
+    global _SESSION_CLOSE_TIMER, _SESSION_STRATEGY_STOPPED, _L2ORDER_STRATEGY_ENABLED
+    if _SESSION_STRATEGY_STOPPED:
+        return
+    _SESSION_STRATEGY_STOPPED = True
+    _SESSION_CLOSE_TIMER = None
+    _L2ORDER_STRATEGY_ENABLED = False
+    for inst in _INSTANCES.values():
+        for sub_id in list(inst.get("sub_ids", [])):
+            period = inst.get("sub_periods", {}).get(sub_id)
+            if period not in ("l2quote", "l2order", "l2transaction"):
+                continue
+            try:
+                result = C.unsubscribe_quote(sub_id) if C is not None else False
+                _log("[SESSION_CLOSE_UNSUBSCRIBE] code=%s period=%s sub_id=%s result=%r" %
+                     (_stock_label(inst["code"], inst), period, sub_id, result))
+            except Exception as exc:
+                _log("[SESSION_CLOSE_UNSUBSCRIBE_FAIL] code=%s period=%s sub_id=%s error=%r" %
+                     (_stock_label(inst["code"], inst), period, sub_id, exc))
+            _SUBSCRIPTIONS[:] = [active_id for active_id in _SUBSCRIPTIONS
+                                 if active_id != sub_id]
+            inst.get("sub_periods", {}).pop(sub_id, None)
+        inst["sub_ids"][:] = [sub_id for sub_id in inst.get("sub_ids", [])
+                               if sub_id in inst.get("sub_periods", {})]
+    _log("[STRATEGY_STOP] time=%s reason=continuous_session_end boundary=14:57:00" %
+         _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3])
+
+
+def _schedule_strategy_close(C):
+    global _SESSION_CLOSE_TIMER
+    now = _dt.datetime.now()
+    close_target = now.replace(hour=14, minute=57, second=0, microsecond=0)
+    if now >= close_target:
+        _stop_strategy_for_close(C)
+        return
+    try:
+        _SESSION_CLOSE_TIMER = C.schedule_run(
+            lambda ContextInfo: _stop_strategy_for_close(ContextInfo),
+            close_target, repeat_times=0, name="qmt_strategy_close")
+    except Exception as exc:
+        _log("[STRATEGY_STOP_TIMER_FAIL] error=%r" % (exc,))
 
 def _auction_retry_timer(ContextInfo):
     global _AUCTION_RETRY_TIMER
@@ -1933,7 +1978,8 @@ def _handle_quote(code, period, payload):
     # Reject delayed callbacks before taking the strategy lock or copying data.
     received_at = time.time()
     inst = _INSTANCES.get(code)
-    if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+    if (_SESSION_STRATEGY_STOPPED or not inst or
+            inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED):
         return
     _CALLBACK_COUNTS[period] = _CALLBACK_COUNTS.get(period, 0) + 1
     source = _unwrap(code, payload)
@@ -1943,7 +1989,8 @@ def _handle_quote(code, period, payload):
         return
     with _LOCK:
         inst = _INSTANCES.get(code)
-        if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+        if (_SESSION_STRATEGY_STOPPED or not inst or
+            inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED):
             return
         if period == "l2quote":
             _cache_l2order_quote(inst, source, event_raw, received_at)
@@ -2048,7 +2095,8 @@ def _handle_l2order(code, payload):
     global _L2ORDER_STRATEGY_ENABLED
     received_at = time.time()
     inst = _INSTANCES.get(code)
-    if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+    if (_SESSION_STRATEGY_STOPPED or not inst or
+            inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED):
         return
     _CALLBACK_COUNTS["l2order"] = _CALLBACK_COUNTS.get("l2order", 0) + 1
     source = _unwrap(code, payload)
@@ -2090,7 +2138,8 @@ def _handle_l2order(code, payload):
         _log("[L2ORDER_STREAM_READY] code=%s" % code)
     with _LOCK:
         inst = _INSTANCES.get(code)
-        if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+        if (_SESSION_STRATEGY_STOPPED or not inst or
+            inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED):
             return
         requested_at = inst.get("l2order_requested_at")
         if requested_at is not None and inst.get("l2order_first_callback_at") is None:
@@ -2228,7 +2277,7 @@ def _handle_l2transaction(code, payload):
     # Reject delayed callbacks before taking the strategy lock or copying data.
     received_at = time.time()
     inst = _INSTANCES.get(code)
-    if (not inst or inst.get("subscriptions_stopped") or
+    if (_SESSION_STRATEGY_STOPPED or not inst or inst.get("subscriptions_stopped") or
             inst["state"] in (STATE_DONE, STATE_SKIPPED)):
         return
     if not inst.get("l2transaction_monitor_active"):
@@ -2248,7 +2297,7 @@ def _handle_l2transaction(code, payload):
     event_time = _event_time(_field(source, "stime", "time", "timestamp"))
     with _LOCK:
         inst = _INSTANCES.get(code)
-        if (not inst or inst.get("subscriptions_stopped") or
+        if (_SESSION_STRATEGY_STOPPED or not inst or inst.get("subscriptions_stopped") or
                 inst["state"] in (STATE_DONE, STATE_SKIPPED)):
             return
         requested_at = inst.get("l2transaction_requested_at")
@@ -2288,7 +2337,8 @@ def _handle_l2transaction(code, payload):
 def _subscribe(C, code, period):
     global _SUB_SUCCESS, _SUB_FAILED
     inst = _INSTANCES.get(code)
-    if not inst or inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED:
+    if (_SESSION_STRATEGY_STOPPED or not inst or
+            inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED):
         return
     if period == "l2order":
         callback = lambda data, c=code: _handle_l2order(c, data)
@@ -2467,6 +2517,7 @@ def init(C):
     global _C, _DAY, _LAST_SUMMARY, _AUCTION_RETRY_TIMER
     global _L2ORDER_SUBSCRIBE_TIMER, _L2ORDER_ENABLE_TIMER
     global _L2ORDER_STRATEGY_ENABLED, _SUB_SUCCESS, _SUB_FAILED
+    global _SESSION_CLOSE_TIMER, _SESSION_STRATEGY_STOPPED
     with _LOCK:
         _C = C
         if ACCOUNT_ID:
@@ -2502,6 +2553,8 @@ def init(C):
         _L2ORDER_SUBSCRIBE_TIMER = None
         _L2ORDER_ENABLE_TIMER = None
         _L2ORDER_STRATEGY_ENABLED = False
+        _SESSION_CLOSE_TIMER = None
+        _SESSION_STRATEGY_STOPPED = False
         _SUB_SUCCESS = 0
         _SUB_FAILED = 0
         _INSTANCES.clear()
@@ -2522,6 +2575,7 @@ def init(C):
              "retry_interval=%.1fs,max_attempts=%d" % (
                  L2ORDER_SUBSCRIBE_RETRY_SECONDS, L2ORDER_SUBSCRIBE_MAX_ATTEMPTS))
         _schedule_l2order_subscriptions(C)
+        _schedule_strategy_close(C)
         expected_subscriptions = sum(
             sum(1 for period in PERIODS if period in inst.get("sub_periods", {}).values())
             for inst in _INSTANCES.values()
@@ -2545,6 +2599,9 @@ def init(C):
 
 def handlebar(C):
     global _LAST_SUMMARY
+    if not _SESSION_STRATEGY_STOPPED and _wall_seconds_since_midnight() >= 14 * 60 * 60 + 57 * 60:
+        _stop_strategy_for_close(C)
+        return
     is_last_bar = getattr(C, "is_last_bar", None)
     if callable(is_last_bar) and not is_last_bar():
         return
@@ -2697,6 +2754,14 @@ def deal_callback(ContextInfo, dealInfo):
 def stop(C):
     with _LOCK:
         global _AUCTION_RETRY_TIMER, _L2ORDER_SUBSCRIBE_TIMER, _L2ORDER_ENABLE_TIMER
+        global _SESSION_CLOSE_TIMER, _SESSION_STRATEGY_STOPPED
+        _SESSION_STRATEGY_STOPPED = True
+        if _SESSION_CLOSE_TIMER is not None:
+            try:
+                C.cancel_schedule_run("qmt_strategy_close")
+            except Exception:
+                pass
+            _SESSION_CLOSE_TIMER = None
         if _AUCTION_RETRY_TIMER is not None:
             try:
                 C.cancel_schedule_run("qmt_auction_retry")
