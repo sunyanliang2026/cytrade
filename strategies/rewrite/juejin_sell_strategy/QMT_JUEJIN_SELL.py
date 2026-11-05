@@ -874,7 +874,7 @@ def _pending_request_valid(inst, request):
         return (inst["exp"] == 1 and seconds is not None and seconds < 9 * 3600 + 31 * 60
                 and pre_close * 0.94 < bid < pre_close * 0.98)
     if action == "weak_rebound_primary":
-        return inst["flag"] == FLAG_WEAK and bid < pre_close * 1.02 and inst["day_low"] < pre_close * 0.97
+        return inst["flag"] == FLAG_WEAK and bid < pre_close * 1.02 and inst["day_low"] < pre_close * 0.9815
     if action == "limit_down_clear":
         return (_price_equal(quote.get("ask", 0), inst["limit_down"])
                 and _book_amount(quote.get("ask", 0), quote.get("ask_volume", 0)) > LIMIT_DOWN_CLEAR_AMOUNT)
@@ -1072,7 +1072,7 @@ def _handle_weak_rebound_failure(inst, quote, seconds):
         inst["flag"] == FLAG_WEAK
         and inst["pre_bid"] >= inst["pre_close"] * 1.02
         and quote["bid"] < inst["pre_close"] * 1.02
-        and inst["day_low"] < inst["pre_close"] * 0.97
+        and inst["day_low"] < inst["pre_close"] * 0.9815
         and seconds is not None
         and seconds > 9 * 3600 + 33 * 60
     ):
