@@ -81,6 +81,7 @@ L2ORDER_SUBSCRIBE_MAX_ATTEMPTS = 3
 L2ORDER_SUBSCRIBE_BATCH = 5
 L2ORDER_SUBSCRIBE_BATCH_DELAY_SECONDS = 1.0
 L2ORDER_DRAIN_WINDOW_SECONDS = 5.0
+L2ORDER_DRAIN_LOG_INTERVAL_SECONDS = 1.0
 L2ORDER_RESUBSCRIBE_MAX_ATTEMPTS = 2
 L2_PERIODS = set(PERIODS)
 VALIDATED_SUBMIT_REASONS = frozenset(("首封", "首封大单", "回封", "回封大单"))
@@ -905,6 +906,8 @@ def _new_instance(code, amount):
         "l2order_requested_at": None, "l2order_first_callback_at": None,
         "l2order_raw_first_callback_at": None, "l2order_drain_until": None,
         "l2order_stream_ready": False, "l2order_resubscribe_attempts": 0,
+        "l2order_subscription_generation": 0,
+        "l2order_subscription_metrics": {},
         "l2order_freshness_started_at": None,
         "l2transaction_requested_at": None, "l2transaction_first_callback_at": None,
         "l2transaction_monitor_active": False,
@@ -2090,7 +2093,7 @@ def _handle_quote(code, period, payload):
         _check_validation(inst)
 
 
-def _handle_l2order(code, payload):
+def _handle_l2order(code, payload, subscription_generation=None):
     # Reject delayed callbacks before taking the strategy lock or copying data.
     global _L2ORDER_STRATEGY_ENABLED
     received_at = time.time()
@@ -2100,29 +2103,82 @@ def _handle_l2order(code, payload):
         return
     _CALLBACK_COUNTS["l2order"] = _CALLBACK_COUNTS.get("l2order", 0) + 1
     source = _unwrap(code, payload)
-    if inst.get("l2order_raw_first_callback_at") is None:
-        inst["l2order_raw_first_callback_at"] = received_at
+    if subscription_generation is None:
+        subscription_generation = inst.get("l2order_subscription_generation", 0)
+    metrics_by_generation = inst.setdefault("l2order_subscription_metrics", {})
+    subscription_metrics = metrics_by_generation.get(subscription_generation)
+    if subscription_metrics is None:
+        subscription_metrics = {
+            "requested_at": inst.get("l2order_requested_at") or received_at,
+            "sub_id": None,
+            "resubscribe_attempt": inst.get("l2order_resubscribe_attempts", 0),
+            "raw_first_at": None,
+            "fresh_first_at": None,
+            "stale_count": 0,
+            "stale_logged_count": 0,
+            "stale_since_last_log": 0,
+            "drain_last_log_at": None,
+            "drain_log_count": 0,
+        }
+        metrics_by_generation[subscription_generation] = subscription_metrics
+    if subscription_metrics.get("raw_first_at") is None:
+        subscription_metrics["raw_first_at"] = received_at
+        if inst.get("l2order_raw_first_callback_at") is None:
+            inst["l2order_raw_first_callback_at"] = received_at
         raw_event = _field(source, "time", "stime", "timestamp")
         raw_delay = _latency_ms(raw_event, received_at)
-        _log("[L2ORDER_RAW_FIRST_CALLBACK] code=%s request_to_callback_ms=%.0f "
-             "event_time=%s event_delay_ms=%s" %
-             (code, (received_at - (inst.get("l2order_requested_at") or received_at)) * 1000.0,
+        requested_at = subscription_metrics.get("requested_at") or received_at
+        _log("[L2ORDER_RAW_FIRST_CALLBACK] code=%s subscription=%s sub_id=%s "
+             "resubscribe=%d request_to_callback_ms=%.0f event_time=%s event_delay_ms=%s" %
+             (code, subscription_generation,
+              subscription_metrics.get("sub_id") or "pending",
+              subscription_metrics.get("resubscribe_attempt", 0),
+              (received_at - requested_at) * 1000.0,
               _format_event_timestamp(raw_event) or str(raw_event or ""),
               "%.0f" % raw_delay if raw_delay is not None else "n/a"))
     # Prewarm callbacks are consumed without freshness checks or strategy work.
     if not _L2ORDER_STRATEGY_ENABLED:
         return
     drain_until = inst.get("l2order_drain_until")
-    fresh, event_raw, _ = _freshness_gate(
+    fresh, event_raw, freshness_delay_ms = _freshness_gate(
         code, "l2order", source, received_at, record_latest=False)
     if not fresh:
+        subscription_metrics["stale_count"] += 1
+        subscription_metrics["stale_since_last_log"] += 1
         if (inst.get("l2order_drain_until") is not None and
                 received_at >= inst["l2order_drain_until"]):
             _resubscribe_l2order(_C, inst, received_at, event_raw)
         inst["l2order_drain_until"] = received_at + L2ORDER_DRAIN_WINDOW_SECONDS
-        _log("[L2ORDER_DRAIN] code=%s reason=stale_event retry_until=%s" %
-             (code, _format_local_timestamp(inst["l2order_drain_until"])))
+        last_drain_log_at = subscription_metrics.get("drain_last_log_at")
+        if (last_drain_log_at is None or
+                received_at - last_drain_log_at >= L2ORDER_DRAIN_LOG_INTERVAL_SECONDS):
+            batch_count = subscription_metrics["stale_since_last_log"]
+            subscription_metrics["stale_since_last_log"] = 0
+            subscription_metrics["stale_logged_count"] += batch_count
+            subscription_metrics["drain_log_count"] += 1
+            subscription_metrics["drain_last_log_at"] = received_at
+            _log("[L2ORDER_DRAIN] code=%s subscription=%s sub_id=%s "
+                 "stale_total=%d batch=%d suppressed=%d event_time=%s retry_until=%s" %
+                 (code, subscription_generation,
+                  subscription_metrics.get("sub_id") or "pending",
+                  subscription_metrics["stale_count"], batch_count,
+                  max(0, batch_count - 1),
+                  _format_event_timestamp(event_raw) or str(event_raw or ""),
+                  _format_local_timestamp(inst["l2order_drain_until"])))
         return
+    first_fresh_callback = subscription_metrics.get("fresh_first_at") is None
+    if first_fresh_callback:
+        subscription_metrics["fresh_first_at"] = received_at
+        requested_at = subscription_metrics.get("requested_at") or received_at
+        _log("[L2ORDER_FIRST_CALLBACK] code=%s subscription=%s sub_id=%s "
+             "resubscribe=%d request_to_callback_ms=%.0f event_time=%s "
+             "event_delay_ms=%s freshness=passed" % (
+                 code, subscription_generation,
+                 subscription_metrics.get("sub_id") or "pending",
+                 subscription_metrics.get("resubscribe_attempt", 0),
+                 (received_at - requested_at) * 1000.0,
+                 _format_event_timestamp(event_raw) or str(event_raw or ""),
+                 "%.0f" % freshness_delay_ms if freshness_delay_ms is not None else "n/a"))
     if not _L2ORDER_STRATEGY_ENABLED:
         if not inst.get("l2order_stream_ready"):
             inst["l2order_stream_ready"] = True
@@ -2135,7 +2191,9 @@ def _handle_l2order(code, payload):
     if not inst.get("l2order_stream_ready"):
         inst["l2order_stream_ready"] = True
         inst["l2order_drain_until"] = None
-        _log("[L2ORDER_STREAM_READY] code=%s" % code)
+        _log("[L2ORDER_STREAM_READY] code=%s subscription=%s sub_id=%s" %
+             (code, subscription_generation,
+              subscription_metrics.get("sub_id") or "pending"))
     with _LOCK:
         inst = _INSTANCES.get(code)
         if (_SESSION_STRATEGY_STOPPED or not inst or
@@ -2144,11 +2202,6 @@ def _handle_l2order(code, payload):
         requested_at = inst.get("l2order_requested_at")
         if requested_at is not None and inst.get("l2order_first_callback_at") is None:
             inst["l2order_first_callback_at"] = received_at
-            delay_ms = _latency_ms(_field(source, "time", "stime", "timestamp"), received_at)
-            _log("[L2ORDER_FIRST_CALLBACK] code=%s request_to_callback_ms=%.0f "
-                 "event_delay_ms=%s" % (
-                     code, (received_at - requested_at) * 1000.0,
-                     "%.0f" % delay_ms if delay_ms is not None else "n/a"))
         accepted, event_time, drop_reason, event_key = _l2order_entry_gate(
             inst, source, event_raw)
         if not accepted:
@@ -2340,8 +2393,26 @@ def _subscribe(C, code, period):
     if (_SESSION_STRATEGY_STOPPED or not inst or
             inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED):
         return
+    subscription_generation = None
+    subscription_metrics = None
     if period == "l2order":
-        callback = lambda data, c=code: _handle_l2order(c, data)
+        subscription_generation = inst.get("l2order_subscription_generation", 0) + 1
+        inst["l2order_subscription_generation"] = subscription_generation
+        subscription_metrics = {
+            "requested_at": inst.get("l2order_requested_at") or time.time(),
+            "sub_id": None,
+            "resubscribe_attempt": inst.get("l2order_resubscribe_attempts", 0),
+            "raw_first_at": None,
+            "fresh_first_at": None,
+            "stale_count": 0,
+            "stale_logged_count": 0,
+            "stale_since_last_log": 0,
+            "drain_last_log_at": None,
+            "drain_log_count": 0,
+        }
+        inst.setdefault("l2order_subscription_metrics", {})[
+            subscription_generation] = subscription_metrics
+        callback = lambda data, c=code, g=subscription_generation: _handle_l2order(c, data, g)
     elif period == "l2transaction":
         callback = lambda data, c=code: _handle_l2transaction(c, data)
     else:
@@ -2353,6 +2424,8 @@ def _subscribe(C, code, period):
             _SUBSCRIPTIONS.append(sub_id)
             inst["sub_ids"].append(sub_id)
             inst["sub_periods"][sub_id] = period
+            if subscription_metrics is not None:
+                subscription_metrics["sub_id"] = sub_id
             _log("[订阅] code=%s period=%s sub_id=%s" % (code, period, sub_id))
             return sub_id
         else:
@@ -2511,6 +2584,41 @@ def _summary():
              _L2ORDER_STRATEGY_ENABLED,
              _CALLBACK_COUNTS.get("l2quote", 0), _CALLBACK_COUNTS.get("l2order", 0),
              _CALLBACK_COUNTS.get("l2transaction", 0)))
+    summary_now = time.time()
+    for inst in sorted(_INSTANCES.values(), key=lambda item: item["code"]):
+        metrics_by_generation = inst.get("l2order_subscription_metrics", {})
+        generation = inst.get("l2order_subscription_generation", 0)
+        metrics = metrics_by_generation.get(generation, {})
+        requested_at = metrics.get("requested_at")
+        raw_first_at = metrics.get("raw_first_at")
+        fresh_first_at = metrics.get("fresh_first_at")
+        if requested_at is None:
+            raw_elapsed = "n/a"
+            fresh_elapsed = "n/a"
+        else:
+            raw_elapsed = ("%.0fms" % ((raw_first_at - requested_at) * 1000.0)
+                           if raw_first_at is not None else
+                           "waiting:%.0fms" % ((summary_now - requested_at) * 1000.0))
+            fresh_elapsed = ("%.0fms" % ((fresh_first_at - requested_at) * 1000.0)
+                             if fresh_first_at is not None else
+                             "waiting:%.0fms" % ((summary_now - requested_at) * 1000.0))
+        active_sub_ids = [sub_id for sub_id in inst.get("sub_ids", [])
+                          if inst.get("sub_periods", {}).get(sub_id) == "l2order"]
+        sub_id = metrics.get("sub_id") or (active_sub_ids[-1] if active_sub_ids else "none")
+        stale_total = sum(item.get("stale_count", 0)
+                          for item in metrics_by_generation.values())
+        drain_logs = sum(item.get("drain_log_count", 0)
+                         for item in metrics_by_generation.values())
+        drain_until = inst.get("l2order_drain_until")
+        _log("[L2ORDER_STOCK] code=%s subscription=%s sub_id=%s registered=%s "
+             "resubscribe=%d raw_first=%s fresh_first=%s stale_total=%d "
+             "stale_suppressed=%d drain_logs=%d stream_ready=%s drain_until=%s" % (
+                 _stock_label(inst["code"], inst), generation or "none", sub_id,
+                 bool(active_sub_ids), inst.get("l2order_resubscribe_attempts", 0),
+                 raw_elapsed, fresh_elapsed, stale_total,
+                 max(0, stale_total - drain_logs), drain_logs,
+                 bool(inst.get("l2order_stream_ready")),
+                 _format_local_timestamp(drain_until) if drain_until else "none"))
 
 
 def init(C):
