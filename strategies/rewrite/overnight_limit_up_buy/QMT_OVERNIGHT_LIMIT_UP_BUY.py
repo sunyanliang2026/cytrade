@@ -41,6 +41,7 @@ ORDER_PLAN = ()
 
 SUBMIT_HOUR = 8
 SUBMIT_MINUTE = 30
+SUBMIT_OFFSET_MS = 0
 LATEST_SUBMIT_HOUR = 15
 LATEST_SUBMIT_MINUTE = 0
 MAX_REJECT_RETRIES = 2
@@ -61,12 +62,27 @@ _CTX = None
 _SESSION = {}
 
 
+def _format_timestamp_millis(value):
+    return value.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
 def _log(message):
-    line = "[overnight] %s" % message
     try:
-        print(line)
+        log_time = _format_timestamp_millis(datetime.datetime.now())
+        print("[overnight] %s log_time=%s" % (message, log_time))
     except Exception:
         pass
+
+
+def _submit_datetime(now):
+    base = now.replace(
+        hour=SUBMIT_HOUR, minute=SUBMIT_MINUTE, second=0, microsecond=0
+    )
+    return base + datetime.timedelta(milliseconds=SUBMIT_OFFSET_MS)
+
+
+def _format_clock_millis(value):
+    return value.strftime("%H:%M:%S.%f")[:-3]
 
 
 def _field(source, *names):
@@ -689,12 +705,13 @@ def _preflight_step(C, now=None):
     if end < len(rows):
         _log("PREFLIGHT_PROGRESS checked=%s total=%s" % (end, len(rows)))
         return
-    preparation_deadline = now.replace(
-        hour=SUBMIT_HOUR, minute=SUBMIT_MINUTE, second=0, microsecond=0
-    ) - datetime.timedelta(milliseconds=SUBMISSION_PREP_LEAD_MS)
+    preparation_deadline = _submit_datetime(now) - datetime.timedelta(
+        milliseconds=SUBMISSION_PREP_LEAD_MS
+    )
     elapsed = max(0.0, time.monotonic() - step_started_mono)
     if now + datetime.timedelta(seconds=elapsed) >= preparation_deadline:
-        _abort("price preflight missed the 08:29:58 preparation deadline")
+        _abort("price preflight missed preparation deadline=%s" %
+               _format_clock_millis(preparation_deadline))
         return
     _SESSION["phase"] = "WAITING_FOR_SUBMIT_TIME"
 
@@ -771,16 +788,16 @@ def _prepare_submission(C, now):
         return False
     elapsed = max(0.0, time.monotonic() - started_mono)
     finished = now + datetime.timedelta(seconds=elapsed)
-    submit_at = now.replace(
-        hour=SUBMIT_HOUR, minute=SUBMIT_MINUTE, second=0, microsecond=0
-    )
+    submit_at = _submit_datetime(now)
     if finished >= submit_at:
-        _abort("submission preparation crossed the 08:30 cutoff")
+        _abort("submission preparation crossed cutoff=%s" %
+               _format_clock_millis(submit_at))
         return False
     _SESSION["submission_prepared"] = True
     _format_plan()
-    _log("SUBMISSION_ARMED time=%02d:%02d rows=%s" % (
-        SUBMIT_HOUR, SUBMIT_MINUTE, len(_SESSION["plans"])
+    _log("SUBMISSION_ARMED time=%s offset_ms=%s rows=%s" % (
+        _format_clock_millis(submit_at), SUBMIT_OFFSET_MS,
+        len(_SESSION["plans"])
     ))
     return True
 
@@ -945,16 +962,16 @@ def _drive(C, now=None):
     now = now or datetime.datetime.now()
     phase = _SESSION.get("phase")
     if phase == "PREFLIGHT":
-        submit_at = now.replace(
-            hour=SUBMIT_HOUR, minute=SUBMIT_MINUTE, second=0, microsecond=0
-        )
+        submit_at = _submit_datetime(now)
         preparation_deadline = submit_at - datetime.timedelta(
             milliseconds=SUBMISSION_PREP_LEAD_MS
         )
         if now >= preparation_deadline:
             waiting = _SESSION.get("price_waiting_rows", [])
-            _abort("price preflight missed the 08:29:58 preparation deadline; "
-                   "waiting_rows=%s" % waiting)
+            _abort("price preflight missed preparation deadline=%s; "
+                   "waiting_rows=%s" % (
+                       _format_clock_millis(preparation_deadline), waiting
+                   ))
             return
         _preflight_step(C, now=now)
         if _SESSION.get("phase") in ("ABORTED", "PARTIAL_STOP", "COMPLETE"):
@@ -980,16 +997,18 @@ def _drive(C, now=None):
         if (now.hour, now.minute) >= (LATEST_SUBMIT_HOUR, LATEST_SUBMIT_MINUTE):
             _abort("latest submission time 15:00 has passed")
             return
-        if (now.hour, now.minute) < (SUBMIT_HOUR, SUBMIT_MINUTE):
-            arm_time = now.replace(
-                hour=SUBMIT_HOUR, minute=SUBMIT_MINUTE, second=0, microsecond=0
-            ) - datetime.timedelta(milliseconds=SUBMISSION_PREP_LEAD_MS)
+        submit_at = _submit_datetime(now)
+        if now < submit_at:
+            arm_time = submit_at - datetime.timedelta(
+                milliseconds=SUBMISSION_PREP_LEAD_MS
+            )
             if (not _SESSION.get("submission_prepared") and now >= arm_time
                     and not _prepare_submission(C, now)):
                 _cancel_scheduler(C)
             return
         if not _SESSION.get("submission_prepared"):
-            _abort("submission preparation did not finish before 08:30")
+            _abort("submission preparation did not finish before %s" %
+                   _format_clock_millis(submit_at))
             return
         _SESSION["phase"] = "DISPATCHING"
         phase = "DISPATCHING"
@@ -1089,8 +1108,10 @@ def init(C):
     except Exception as exc:
         _abort("could not start non-blocking scheduler: %r" % (exc,))
         return
-    _log("RUNNING phase=PREFLIGHT schedule_id=%r preflight_slice=%s submit_slice=%s" % (
-        _SESSION["task_id"], PREFLIGHT_ROWS_PER_TURN, SUBMIT_ROWS_PER_TURN
+    _log("RUNNING phase=PREFLIGHT schedule_id=%r preflight_slice=%s submit_slice=%s "
+         "submit_offset_ms=%s" % (
+        _SESSION["task_id"], PREFLIGHT_ROWS_PER_TURN, SUBMIT_ROWS_PER_TURN,
+        SUBMIT_OFFSET_MS
     ))
 
 

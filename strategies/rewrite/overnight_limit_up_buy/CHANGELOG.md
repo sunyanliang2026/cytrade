@@ -1,5 +1,10 @@
 # Change Log
 
+## 2026-11-11
+
+- Added `SUBMIT_OFFSET_MS` for millisecond-level submission timing. Positive values delay submission and negative values advance it; preflight, preparation, dispatch, and timing logs use the same effective target.
+- Added a millisecond-resolution `log_time` suffix to every overnight strategy log line while preserving the existing message prefix.
+
 ## 2026-11-03
 
 - Added a pre-open fallback for stale QMT instrument details: use a current-day explicit limit price when available; otherwise match the previous close to its session and calculate the standard board limit before sizing the order. IPO-age, missing rule data, and mismatched history remain fail-closed; the 08:30 submit path still uses only the prepared order parameters.
