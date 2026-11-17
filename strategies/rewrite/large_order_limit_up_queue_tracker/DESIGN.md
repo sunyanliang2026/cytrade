@@ -1,0 +1,21 @@
+# Queue Capture Design
+
+## Event flow
+
+1. The existing strategy accepts a fresh, limit-up buy event as its trigger.
+2. The queue capture starts before order submission and seeds the trigger order as item one.
+3. The strategy submits the original main order first. If its synchronous `passorder` result is not an explicit rejection, it immediately submits a 100-share buy at the current-day limit-down price without waiting for the asynchronous order callback or main order ID.
+4. Before the ordinary `l2order` freshness gate, the capture path checks raw callback fields. It retains only buy orders at the instrument's limit-up price and does not copy the callback payload.
+5. A matching 100-share limit-down buy event ends the capture. If it is not observed, the event-time cutoff is trigger time plus one second; the first later event ends the capture. Session shutdown also ends an open capture.
+6. The completion log contains ordered share quantities only. Internal order IDs map cancellation events back to their collection index.
+7. At completion, the strategy requests cancellation of the sentinel. An independent one-second timer also marks cancellation due if no boundary event arrived, so a quiet stream cannot leave the sentinel resting indefinitely. Since the sentinel is submitted after the main `passorder` call returns, this timer cannot delay main order submission. Its separate remark token associates order callbacks and order-query results without changing the main order's association state.
+8. Cancellation tracking accepts matching `l2order` cancel events and, for subscribed transaction streams, `tradeFlag=3` events whose `buyNo` is in the captured set. Transaction events are not freshness-filtered. A Shenzhen transaction subscription stays active through the session while captured order IDs remain available, even if the main strategy order becomes terminal.
+9. After a sentinel or one-second fallback closes the collection, the strategy compares canceled shares with the original share volume of the captured orders. The denominator includes the trigger order and every captured limit-up buy before the sentinel, including our main order if its L2 event arrived in that interval. The numerator sums each captured order's cancellation total, capped at that order's original quantity; duplicate cancel events are ignored. Only a strict ratio greater than 30% requests cancellation of our main order, once. A trigger-order cancellation is logged but no longer cancels our order by itself. The threshold decision waits for a complete collection, and a confirmed threshold cancellation is terminal.
+
+## Boundaries and limitations
+
+- The sentinel match uses the submitted sentinel's distinctive side, price, and 100-share quantity because its L2 entrust number is not available until the event arrives. Another same-stock 100-share limit-down buy after submission could match this heuristic.
+- The collection fallback is event-time based. If no event advances beyond the one-second cutoff, collection completes when the strategy stops at the end of continuous trading; sentinel cancellation still runs from its separate local timer.
+- The down-limit field is accepted only when its source date matches the runtime date. If the QMT detail and quote sources expose no current-day down-limit field, no sentinel is submitted; the one-second capture fallback remains available.
+- L2 order timestamps and callback order must remain comparable for the ordered list to represent exchange queue sequence. The capture deliberately accepts stale events and records their event timestamps for review.
+- The copied source retains the original live-order setting and account configuration. Review the copy independently before deployment.
