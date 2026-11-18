@@ -78,7 +78,7 @@ L2ORDER_DRAIN_WINDOW_SECONDS = 5.0
 L2ORDER_DRAIN_LOG_INTERVAL_SECONDS = 1.0
 L2ORDER_RESUBSCRIBE_MAX_ATTEMPTS = 2
 QUEUE_CAPTURE_FALLBACK_SECONDS = 1.0
-QUEUE_CANCEL_RATIO_THRESHOLD = 0.30
+QUEUE_CANCEL_RATIO_THRESHOLD = 0.50
 QUEUE_SENTINEL_VOLUME_SHARES = 100
 QUEUE_SENTINEL_LOOKUP_RETRY_SECONDS = 0.1
 QUEUE_SENTINEL_LOOKUP_MAX_ATTEMPTS = 10
@@ -1592,7 +1592,7 @@ def _queue_cancel_ratio_check(inst, ContextInfo=None):
              _stock_label(inst["code"], inst), int(cancelled_volume),
              int(total_volume), 100.0 * cancelled_volume / total_volume,
              QUEUE_CANCEL_RATIO_THRESHOLD * 100.0))
-    _request_cancel(inst, "queue_cancel_ratio_exceeded_30pct", ContextInfo)
+    _request_cancel(inst, "queue_cancel_ratio_exceeded_50pct", ContextInfo)
     return True
 
 
@@ -2386,7 +2386,7 @@ def _check_validation(inst, ContextInfo=None):
             not inst.get("cancel_requested")):
         _request_cancel(
             inst, inst.get("cancel_due_reason") or
-            "queue_cancel_ratio_exceeded_30pct", ContextInfo)
+            "queue_cancel_ratio_exceeded_50pct", ContextInfo)
     if (inst.get("cancel_started") and not inst["cancel_confirmed"] and
             inst.get("cancel_attempts", 0) >= CANCEL_MAX_ATTEMPTS and
             not inst.get("cancel_requested")):
