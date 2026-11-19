@@ -30,14 +30,13 @@ class _PriceNotReady(ValueError):
     pass
 
 # Example only: replace the date, codes, and amounts before enabling a daily plan.
-# PLAN_TRADE_DATE = "YYYYMMDD"
-# ORDER_PLAN = (
-#     ("603005", 26000),
-#     ("000530", 26000),
-# )
+PLAN_TRADE_DATE = "20261116"
+ORDER_PLAN = (
+    ("002148", 16000),
+    ("002187", 16000),
+)
 # Update the active values below before compiling the model for a trading day.
-PLAN_TRADE_DATE = ""
-ORDER_PLAN = ()
+
 
 SUBMIT_HOUR = 8
 SUBMIT_MINUTE = 30
