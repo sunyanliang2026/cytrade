@@ -420,11 +420,20 @@ def _limit_rate(detail, stock_code, trade_day):
     return rate, name
 
 
-def _resolve_limit_up_price(C, detail, trade_day, stock_code):
+def _resolve_limit_price(C, detail, trade_day, stock_code, down=False):
     detail_day = _normalize_day(_field(
         detail, "TradingDay", "tradingDay", "m_strTradingDay", "tradeDate"
     ))
-    detail_price = _explicit_limit_price(detail)
+    def explicit_price(source):
+        if not down:
+            return _explicit_limit_price(source)
+        return _float_value(_last_value(_field(
+            source, "DownStopPrice", "downStopPrice", "downLimit", "down_limit",
+            "lowerLimit", "lower_limit", "limitDown", "downLimitPrice",
+            "lowerLimitPrice", "limit_down"
+        )))
+
+    detail_price = explicit_price(detail)
     name = _instrument_name(C, detail, stock_code)
     if detail_day == trade_day and detail_price > 0:
         return detail_price, {
@@ -434,7 +443,7 @@ def _resolve_limit_up_price(C, detail, trade_day, stock_code):
 
     tick = _full_tick_for(C, stock_code)
     tick_day = _quote_day(tick)
-    tick_price = _explicit_limit_price(tick)
+    tick_price = explicit_price(tick)
     if tick_day == trade_day and tick_price > 0:
         return tick_price, {
             "source": "full_tick", "instrument_name": name,
@@ -474,16 +483,20 @@ def _resolve_limit_up_price(C, detail, trade_day, stock_code):
     rate, rule_name = _limit_rate(detail, stock_code, trade_day)
     limit_price = (
         decimal.Decimal(str(previous_close)) *
-        (decimal.Decimal("1") + rate)
+        (decimal.Decimal("1") - rate if down else decimal.Decimal("1") + rate)
     ).quantize(decimal.Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
     if limit_price <= 0:
-        raise _PriceNotReady("calculated limit-up price is invalid for %s" % stock_code)
+        raise _PriceNotReady("calculated limit price is invalid for %s" % stock_code)
     return float(limit_price), {
         "source": "calculated_%s" % reference_source,
         "instrument_name": rule_name or name,
         "reference_day": reference_day, "previous_close": previous_close,
         "limit_rate": str(rate),
     }
+
+
+def _resolve_limit_up_price(C, detail, trade_day, stock_code):
+    return _resolve_limit_price(C, detail, trade_day, stock_code)
 
 
 def _limit_up_price(detail, trade_day, stock_code):
@@ -569,12 +582,14 @@ def _check_startup_order_records(records):
 
 def _format_plan():
     total = sum(item["estimated_amount"] for item in _SESSION["plans"])
-    _log("PREFLIGHT_OK day=%s rows=%s estimate=%.2f live=%s" % (
-        _SESSION["trade_day"], len(_SESSION["plans"]), total, ENABLE_LIVE_ORDERS
+    sentinel_total = sum(item["estimated_amount"] for item in _SESSION["sentinels"])
+    _log("PREFLIGHT_OK day=%s rows=%s estimate=%.2f sentinels=%s sentinel_estimate=%.2f live=%s" % (
+        _SESSION["trade_day"], len(_SESSION["plans"]), total,
+        len(_SESSION["sentinels"]), sentinel_total, ENABLE_LIVE_ORDERS
     ))
     if ENABLE_LIVE_ORDERS:
         _log("FUNDS_OK available=%.2f required=%.2f" % (
-            _SESSION["available_cash"], total
+            _SESSION["available_cash"], total + sentinel_total
         ))
     else:
         _log("FUNDS_CHECK_SKIPPED reason=live_orders_disabled")
@@ -628,6 +643,7 @@ def _preflight_step(C, now=None):
                 )
                 _SESSION["price_cache"][code] = price
                 _SESSION["price_meta"][code] = metadata
+                _prepare_sentinel(C, order, detail, price, metadata)
             price = _SESSION["price_cache"][code]
             metadata = _SESSION["price_meta"][code]
             name = metadata["instrument_name"]
@@ -733,18 +749,49 @@ def _reserve_batch():
     return True
 
 
+def _prepare_sentinel(C, order, detail, limit_up, main_metadata):
+    code = order["stock_code"]
+    name = main_metadata["instrument_name"]
+    reason = ""
+    if code.startswith(("688", "689")):
+        reason = "minimum_buy_quantity_exceeds_100"
+    else:
+        try:
+            price, metadata = _resolve_limit_price(
+                C, detail, _SESSION["trade_day"], code, down=True
+            )
+            if not 0 < price < limit_up:
+                raise _PriceNotReady("limit-down price must be below limit-up price")
+        except _PriceNotReady as exc:
+            reason = str(exc)
+    if reason:
+        _log("SENTINEL_SKIPPED code=%s name=%s reason=%s" % (code, name, reason))
+        return
+    _SESSION["sentinels"].append({
+        "row_no": order["row_no"], "stock_code": code, "instrument_name": name,
+        "limit_down_price": price, "quantity": 100, "is_sentinel": True,
+        "estimated_amount": round(price * 100, 2), "attempts": 0,
+        "status": "planned", "attempt_history": [],
+    })
+    _log("SENTINEL_PLAN code=%s name=%s price=%.3f qty=100 source=%s" % (
+        code, name, price, metadata["source"]
+    ))
+
+
 def _prepare_initial_attempts(C):
     sender = globals().get("passorder")
     if ENABLE_LIVE_ORDERS and not callable(sender):
         _abort("passorder is unavailable before submission")
         return False
-    for plan in _SESSION["plans"]:
+    for plan in _SESSION["plans"] + _SESSION["sentinels"]:
         if not ENABLE_LIVE_ORDERS:
             continue
+        sentinel = plan.get("is_sentinel")
+        price = plan["limit_down_price"] if sentinel else plan["limit_up_price"]
         attempt_no = plan["attempts"] + 1
+        row_token = "S%s" % plan["row_no"] if sentinel else plan["row_no"]
         token = "%s_%s_%s_%s" % (
-            _SESSION["trade_day"], plan["row_no"], attempt_no,
-            uuid.uuid4().hex[:8]
+            _SESSION["trade_day"], row_token, attempt_no, uuid.uuid4().hex[:8]
         )
         attempt = {
             "attempt": attempt_no,
@@ -759,7 +806,7 @@ def _prepare_initial_attempts(C):
         plan["prepared_sender"] = sender
         plan["prepared_args"] = (
             23, ORDER_TYPE_BUY, ACCOUNT_ID, plan["stock_code"], PRICE_TYPE_LIMIT,
-            plan["limit_up_price"], plan["quantity"], STRATEGY_NAME,
+            price, plan["quantity"], STRATEGY_NAME,
             QUICK_TRADE, token, C
         )
         _SESSION["token_to_plan"][token] = plan
@@ -769,7 +816,7 @@ def _prepare_initial_attempts(C):
 
 def _prepare_submission(C, now):
     started_mono = time.monotonic()
-    required = sum(item["estimated_amount"] for item in _SESSION["plans"])
+    required = sum(item["estimated_amount"] for item in _SESSION["plans"] + _SESSION["sentinels"])
     if ENABLE_LIVE_ORDERS:
         try:
             available = _available_cash(C)
@@ -811,7 +858,10 @@ def _is_preopen_rejection(message):
     return any(marker in text for marker in markers)
 
 
-def _submit_plan(C, plan):
+def _submit_plan(C, plan, deferred_logs=None):
+    sentinel = plan.get("is_sentinel")
+    price = plan["limit_down_price"] if sentinel else plan["limit_up_price"]
+    label = "SENTINEL" if sentinel else "ORDER"
     attempt = plan.pop("prepared_attempt", None)
     prepared_args = plan.pop("prepared_args", None)
     sender = plan.pop("prepared_sender", None)
@@ -855,13 +905,19 @@ def _submit_plan(C, plan):
         if prepared_args is None:
             prepared_args = (
                 23, ORDER_TYPE_BUY, ACCOUNT_ID, plan["stock_code"], PRICE_TYPE_LIMIT,
-                plan["limit_up_price"], plan["quantity"], STRATEGY_NAME,
+                price, plan["quantity"], STRATEGY_NAME,
                 QUICK_TRADE, token, C
             )
+        submit_time = datetime.datetime.now()
         result = sender(*prepared_args)
     except Exception as exc:
         plan["status"] = "unknown"
         attempt["status"] = "unknown"
+        if sentinel:
+            _log("SENTINEL_SEND_UNKNOWN code=%s name=%s token=%s error=%r" % (
+                plan["stock_code"], plan["instrument_name"], token, exc
+            ))
+            return False
         _SESSION["phase"] = "PARTIAL_STOP"
         _log("SEND_UNKNOWN row=%s token=%s error=%r; remaining rows halted" % (
             plan["row_no"], token, exc
@@ -871,38 +927,42 @@ def _submit_plan(C, plan):
     if result is False or (isinstance(result, (int, float)) and result < 0) or str(result) == "-1":
         plan["status"] = "unknown"
         attempt["status"] = "unknown"
+        if sentinel:
+            _log("SENTINEL_SEND_UNKNOWN code=%s name=%s token=%s return=%r" % (
+                plan["stock_code"], plan["instrument_name"], token, result
+            ))
+            return False
         _SESSION["phase"] = "PARTIAL_STOP"
         _log("SEND_UNKNOWN row=%s token=%s return=%r; remaining rows halted" % (
             plan["row_no"], token, result
         ))
         return False
 
-    if result == 0:
-        plan["status"] = "accepted_no_id"
-        attempt["status"] = "accepted_no_id"
-        _log("ORDER_ACCEPTED_NO_ID row=%s code=%s name=%s price=%.3f qty=%s attempt=%s token=%s; "
-             "waiting for broker callback" % (
-                 plan["row_no"], plan["stock_code"], plan["instrument_name"],
-                 plan["limit_up_price"], plan["quantity"], plan["attempts"], token
-             ))
-        return True
-
-    plan["status"] = "sent"
-    attempt["status"] = "sent"
-    if isinstance(result, (str, int)) and str(result) not in ("", "0", "-1"):
+    if attempt["status"] == "sending":
+        plan["status"] = "accepted_no_id" if result == 0 else "sent"
+        attempt["status"] = plan["status"]
+    if (not attempt["order_id"] and isinstance(result, (str, int))
+            and str(result) not in ("", "0", "-1")):
         plan["order_id"] = str(result)
         attempt["order_id"] = str(result)
         _SESSION["order_id_to_plan"][str(result)] = plan
         _SESSION["order_id_to_attempt"][str(result)] = attempt
-    _log("ORDER_SENT row=%s code=%s name=%s price=%.3f qty=%s attempt=%s token=%s return=%r" % (
+    event = label + ("_ACCEPTED_NO_ID" if result == 0 else "_SENT")
+    message = "%s row=%s code=%s name=%s price=%.3f qty=%s attempt=%s token=%s return=%r submitted_at=%s" % (
+        event,
         plan["row_no"], plan["stock_code"], plan["instrument_name"],
-        plan["limit_up_price"], plan["quantity"], plan["attempts"], token, result
-    ))
+        price, plan["quantity"], plan["attempts"], token, result,
+        _format_timestamp_millis(submit_time)
+    )
+    if deferred_logs is None:
+        _log(message)
+    else:
+        deferred_logs.append(message)
     return True
 
 
 def _dispatch_step(C, now):
-    due_rows = sorted(_SESSION["retry_due"].keys())
+    due_rows = sorted(_SESSION["retry_due"]) if _SESSION["sentinels_dispatched"] else ()
     for row_no in due_rows:
         if _SESSION["retry_due"][row_no] <= time.monotonic():
             del _SESSION["retry_due"][row_no]
@@ -922,6 +982,7 @@ def _dispatch_step(C, now):
             return
 
     sent_this_turn = 0
+    deferred_logs = []
     while (_SESSION["dispatch_cursor"] < len(_SESSION["plans"])
            and sent_this_turn < SUBMIT_ROWS_PER_TURN):
         plan = _SESSION["plans"][_SESSION["dispatch_cursor"]]
@@ -930,7 +991,9 @@ def _dispatch_step(C, now):
             sent_this_turn += 1
             continue
         if ENABLE_LIVE_ORDERS:
-            if not _submit_plan(C, plan):
+            if not _submit_plan(C, plan, deferred_logs):
+                for message in deferred_logs:
+                    _log(message)
                 return
         else:
             plan["status"] = "dry_run"
@@ -939,6 +1002,21 @@ def _dispatch_step(C, now):
                 plan["limit_up_price"], plan["quantity"], plan["estimated_amount"]
             ))
         sent_this_turn += 1
+
+    if (_SESSION["dispatch_cursor"] >= len(_SESSION["plans"])
+            and not _SESSION["sentinels_dispatched"]):
+        _SESSION["sentinels_dispatched"] = True
+        for sentinel in _SESSION["sentinels"]:
+            if ENABLE_LIVE_ORDERS:
+                _submit_plan(C, sentinel, deferred_logs)
+            else:
+                sentinel["status"] = "dry_run"
+                _log("SENTINEL_DRY_RUN code=%s name=%s price=%.3f qty=%s" % (
+                    sentinel["stock_code"], sentinel["instrument_name"],
+                    sentinel["limit_down_price"], sentinel["quantity"]
+                ))
+    for message in deferred_logs:
+        _log(message)
 
     if (_SESSION["dispatch_cursor"] >= len(_SESSION["plans"])
             and not _SESSION["retry_due"]):
@@ -1042,6 +1120,8 @@ def init(C):
         "trade_day": today,
         "orders": [],
         "plans": [],
+        "sentinels": [],
+        "sentinels_dispatched": False,
         "plan_by_row": {},
         "preflight_cursor": 0,
         "price_waiting_rows": [],
@@ -1153,13 +1233,22 @@ def _find_callback_plan(info, is_deal=False):
         info, "m_dPrice", "price", "order_price", "m_dOrderPrice",
         "traded_price"
     ))
+    sentinels = [
+        candidate for candidate in _SESSION["sentinels"]
+        if candidate["stock_code"] == code and candidate["attempts"] > 0
+    ]
+    if is_deal and any(
+            price <= candidate["limit_down_price"] + 0.0001 for candidate in sentinels):
+        # A main buy can also fill at the sentinel price. Require order identity.
+        return None, token, order_id, False
     candidates = []
-    for candidate in _SESSION.get("plans", []):
+    for candidate in _SESSION["plans"] + sentinels:
         if candidate.get("stock_code") != code:
             continue
         if quantity > 0 and int(quantity) != int(candidate.get("quantity") or 0):
             continue
-        if price > 0 and abs(price - float(candidate.get("limit_up_price") or 0.0)) >= 0.0001:
+        order_price = candidate.get("limit_down_price", candidate.get("limit_up_price", 0.0))
+        if price > 0 and abs(price - order_price) >= 0.0001:
             continue
         candidates.append(candidate)
     if len(candidates) == 1:
@@ -1241,6 +1330,21 @@ def order_callback(ContextInfo, orderInfo):
         status == ORDER_STATUS_JUNK
         or (status is None and _is_preopen_rejection(message))
     )
+    if plan.get("is_sentinel"):
+        if retryable_rejection:
+            plan["status"] = "rejected"
+        elif status == ORDER_STATUS_SUCCEEDED or plan["traded_volume"] >= plan["quantity"]:
+            plan["status"] = "filled"
+        elif _is_terminal_order_status(status):
+            plan["status"] = "terminal"
+        else:
+            plan["status"] = "partial_filled" if plan["traded_volume"] else "callback_received"
+        attempt["status"] = plan["status"]
+        _log("SENTINEL_ORDER_CALLBACK code=%s name=%s id=%s status=%s traded=%s message=%s" % (
+            plan["stock_code"], plan["instrument_name"], order_id, status,
+            plan["traded_volume"], message
+        ))
+        return
     if retryable_rejection:
         attempt["status"] = "rejected"
         reject_key = _reject_callback_key(plan["row_no"], attempt)
@@ -1304,6 +1408,35 @@ def deal_callback(ContextInfo, dealInfo):
         "tradedID", "traded_id"
     ) or "").strip()
     attempt = _attempt_for_callback(plan, token, order_id)
+    if plan.get("is_sentinel"):
+        volume = max(0, _int_value(_field(
+            dealInfo, "m_nVolume", "m_nTradeVolume", "deal_volume",
+            "traded_volume", "tradedVolume", "volume"
+        )) or 0)
+        if deal_id and deal_id in _SESSION["handled_deals"]:
+            return
+        if deal_id and volume:
+            _SESSION["handled_deals"].add(deal_id)
+            plan["deal_volume"] = plan.get("deal_volume", 0) + volume
+            plan["traded_volume"] = max(plan["traded_volume"], plan["deal_volume"])
+            if attempt is not None:
+                attempt["traded_volume"] = plan["traded_volume"]
+            plan["status"] = (
+                "filled" if plan["traded_volume"] >= plan["quantity"] else "partial_filled"
+            )
+        else:
+            plan["fill_uncertain"] = True
+        if order_id:
+            plan["order_id"] = order_id
+            _SESSION["order_id_to_plan"][order_id] = plan
+            if attempt is not None:
+                attempt["order_id"] = order_id
+                _SESSION["order_id_to_attempt"][order_id] = attempt
+        _log("SENTINEL_DEAL_CALLBACK code=%s name=%s id=%s qty=%s verified=%s" % (
+            plan["stock_code"], plan["instrument_name"], order_id, volume,
+            bool(deal_id and volume)
+        ))
+        return
     if not deal_id:
         plan["fill_uncertain"] = True
         plan["status"] = "fill_unverified"
