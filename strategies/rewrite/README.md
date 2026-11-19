@@ -13,6 +13,7 @@ stop(ContextInfo)
 ## 文件
 
 - `large_order_limit_up_buy/QMT_LARGE_ORDER_LIMIT_UP_BUY.py`：可复制到 QMT 原生 Python 目录运行的当前脚本，编码保持 `gbk`。
+- `large_order_limit_up_queue_tracker/`：基于当前打板脚本建立的独立队列撤单跟踪策略副本，不覆盖原策略或现有 QMT 部署文件。
 - `juejin_sell_strategy/`：Juejin 卖出策略原生模型、规则说明和离线测试。
 - `overnight_limit_up_buy/`：独立的隔夜涨停买入原生模型。
 - `large_order_limit_up_buy/DESIGN.md`：设计文档到代码状态机和事件处理的映射，以及当前差异。
@@ -63,6 +64,7 @@ The native models are kept as sibling projects:
 
 ```text
 large_order_limit_up_buy/
+large_order_limit_up_queue_tracker/
 juejin_sell_strategy/
 overnight_limit_up_buy/
 ```
