@@ -30,9 +30,6 @@ POOL_ITEMS = (
 )
 
 
-FIRST_SEAL_MIN_AMOUNT = 60000000.0
-FIRST_LARGE_ORDER_MIN_AMOUNT = 2000000.0
-FIRST_LARGE_ORDER_TOTAL_AMOUNT = 10000000.0
 LARGE_ORDER_MIN_VOLUME_SHARES = 900000
 LARGE_ORDER_MIN_AMOUNT = 5000000.0
 RESEAL_MIN_SEAL_SECONDS = 10.0
@@ -42,8 +39,6 @@ RESEAL_VERIFY_ORDER_COUNT = 150
 RESEAL_VERIFY_LARGE_AMOUNT = 1500000.0
 RESEAL_VERIFY_LARGE_COUNT = 2
 RESEAL_VALIDATION_WINDOW_SECONDS = 1.0
-RESEAL_VALIDATION_CONTINUE_ON_FAILURE = False
-RESEAL_LATE_WINDOW_SECONDS = 5.0
 RESEAL_PRE_SUBMIT_ORDER_MAX_COUNT = 200
 RESEAL_PRE_SUBMIT_ORDER_MAX_AGE_SECONDS = 2.0
 ORDER_LOOKUP_RETRY_INTERVAL_SECONDS = 0.1
@@ -85,7 +80,7 @@ QUEUE_SENTINEL_LOOKUP_MAX_ATTEMPTS = 10
 QUEUE_SENTINEL_CANCEL_MAX_ATTEMPTS = 3
 QUEUE_SENTINEL_CANCEL_RETRY_SECONDS = 0.2
 L2_PERIODS = set(PERIODS)
-VALIDATED_SUBMIT_REASONS = frozenset(("首封", "首封大单", "回封", "回封大单"))
+VALIDATED_SUBMIT_REASONS = frozenset(("首封大单", "回封大单"))
 STATE_WAIT_INITIAL = "WAIT_INITIAL_QUOTE"
 STATE_READY = "READY"
 STATE_WAIT_REOPEN = "WAIT_REOPEN"
@@ -898,9 +893,10 @@ def _new_instance(code, amount):
         "limit_up": None, "limit_down": None, "last_close": None,
         "open_price": None, "day_low": None,
         "last_event_time": "", "last_l2quote": {}, "auction_checked": False,
-        "initial_sealed": False, "seal_started": None, "seal_peak": 0.0,
-        "break_started": None, "reseal_ready": False, "first_large_total": 0.0,
-        "first_large_ids": set(), "seen_order_ids": set(), "seen_order_queue": deque(),
+        "seal_started": None, "seal_peak": 0.0,
+        "break_started": None, "reseal_ready": False,
+        "rearm_quote_cutoff": None, "reseal_break_event": None,
+        "seen_order_ids": set(), "seen_order_queue": deque(),
         "seen_cancel_event_keys": set(), "seen_cancel_event_queue": deque(),
         "l2order_history": [],
         "verify_count": 0,
@@ -912,7 +908,7 @@ def _new_instance(code, amount):
         "cancel_confirmed": False, "cancel_failed": False, "cancel_due": False,
         "cancel_due_reason": "", "cancel_request_timer": None,
         "cancel_requested": False, "cancel_attempts": 0,
-        "cancel_terminal": False, "external_cancel_event_keys": set(),
+        "external_cancel_event_keys": set(),
         "external_cancel_monitor_enabled": False,
         "external_cancel_wait_count": 0, "external_cancel_wait_last_log": 0.0,
         "trigger_order_id": None, "trigger_order_key": None,
@@ -940,8 +936,7 @@ def _new_instance(code, amount):
         "sentinel_cancel_timer": None, "sentinel_timeout_timer": None,
         "sentinel_lookup_timer": None,
         "sentinel_lookup_attempts": 0, "sentinel_seen_deal_ids": set(),
-        "late_large_count": 0,
-        "late_large_ids": set(), "follow_sent": False, "our_order_id": None,
+        "our_order_id": None,
         "our_order_qty": 0, "our_traded_qty": 0, "our_order_status": "",
         "order_reported_traded_qty": 0, "deal_traded_qty": 0,
         "seen_deal_ids": set(), "pending_deal_infos": [],
@@ -1329,9 +1324,6 @@ def _start_validation(inst, trigger_order_key=None, trigger_event_raw=None):
     inst["cancel_failed"] = False
     inst["cancel_due"] = False
     inst["cancel_due_reason"] = ""
-    inst["late_large_count"] = 0
-    inst["late_large_ids"].clear()
-    inst["follow_sent"] = False
     inst["validation_passed"] = False
     _log("[FOLLOW_VERIFY_START] code=%s token=%s order_id=%s window=%.0fms "
          "max_post_events=%d required_large=%d min_amount=%.0f pre_events=%d "
@@ -1586,7 +1578,6 @@ def _queue_cancel_ratio_check(inst, ContextInfo=None):
     if cancelled_volume <= total_volume * QUEUE_CANCEL_RATIO_THRESHOLD:
         return False
     inst["queue_cancel_ratio_triggered"] = True
-    inst["cancel_terminal"] = True
     _log("[QUEUE_CANCEL_RATIO_TRIGGER] code=%s cancelled_shares=%d total_shares=%d "
          "ratio=%.2f%% threshold=%.0f%% operator=gt action=cancel_our_order" % (
              _stock_label(inst["code"], inst), int(cancelled_volume),
@@ -2089,8 +2080,9 @@ def _submit_queue_sentinel(inst):
 
 
 def _submit(inst, reason, trigger_order_key=None, trigger_order=None):
-    is_follow = reason == "撤单后跟随"
-    if inst["state"] in (STATE_DONE, STATE_SKIPPED) or inst.get("submission_pending") or (inst.get("our_order_id") and not is_follow):
+    if (reason not in VALIDATED_SUBMIT_REASONS or not trigger_order or
+            inst["state"] in (STATE_DONE, STATE_SKIPPED) or
+            inst.get("submission_pending") or inst.get("our_order_id")):
         return False
     if not ACCOUNT_ID:
         _log("[下单判断] %s 未配置 ACCOUNT_ID，跳过真实下单" % inst["code"])
@@ -2126,7 +2118,6 @@ def _submit(inst, reason, trigger_order_key=None, trigger_order=None):
         inst["cancel_due_reason"] = ""
         inst["cancel_requested"] = False
         inst["cancel_attempts"] = 0
-        inst["cancel_terminal"] = False
         inst["external_cancel_monitor_enabled"] = False
         inst["l2transaction_monitor_active"] = False
         inst["external_cancel_event_keys"].clear()
@@ -2255,15 +2246,62 @@ def _confirm_cancel(inst, status=None):
     inst["cancel_due"] = False
     inst["cancel_failed"] = False
     inst["cancel_confirmed"] = True
+    inst["validation_active"] = False
+    _cancel_timer(inst)
     _cancel_request_timer(inst)
     _log("[CANCEL_CONFIRMED] code=%s order_id=%s status=%s traded=%s/%s" % (
         inst["code"], _our_cancel_order_id(inst), status,
         inst.get("our_traded_qty", 0), inst.get("our_order_qty", 0)))
-    if inst.get("cancel_terminal"):
-        reason = ("queue_cancel_ratio_exceeded"
-                  if inst.get("queue_cancel_ratio_triggered")
-                  else "terminal_cancelled")
-        _set_state(inst, STATE_DONE, reason)
+    if inst.get("our_traded_qty", 0) > 0 or status == "53":
+        _set_state(inst, STATE_DONE, "主单撤单后结束")
+    elif (inst.get("cancel_due_reason") in ("event_limit", "timeout")
+            or inst.get("queue_cancel_ratio_triggered")):
+        if inst.get("rearm_quote_cutoff") is None:
+            inst["rearm_quote_cutoff"] = _wall_seconds_since_midnight()
+    else:
+        _set_state(inst, STATE_DONE, "主单撤单后结束")
+
+
+def _rearm_after_cancel(inst, quote_event_raw):
+    cutoff = inst.get("rearm_quote_cutoff")
+    if cutoff is None or inst["state"] in (STATE_DONE, STATE_SKIPPED):
+        return True
+    if inst.get("our_traded_qty", 0) > 0:
+        _set_state(inst, STATE_DONE, "部分成交后余量撤单")
+        return False
+    event_seconds = _event_seconds(quote_event_raw)
+    if event_seconds is None or event_seconds <= cutoff:
+        return False
+    sentinel_result = inst.get("sentinel_submit_result")
+    sentinel_rejected = sentinel_result is False or str(sentinel_result) == "-1"
+    if (inst.get("sentinel_token") and not sentinel_rejected and
+            not inst.get("sentinel_cancel_confirmed")):
+        return False
+    old_order_id = _our_cancel_order_id(inst)
+    if old_order_id:
+        inst["previous_order_ids"].add(old_order_id)
+    _cancel_order_lookup(inst)
+    _cancel_sentinel_lookup(inst)
+    _cancel_sentinel_timeout(inst)
+    _cancel_sentinel_cancel_timer(inst)
+    inst.update(
+        our_order_id=None, our_order_qty=0, our_order_status="",
+        validation_order_id=None, submit_token=None, submit_reason="",
+        submission_pending=False, validation_started=None, validation_passed=False,
+        cancel_started=None, cancel_confirmed=False, cancel_due_reason="",
+        pending_order_info=None, pending_deal_infos=[],
+        external_cancel_monitor_enabled=False, l2transaction_monitor_active=False,
+        trigger_order_id=None, trigger_order_key=None,
+        queue_capture_active=False, queue_capture_complete=False,
+        queue_capture_boundary_complete=False, queue_cancel_ratio_triggered=False,
+        queue_capture_total_volume=0.0, queue_capture_orders=[],
+        queue_capture_order_keys=set(), queue_tracked_orders={},
+        queue_pending_cancel_logs=[], sentinel_token=None, sentinel_order_id=None,
+        l2order_history=[], seal_started=None, seal_peak=0.0,
+        break_started=None, reseal_ready=False, reseal_break_event=None,
+        rearm_quote_cutoff=None, last_l2quote={})
+    _set_state(inst, STATE_WAIT_REOPEN, "主单零成交撤单，重新观察封板")
+    return True
 
 
 def _request_cancel(inst, reason="validation_failed", ContextInfo=None):
@@ -2382,7 +2420,7 @@ def _check_validation(inst, ContextInfo=None):
                      inst["verify_large_count"], RESEAL_VERIFY_LARGE_COUNT,
                      elapsed * 1000.0, inst.get("validation_stale_count", 0)))
             _request_cancel(inst, reason, ContextInfo)
-    if (inst.get("cancel_terminal") and not inst.get("cancel_confirmed") and
+    if (inst.get("queue_cancel_ratio_triggered") and not inst.get("cancel_confirmed") and
             not inst.get("cancel_requested")):
         _request_cancel(
             inst, inst.get("cancel_due_reason") or
@@ -2393,23 +2431,6 @@ def _check_validation(inst, ContextInfo=None):
         _log("[CANCEL_PENDING] code=%s order_id=%s retries_exhausted=true" % (
             inst["code"], _our_cancel_order_id(inst)))
         return
-    if inst.get("cancel_terminal") and inst.get("cancel_confirmed"):
-        reason = ("queue_cancel_ratio_exceeded"
-                  if inst.get("queue_cancel_ratio_triggered")
-                  else "terminal_cancelled")
-        _set_state(inst, STATE_DONE, reason)
-        return
-    if inst.get("cancel_confirmed") and inst["our_traded_qty"] > 0:
-        _set_state(inst, STATE_DONE, "部分成交后余量撤单")
-        return
-    if inst.get("cancel_confirmed") and not RESEAL_VALIDATION_CONTINUE_ON_FAILURE:
-        _set_state(inst, STATE_DONE, "撤单后补单已关闭")
-        return
-    if (inst.get("cancel_confirmed") and not inst.get("follow_sent") and
-            _now() - inst["cancel_started"] < RESEAL_LATE_WINDOW_SECONDS):
-        if inst["late_large_count"] >= RESEAL_VERIFY_LARGE_COUNT and inst["last_l2quote"].get("bid_at_limit"):
-            inst["follow_sent"] = True
-            _submit(inst, "撤单后跟随")
 
 
 def _quote_scalar(value):
@@ -2644,6 +2665,8 @@ def _handle_quote(code, period, payload):
             inst.get("subscriptions_stopped") or inst["state"] == STATE_SKIPPED):
             return
         if period == "l2quote":
+            if not _rearm_after_cancel(inst, event_raw):
+                return
             _cache_l2order_quote(inst, source, event_raw, received_at)
             _try_subscribe_l2order(_C, inst, received_at)
         accepted, event_time, drop_reason = _quote_entry_gate(inst, source)
@@ -2703,20 +2726,6 @@ def _handle_quote(code, period, payload):
                 _set_state(inst, STATE_WAIT_REOPEN, "盘中启动时已在涨停价，等待回封")
             else:
                 _set_state(inst, STATE_READY, "收到连续竞价有效行情")
-        if inst["state"] == STATE_READY:
-            if bid_at_limit:
-                if inst["seal_started"] is None:
-                    inst["seal_started"] = _now()
-                inst["seal_peak"] = max(inst["seal_peak"], seal_amount)
-                if seal_amount > FIRST_SEAL_MIN_AMOUNT:
-                    inst["initial_sealed"] = True
-            else:
-                inst["seal_started"] = None
-                inst["seal_peak"] = 0.0
-                inst["initial_sealed"] = False
-                inst["first_large_total"] = 0.0
-                inst["first_large_ids"].clear()
-            return
         if inst["state"] == STATE_WAIT_REOPEN:
             if bid_at_limit:
                 if inst["seal_started"] is None:
@@ -2727,17 +2736,10 @@ def _handle_quote(code, period, payload):
                     inst["break_started"] = _now()
                     if _now() - inst["seal_started"] > RESEAL_MIN_SEAL_SECONDS and inst["seal_peak"] >= RESEAL_MIN_PEAK_AMOUNT:
                         inst["reseal_ready"] = True
+                        inst["reseal_break_event"] = _event_seconds(event_raw)
                         _set_state(inst, STATE_WAIT_RESEAL, "合格封板开板")
                 inst["seal_started"] = None
                 inst["seal_peak"] = 0.0
-            return
-        if inst["state"] == STATE_WAIT_RESEAL:
-            if not bid_at_limit:
-                if inst["break_started"] is None:
-                    inst["break_started"] = _now()
-                return
-            if inst["break_started"] is not None and _now() - inst["break_started"] >= RESEAL_BREAK_SECONDS:
-                _submit(inst, "回封")
             return
         _check_validation(inst)
 
@@ -2930,12 +2932,6 @@ def _handle_l2order(code, payload, subscription_generation=None):
                              inst["verify_large_count"], RESEAL_VERIFY_LARGE_COUNT,
                              amount, event_raw or event_time))
                 _check_validation(inst)
-            elif inst.get("cancel_started") and not inst.get("cancel_confirmed"):
-                if amount >= RESEAL_VERIFY_LARGE_AMOUNT:
-                    large_key = order_id or event_key
-                    if large_key not in inst["late_large_ids"]:
-                        inst["late_large_ids"].add(large_key)
-                        inst["late_large_count"] += 1
             return
         if inst.get("submission_pending") or inst.get("validation_passed") or inst.get("cancel_due"):
             return
@@ -2950,6 +2946,8 @@ def _handle_l2order(code, payload, subscription_generation=None):
             and inst.get("reseal_ready")
             and inst.get("break_started") is not None
             and _now() - inst["break_started"] >= RESEAL_BREAK_SECONDS
+            and (inst.get("reseal_break_event") is None or
+                 (_event_seconds(event_raw) or 0) > inst["reseal_break_event"])
             and _is_large_order_trigger(volume, amount)
         ):
             trigger_reason = "回封大单"
@@ -2962,19 +2960,6 @@ def _handle_l2order(code, payload, subscription_generation=None):
                     inst["code"], trigger_reason, order_id or "无编号", int(volume),
                     volume / 100.0, amount))
             return
-
-        if inst["state"] == STATE_READY and inst["initial_sealed"]:
-            if amount >= FIRST_LARGE_ORDER_MIN_AMOUNT:
-                if order_id not in inst["first_large_ids"]:
-                    inst["first_large_ids"].add(order_id)
-                    inst["first_large_total"] += amount
-            if (inst["first_large_total"] > FIRST_LARGE_ORDER_TOTAL_AMOUNT
-                    and _opening_low_filter_met(inst)):
-                _submit(inst, "首封", event_key, {
-                    "order_id": order_id, "price": price, "volume": volume,
-                    "amount": amount, "direction": direction,
-                    "event_time": event_time, "event_raw": event_raw})
-
 
 def _handle_l2transaction(code, payload):
     # Reject delayed callbacks before taking the strategy lock or copying data.
