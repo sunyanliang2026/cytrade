@@ -46,6 +46,7 @@ LIMIT_UP_LARGE_REDUCE_AMOUNT = 80000000.0
 LIMIT_DOWN_CLEAR_AMOUNT = 50000000.0
 LIMIT_OPEN_GRACE_SECONDS = 60.0
 LIMIT_OPEN_RECOVERY_SECONDS = 300.0
+LIMIT_OPEN_SELL_CUTOFF_SECONDS = 14 * 3600 + 56 * 60
 CANCEL_WAIT_SECONDS = 2.0
 SUMMARY_INTERVAL_SECONDS = 300.0
 
@@ -238,6 +239,13 @@ def _in_auction(seconds):
 
 def _in_regular_session(seconds):
     return seconds is not None and 9 * 3600 + 26 * 60 <= seconds <= 14 * 3600 + 57 * 60
+
+
+def _limit_open_sell_window_open(seconds):
+    now = _dt.datetime.now()
+    current_seconds = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond / 1000000.0
+    return (seconds is not None and seconds < LIMIT_OPEN_SELL_CUTOFF_SECONDS
+            and current_seconds < LIMIT_OPEN_SELL_CUTOFF_SECONDS)
 
 
 _STOCK_CODE_RE = re.compile(
@@ -865,6 +873,8 @@ def _pending_request_valid(inst, request):
     pre_close = inst["pre_close"]
     action = request["action"]
     seconds = _event_seconds(inst["last_l2_event_time"])
+    if action in ("limit_open_first_sell", "limit_open_second_sell") and not _limit_open_sell_window_open(seconds):
+        return False
     if action == "auction_under_expectation_primary":
         return (seconds is not None and 9 * 3600 + 24 * 60 + 56 <= seconds < 9 * 3600 + 25 * 60
                 and inst["exp"] == 1 and pre_close * 0.94 < bid < pre_close * 0.995)
@@ -916,6 +926,12 @@ def _pending_price(inst, request):
 def _drain_pending_after_cancel(inst):
     pending = inst.get("pending_after_cancel")
     if not pending:
+        return
+    if (any(request["action"] in ("limit_open_first_sell", "limit_open_second_sell")
+            for request in pending["requests"])
+            and not _limit_open_sell_window_open(_event_seconds(inst["last_l2_event_time"]))):
+        _log("[PENDING_SELL_ABORTED] code=%s reason=limit_open_after_1456" % inst["code"])
+        inst["pending_after_cancel"] = None
         return
     if _now() > pending["expires_at"]:
         _log("[PENDING_SELL_ABORTED] code=%s reason=signal_expired" % inst["code"])
@@ -1174,6 +1190,8 @@ def _handle_flag_seven(inst, quote, seconds):
 
 
 def _handle_limit_up_open(inst, quote, seconds):
+    if not _limit_open_sell_window_open(seconds):
+        return
     if inst["flag"] != FLAG_LIMIT_UP:
         return
     if inst["open_flag"] == FLAG_LIMIT_UP and inst["up_sell"] == LIMIT_UP_FIRST_SELL_DONE:
@@ -1215,7 +1233,9 @@ def _handle_limit_up_open(inst, quote, seconds):
             _set_flag(inst, FLAG_SELL_DONE, "limit_open_first_sell")
 
 
-def _handle_limit_open_second_sell(inst, quote, first_sell_done_before_tick):
+def _handle_limit_open_second_sell(inst, quote, first_sell_done_before_tick, seconds):
+    if not _limit_open_sell_window_open(seconds):
+        return
     if not (
         first_sell_done_before_tick
         and not inst["limit_open_second_sell_done"]
@@ -1305,7 +1325,7 @@ def _process_l2quote(inst, data, event_seconds):
     _handle_flag_five(inst, quote, event_seconds)
     _handle_flag_seven(inst, quote, event_seconds)
     _handle_limit_up_open(inst, quote, event_seconds)
-    _handle_limit_open_second_sell(inst, quote, first_sell_done_before_tick)
+    _handle_limit_open_second_sell(inst, quote, first_sell_done_before_tick, event_seconds)
     _recover_after_limit_open_timeout(inst, quote)
     _update_price_state(inst, quote)
     _log_flag7_monitor(inst, quote)

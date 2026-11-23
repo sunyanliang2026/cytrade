@@ -20,15 +20,24 @@ STRATEGY_NAME = "large_order_limit_up_queue_tracker"
 ORDER_TYPE_BUY = 1101
 PRICE_TYPE_LIMIT = 11
 
-POOL_TRADE_DATE = "20261117"
+POOL_TRADE_DATE = "20261119"
 
 POOL_ITEMS = (
-    ("002843", 18000.0),
-    ("600770", 18000.0),
-    ("002685", 25000.0),
-    ("600410", 18000.0),
+    ("002685", 21000.0),
+    ("603030", 21000.0),
+    ("603324", 21000.0),
+    ("600410", 21000.0),
+    ("002771", 21000.0),
+    ("000158", 18000.0),
+    ("000889", 21000.0),
+    ("600619", 21000.0),
+    ("002418", 21000.0),
+    ("600520", 21000.0),
+    ("002077", 21000.0),
+    ("603931", 21000.0),
+    ("603813", 21000.0),
+    ("600156", 21000.0),
 )
-
 
 LARGE_ORDER_MIN_VOLUME_SHARES = 900000
 LARGE_ORDER_MIN_AMOUNT = 5000000.0
@@ -1034,6 +1043,20 @@ def _quote_values(inst, data, track_day=True):
         if last:
             inst["day_low"] = last if inst["day_low"] is None else min(inst["day_low"], last)
     return bid, bid_vol, ask, last, low
+
+
+def _seal_book_status(bid, limit_up, raw_bid_vol):
+    if not limit_up or not bid:
+        return None
+    if abs(bid - limit_up) >= 1e-8:
+        return False
+    if isinstance(raw_bid_vol, (list, tuple)):
+        raw_bid_vol = raw_bid_vol[0] if raw_bid_vol else None
+    if _safe_float(raw_bid_vol) is not None:
+        return True
+    if raw_bid_vol in (0, "0", "0.0"):
+        return False
+    return None
 
 
 def _amount(price, volume):
@@ -2556,16 +2579,17 @@ def _quote_entry_gate(inst, source):
                 _limit_from(source, inst.get("last_l2quote")))
     bid = _quote_scalar(_field(source, "bidPrice", "bid", "bid1", "bidPrice1"))
     if limit_up and bid:
-        bid_at_limit = abs(bid - limit_up) < 1e-8
+        raw_bid_vol = _field(source, "bidVol", "bidVolume", "bid1_volume", "bidVolume1")
+        bid_at_limit = _seal_book_status(bid, limit_up, raw_bid_vol)
         previous_quote = inst.get("last_l2quote", {})
         previous = previous_quote.get("bid_at_limit")
-        current_bid_vol = _quote_scalar(
-            _field(source, "bidVol", "bidVolume", "bid1_volume", "bidVolume1"))
+        current_bid_vol = _quote_scalar(raw_bid_vol)
         previous_bid_vol = _safe_float(previous_quote.get("bidVol"))
         queue_growth = bool(
             bid_at_limit and current_bid_vol and
             (previous_bid_vol is None or current_bid_vol > previous_bid_vol))
-        if (previous is None or bool(previous) != bid_at_limit or queue_growth or
+        if bid_at_limit is not None and (
+                previous != bid_at_limit or queue_growth or
                 inst["state"] == STATE_WAIT_INITIAL):
             reason = ("limit_up_queue_growth" if queue_growth else
                       "limit_up_book" if bid_at_limit else "seal_transition")
@@ -2704,9 +2728,10 @@ def _handle_quote(code, period, payload):
             return
         if not is_l2quote:
             return
-        if not limit_up or not bid:
+        raw_bid_vol = _field(data, "bidVol", "bidVolume", "bid1_volume", "bidVolume1")
+        bid_at_limit = _seal_book_status(bid, limit_up, raw_bid_vol)
+        if bid_at_limit is None:
             return
-        bid_at_limit = abs(bid - limit_up) < 1e-8
         seal_amount = _amount(bid, bid_vol)
         if is_l2quote:
             # Keep only the latest scalar quote state needed by the strategy.
@@ -2726,7 +2751,7 @@ def _handle_quote(code, period, payload):
                 _set_state(inst, STATE_WAIT_REOPEN, "盘中启动时已在涨停价，等待回封")
             else:
                 _set_state(inst, STATE_READY, "收到连续竞价有效行情")
-        if inst["state"] == STATE_WAIT_REOPEN:
+        if inst["state"] in (STATE_READY, STATE_WAIT_REOPEN):
             if bid_at_limit:
                 if inst["seal_started"] is None:
                     inst["seal_started"] = _now()
@@ -3170,7 +3195,11 @@ def _summary():
         display_state = inst["state"]
         if inst.get("our_order_id") and display_state not in (STATE_DONE, STATE_SKIPPED):
             display_state = "已下单，等待成交"
-        by_state.setdefault(display_state, []).append(_stock_label(inst["code"], inst))
+        bid_at_limit = inst.get("last_l2quote", {}).get("bid_at_limit")
+        book_state = ("涨停封板" if bid_at_limit is True else
+                      "未封板" if bid_at_limit is False else "待确认")
+        label = "%s（盘口：%s）" % (_stock_label(inst["code"], inst), book_state)
+        by_state.setdefault(display_state, []).append(label)
     period_counts = ",".join("%s:%d" % (period, _PERIOD_COUNTS.get(period, 0)) for period in PERIODS)
     first_callbacks = ",".join(sorted(_FIRST_CALLBACKS)) or "无"
     last_events = ",".join("%s:%s" % (period, _LAST_EVENT_TIMES.get(period, "")) for period in PERIODS)
@@ -3399,6 +3428,26 @@ def _apply_order_update(inst, item):
         _set_state(inst, STATE_DONE, "订单废单")
 
 
+def _log_deal_queue_cancel_ratio(inst, item):
+    threshold = QUEUE_CANCEL_RATIO_THRESHOLD * 100.0
+    records = inst.get("queue_capture_orders", [])
+    if not inst.get("queue_capture_boundary_complete"):
+        summary = "队列采集未完成，撤单比例待确认"
+    elif not records or not inst.get("queue_capture_total_volume"):
+        summary = "队列无有效委托，撤单比例不适用"
+    else:
+        total = inst["queue_capture_total_volume"]
+        cancelled = sum(min(record["volume"], max(0.0, record["cancel_volume"]))
+                        for record in records)
+        cancelled_count = sum(1 for record in records if record["cancel_volume"] > 0)
+        summary = "撤单=%d/%d笔，撤单股数=%d/%d股，按股数=%.2f%%" % (
+            cancelled_count, len(records), int(cancelled), int(total),
+            100.0 * cancelled / total)
+    _log("[成交时队列撤单] %s 主单=%s 成交编号=%s %s，撤单阈值=>%.0f%%" % (
+        _stock_label(inst["code"], inst), item.get("id") or inst.get("our_order_id") or "",
+        item.get("deal_id") or "", summary, threshold))
+
+
 def _apply_deal_update(inst, item):
     deal_id = item.get("deal_id") or ""
     if deal_id and deal_id in inst["seen_deal_ids"]:
@@ -3423,6 +3472,7 @@ def _apply_deal_update(inst, item):
     _log("[DEAL_CALLBACK] id=%s code=%s deal_id=%s volume=%s cum_volume=%s price=%s" % (
         item.get("id", ""), item.get("code", ""), deal_id, volume,
         inst["our_traded_qty"], item.get("price", 0)))
+    _log_deal_queue_cancel_ratio(inst, item)
 
 
 def _is_ignored_exited_order_callback(inst, item):
