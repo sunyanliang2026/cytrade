@@ -904,6 +904,7 @@ def _new_instance(code, amount):
         "last_event_time": "", "last_l2quote": {}, "auction_checked": False,
         "seal_started": None, "seal_peak": 0.0,
         "break_started": None, "reseal_ready": False,
+        "retry_reseal_unqualified": False,
         "rearm_quote_cutoff": None, "reseal_break_event": None,
         "seen_order_ids": set(), "seen_order_queue": deque(),
         "seen_cancel_event_keys": set(), "seen_cancel_event_queue": deque(),
@@ -2322,8 +2323,9 @@ def _rearm_after_cancel(inst, quote_event_raw):
         queue_pending_cancel_logs=[], sentinel_token=None, sentinel_order_id=None,
         l2order_history=[], seal_started=None, seal_peak=0.0,
         break_started=None, reseal_ready=False, reseal_break_event=None,
+        retry_reseal_unqualified=True,
         rearm_quote_cutoff=None, last_l2quote={})
-    _set_state(inst, STATE_WAIT_REOPEN, "主单零成交撤单，重新观察封板")
+    _set_state(inst, STATE_WAIT_REOPEN, "主单零成交撤单，等待开板后直接回封")
     return True
 
 
@@ -2757,7 +2759,13 @@ def _handle_quote(code, period, payload):
                     inst["seal_started"] = _now()
                 inst["seal_peak"] = max(inst["seal_peak"], seal_amount)
             else:
-                if inst["seal_started"] is not None:
+                if inst.get("retry_reseal_unqualified"):
+                    inst["break_started"] = _now()
+                    inst["reseal_ready"] = True
+                    inst["reseal_break_event"] = _event_seconds(event_raw)
+                    inst["retry_reseal_unqualified"] = False
+                    _set_state(inst, STATE_WAIT_RESEAL, "撤单后开板，跳过封板时长和峰值门槛")
+                elif inst["seal_started"] is not None:
                     inst["break_started"] = _now()
                     if _now() - inst["seal_started"] > RESEAL_MIN_SEAL_SECONDS and inst["seal_peak"] >= RESEAL_MIN_PEAK_AMOUNT:
                         inst["reseal_ready"] = True
