@@ -1097,14 +1097,15 @@ def _limit_price(inst, quote=None):
 
 
 def _set_state(inst, state, reason=""):
-    if inst["state"] != state:
+    previous_state = inst.get("state", "UNKNOWN")
+    if previous_state != state:
         inst["state"] = state
         inst["last_log_reason"] = reason
-        _log("[状态] %s -> %s %s" % (
-            _stock_label(inst["code"], inst), state, reason))
+        _log("[状态] %s %s -> %s reason=%s" % (
+            _stock_label(inst["code"], inst), previous_state, state,
+            reason or "unspecified"))
         if state == STATE_DONE and not inst.get("queue_tracked_orders"):
             _unsubscribe_l2transaction(inst, reason)
-
 
 def _unsubscribe_instance(inst):
     if inst.get("subscriptions_stopped"):
@@ -2734,6 +2735,7 @@ def _handle_quote(code, period, payload):
         bid_at_limit = _seal_book_status(bid, limit_up, raw_bid_vol)
         if bid_at_limit is None:
             return
+        previous_bid_at_limit = inst.get("last_l2quote", {}).get("bid_at_limit")
         seal_amount = _amount(bid, bid_vol)
         if is_l2quote:
             # Keep only the latest scalar quote state needed by the strategy.
@@ -2748,6 +2750,15 @@ def _handle_quote(code, period, payload):
                 "low": low,
             }
         inst["last_l2quote"]["bid_at_limit"] = bid_at_limit
+        if previous_bid_at_limit != bid_at_limit:
+            previous_book_state = ("涨停封板" if previous_bid_at_limit is True else
+                                  "开板" if previous_bid_at_limit is False else "待确认")
+            current_book_state = ("涨停封板" if bid_at_limit else "开板")
+            _log("[盘口状态] %s %s -> %s bid=%.3f bid_vol=%.0f "
+                 "limit_up=%.3f event=%s" % (
+                     _stock_label(inst["code"], inst), previous_book_state,
+                     current_book_state, bid or 0.0, bid_vol or 0.0,
+                     limit_up or 0.0, event_raw or event_time))
         if inst["state"] == STATE_WAIT_INITIAL:
             if bid_at_limit:
                 _set_state(inst, STATE_WAIT_REOPEN, "盘中启动时已在涨停价，等待回封")
