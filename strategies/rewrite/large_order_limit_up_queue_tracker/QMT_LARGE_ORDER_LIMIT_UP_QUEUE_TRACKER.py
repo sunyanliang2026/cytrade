@@ -74,6 +74,7 @@ L2ORDER_RESUBSCRIBE_MAX_ATTEMPTS = 2
 QUEUE_CAPTURE_FALLBACK_SECONDS = 1.0
 QUEUE_CANCEL_RATIO_THRESHOLD = 0.50
 QUEUE_SENTINEL_VOLUME_SHARES = 100
+QUEUE_SENTINEL_PRICE_OFFSET = 0.01
 QUEUE_SENTINEL_LOOKUP_RETRY_SECONDS = 0.1
 QUEUE_SENTINEL_LOOKUP_MAX_ATTEMPTS = 10
 QUEUE_SENTINEL_CANCEL_MAX_ATTEMPTS = 3
@@ -927,6 +928,7 @@ def _new_instance(code, amount):
         "sentinel_token": None, "sentinel_submit_at": None,
         "sentinel_submit_pending": False, "sentinel_submit_result": None,
         "sentinel_order_id": None, "sentinel_order_status": "",
+        "sentinel_price": None,
         "sentinel_traded_qty": 0,
         "sentinel_cancel_due": False, "sentinel_cancel_requested": False,
         "sentinel_cancel_confirmed": False, "sentinel_cancel_attempts": 0,
@@ -1591,6 +1593,7 @@ def _queue_capture_start(inst, trigger_order_key, trigger_order):
     inst["sentinel_submit_result"] = None
     inst["sentinel_order_id"] = None
     inst["sentinel_order_status"] = ""
+    inst["sentinel_price"] = None
     inst["sentinel_traded_qty"] = 0
     inst["sentinel_cancel_due"] = False
     inst["sentinel_cancel_requested"] = False
@@ -1634,9 +1637,9 @@ def _queue_l2order_ingress(inst, source, event_raw, received_at, ContextInfo=Non
         is_sentinel = bool(
             sentinel_after_submit and
             _is_buy_direction(direction) and
-            abs((price or 0.0) - (_safe_float(inst.get("limit_down")) or 0.0)) < 1e-8 and
+            abs((price or 0.0) - (_safe_float(inst.get("sentinel_price")) or 0.0)) < 1e-8 and
             abs(volume - QUEUE_SENTINEL_VOLUME_SHARES) < 1e-8 and
-            _safe_float(inst.get("limit_down")))
+            _safe_float(inst.get("sentinel_price")))
         if is_sentinel:
             _queue_capture_finish(inst, "sentinel", event_raw, ContextInfo)
         elif (event_seconds is not None and cutoff_seconds is not None and
@@ -1957,12 +1960,32 @@ def _associate_sentinel_deal_callback(item):
     return False
 
 
-def _submit_queue_sentinel(inst):
+def _queue_sentinel_price(inst):
     limit_down = _safe_float(inst.get("limit_down"))
     if not limit_down:
-        _log("[QUEUE_SENTINEL_SKIPPED] code=%s reason=current_day_limit_down_unavailable" % (
-            _stock_label(inst["code"], inst)))
+        return None, "current_day_limit_down_unavailable"
+    offset = _safe_float(QUEUE_SENTINEL_PRICE_OFFSET)
+    if offset is None or offset < 0:
+        return None, "invalid_price_offset"
+    if abs(offset * 100.0 - round(offset * 100.0)) >= 1e-7:
+        return None, "offset_not_cent_aligned"
+    price = round(limit_down + offset, 2)
+    limit_up = _safe_float(inst.get("limit_up"))
+    if (price < limit_down - 1e-8 or
+            (limit_up and price > limit_up + 1e-8)):
+        return None, "offset_price_outside_daily_range"
+    return price, ""
+
+
+def _submit_queue_sentinel(inst):
+    price, skip_reason = _queue_sentinel_price(inst)
+    if price is None:
+        _log("[QUEUE_SENTINEL_SKIPPED] code=%s offset=%r reason=%s" % (
+            _stock_label(inst["code"], inst), QUEUE_SENTINEL_PRICE_OFFSET,
+            skip_reason))
         return False
+    limit_down = _safe_float(inst.get("limit_down"))
+    inst["sentinel_price"] = price
     token = "%s_QUEUE_SENTINEL_%s" % (inst["code"], int(time.time() * 1000))
     inst["sentinel_token"] = token
     inst["sentinel_submit_at"] = time.time()
@@ -1971,26 +1994,29 @@ def _submit_queue_sentinel(inst):
     try:
         started = _now()
         result = passorder(23, ORDER_TYPE_BUY, ACCOUNT_ID, inst["code"], PRICE_TYPE_LIMIT,
-                           limit_down, QUEUE_SENTINEL_VOLUME_SHARES, STRATEGY_NAME,
+                           price, QUEUE_SENTINEL_VOLUME_SHARES, STRATEGY_NAME,
                            2, token, _C)
         elapsed_ms = (_now() - started) * 1000.0
         inst["sentinel_submit_result"] = result
         if result is False or str(result) == "-1":
             inst["sentinel_submit_pending"] = False
-            _log("[QUEUE_SENTINEL_SUBMIT_FAILED] code=%s token=%s price=%.3f qty=%d result=%r call_ms=%.1f" % (
+            _log("[QUEUE_SENTINEL_SUBMIT_FAILED] code=%s token=%s limit_down=%.3f offset=%.3f price=%.3f qty=%d result=%r call_ms=%.1f" % (
                 _stock_label(inst["code"], inst), token, limit_down,
+                QUEUE_SENTINEL_PRICE_OFFSET, price,
                 QUEUE_SENTINEL_VOLUME_SHARES, result, elapsed_ms))
             return False
-        _log("[QUEUE_SENTINEL_SUBMITTED] code=%s token=%s price=%.3f qty=%d result=%r call_ms=%.1f" % (
+        _log("[QUEUE_SENTINEL_SUBMITTED] code=%s token=%s limit_down=%.3f offset=%.3f price=%.3f qty=%d result=%r call_ms=%.1f" % (
             _stock_label(inst["code"], inst), token, limit_down,
+            QUEUE_SENTINEL_PRICE_OFFSET, price,
             QUEUE_SENTINEL_VOLUME_SHARES, result, elapsed_ms))
         _schedule_sentinel_lookup(inst)
         _schedule_sentinel_timeout(inst)
         return True
     except Exception as exc:
         inst["sentinel_submit_pending"] = False
-        _log("[QUEUE_SENTINEL_SUBMIT_FAILED] code=%s token=%s error=%r" % (
-            _stock_label(inst["code"], inst), token, exc))
+        _log("[QUEUE_SENTINEL_SUBMIT_FAILED] code=%s token=%s offset=%.3f price=%.3f error=%r" % (
+            _stock_label(inst["code"], inst), token, QUEUE_SENTINEL_PRICE_OFFSET,
+            price, exc))
         return False
 
 
